@@ -6,7 +6,9 @@ an agent's analysis, not a notebook or a dashboard. See
 `Design/DS Artifact OS — Design Doc.md` for the full pitch, philosophy, data
 model, and demo plan.
 
-No release is cut — this runs from a local venv against the source tree.
+Runs from a local venv against the source tree during development;
+`v0.1.0` is the first tagged, citable checkpoint (see "Installing a
+released version" below).
 
 ## Status
 
@@ -40,6 +42,20 @@ session once the server is wired in.
 venv's own site-packages back to this source tree. That's also what lets the
 MCP server run correctly from *any* directory (see below), without needing a
 `PYTHONPATH`.
+
+## Installing a released version
+
+No PyPI package yet — install straight from a tagged commit instead of
+tracking `main`:
+
+```sh
+pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@v0.1.0"
+```
+
+This is a real (non-editable) build, not the editable install above —
+verified against a throwaway venv as part of cutting each release, since an
+editable install hides packaging bugs (a missing file in `package-data`,
+for instance) that only surface on a real build.
 
 ## Running the server standalone
 

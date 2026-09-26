@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "dsos"
 version = "0.1.0"
@@ -35,8 +39,9 @@ dev = ["httpx>=0.27"]
 [tool.setuptools.packages.find]
 include = ["dsos*"]
 
-# Built-in chart styles and report templates — package assets resolved by
-# name (see dsos/templating.py). Without this they'd silently vanish from
-# real installs (editable installs hide the bug).
+# Built-in chart styles, report templates, and the GUI's Jinja templates —
+# non-.py package assets resolved by name/path at runtime (dsos/templating.py,
+# dsos/gui.py). Without this they silently vanish from a real build (editable
+# installs hide the bug — that's why the release process verifies with one).
 [tool.setuptools.package-data]
-dsos = ["assets/chartstyles/*.mplstyle", "assets/reports/*.html"]
+dsos = ["assets/chartstyles/*.mplstyle", "assets/reports/*.html", "templates/*.html"]
