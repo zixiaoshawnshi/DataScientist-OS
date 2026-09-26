@@ -188,7 +188,11 @@ def main() -> None:
 
     r = client.get(f"/artifacts/{dataset_row}/lineage")
     assert r.status_code == 200 and "graph LR" in r.text and query_row in r.text
-    print("[ok] GET /artifacts/{row_id}/lineage renders a Mermaid graph with neighbors")
+    assert " --> " in r.text, (
+        "the graph text must reach the browser unescaped — autoescaping turns "
+        "--> into --&gt;, which Mermaid can't parse, so the graph never renders"
+    )
+    print("[ok] GET /artifacts/{row_id}/lineage renders a Mermaid graph with neighbors (unescaped)")
 
     r = client.get(f"/artifacts/{query_row}")
     assert r.status_code == 200 and 'data-tab="lineage"' in r.text and "graph LR" in r.text
@@ -196,6 +200,12 @@ def main() -> None:
 
     assert 'href="/artifacts?type=chart"' in r.text
     print("[ok] the sidebar nav lists per-type quick links on every page")
+
+    r = client.get("/")
+    assert "dsosToggleTheme" in r.text and "dsos-theme-label" in r.text, (
+        "every page should carry the dark-mode toggle (base.html script + sidebar link)"
+    )
+    print("[ok] every page carries the dark-mode toggle")
 
     r = client.get(f"/artifacts/{narrative_row}/report")
     assert r.status_code == 200

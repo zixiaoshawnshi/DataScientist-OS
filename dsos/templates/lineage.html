@@ -3,13 +3,19 @@
 {% block head %}
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
 <script>
-  window.addEventListener("DOMContentLoaded", () => mermaid.initialize({ startOnLoad: true }));
+  window.addEventListener("DOMContentLoaded", () => {
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: document.documentElement.dataset.theme === "dark" ? "dark" : "default",
+    });
+    mermaid.run().catch(console.error);
+  });
 </script>
 {% endblock %}
 {% block content %}
 <p class="crumbs"><a href="/artifacts/{{ art.row_id }}">← {{ art.title }}</a></p>
 <h1>Lineage: {{ art.title }}</h1>
 <div class="mermaid">
-{{ graph }}
+{{ graph|safe }}
 </div>
 {% endblock %}
