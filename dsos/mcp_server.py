@@ -24,7 +24,31 @@ from dsos.db import connect
 DB_PATH = os.environ.get("DSOS_DB_PATH", "data/store.db")
 conn = connect(DB_PATH)
 
-mcp = FastMCP("DS Artifact OS")
+# Surfaced to the client at connect time via the MCP `initialize` response
+# (protocol-level InitializeResult.instructions, not a tool docstring) — this
+# is what should make the agent reach for this server unprompted, in any
+# repo, with no CLAUDE.md/AGENTS.md to copy in. Keep it short: it's paid on
+# every connection. Whether a given client actually injects it into the
+# model's context (vs. just displaying it) is client-dependent — verify
+# with a live session before trusting it for a demo.
+INSTRUCTIONS = """\
+Use this server for any question that needs real data: trends, comparisons, \
+correlations, "what predicts X", "how many/which", etc. Do not answer such \
+questions from general or prior knowledge — every answer must be backed by \
+a number this server actually computed.
+
+Workflow, in order:
+1. start_session(question) — first call, for every new question.
+2. search_artifacts — check for reusable prior work before fetching anything new.
+3. If nothing reusable: find and download real public data with your own \
+tools, then save_artifact to register it (type="dataset", with source). An \
+unregistered dataset is invisible to search, lineage, and every future question.
+4. run_sql / run_python against the registered artifacts to compute the \
+actual answer — never eyeball or summarize the raw data yourself.
+5. Answer using the computed output, citing the row_ids you used.
+"""
+
+mcp = FastMCP("DS Artifact OS", instructions=INSTRUCTIONS)
 
 
 class ToolCallLogger(Middleware):

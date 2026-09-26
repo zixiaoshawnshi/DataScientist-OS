@@ -31,6 +31,11 @@ from dsos.mcp_server import mcp  # noqa: E402 — import after DSOS_DB_PATH is s
 
 async def main() -> None:
     async with Client(mcp) as client:
+        assert client.instructions and "start_session" in client.instructions, (
+            "server instructions missing from the initialize response"
+        )
+        print("[ok] server instructions present in initialize response")
+
         tools = {t.name for t in (await client.list_tools())}
         expected = {
             "start_session", "search_artifacts", "get_artifact", "save_artifact",
