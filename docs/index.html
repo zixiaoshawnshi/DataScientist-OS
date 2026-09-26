@@ -408,7 +408,15 @@
     direction: 'vertical',
     slidesPerView: 1,
     speed: 500,
-    mousewheel: true,
+    mousewheel: {
+      // trackpads/high-res wheels fire many events per physical gesture;
+      // without a time threshold each one can trigger its own slide
+      // change, so one scroll jumps several slides at once. Ignoring
+      // further wheel input for a bit after each change limits it to one
+      // slide per gesture, matching the transition speed below.
+      thresholdTime: 700,
+      thresholdDelta: 6,
+    },
     keyboard: { enabled: true, pageUpDown: true },
     pagination: { el: '.swiper-pagination', clickable: true },
     on: {
