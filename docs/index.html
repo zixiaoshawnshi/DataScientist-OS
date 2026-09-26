@@ -24,14 +24,40 @@
   }
 
   * { box-sizing: border-box; }
-  html, body { height: 100%; }
+  html, body { min-height: 100%; }
   body {
     margin: 0; background: var(--bg); color: var(--ink);
     font-family: "JetBrains Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
-    display: flex; align-items: center; justify-content: center;
-    padding-inline: 1.25rem; padding-block: 3rem;
   }
-  main { max-width: 36rem; width: 100%; }
+
+  /* --- hero (full-bleed, forced dark regardless of page theme) --- */
+  .hero {
+    position: relative; min-height: 60vh; display: flex; align-items: flex-end;
+    overflow: hidden; background: #0b0d0f; padding: 4rem 1.25rem 3rem;
+  }
+  .hero-media {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: cover; opacity: 0.55;
+  }
+  .hero-scrim {
+    position: absolute; inset: 0;
+    background: linear-gradient(180deg, rgba(11,13,15,0.30) 0%, rgba(11,13,15,0.88) 100%);
+  }
+  .hero-content { position: relative; z-index: 1; max-width: 36rem; width: 100%; margin: 0 auto; }
+  .hero-content .eyebrow { color: #9a9d95; }
+  .hero-content .eyebrow::before { color: #6fcbb2; }
+  .hero-content h1 { color: #f5f4f0; }
+  .hero-content p.pitch { color: #c7c9c2; }
+  .hero-content p.pitch em { color: #f5f4f0; }
+  .hero-content .watch-link {
+    display: inline-block; font-size: 0.8rem; color: #9a9d95;
+    text-decoration: underline; text-decoration-color: #3a3d38; text-underline-offset: 3px;
+  }
+  .hero-content .watch-link:hover, .hero-content .watch-link:focus-visible {
+    color: #6fcbb2; text-decoration-color: #6fcbb2;
+  }
+
+  main { max-width: 36rem; width: 100%; margin: 0 auto; padding: 3rem 1.25rem; }
 
   .eyebrow {
     font-size: 0.78rem; color: var(--muted); margin: 0 0 1.1rem;
@@ -47,17 +73,25 @@
 
   p.pitch {
     font-size: 1rem; line-height: 1.7; color: var(--muted);
-    margin: 0 0 2.6rem; max-width: 48ch;
+    margin: 0 0 1.4rem; max-width: 48ch;
   }
   p.pitch em { color: var(--ink); font-style: normal; }
 
-  .block { margin: 0 0 1.6rem; }
+  .block { margin: 0 0 2.4rem; }
   .block-head {
     display: flex; align-items: center; justify-content: space-between;
     gap: 1rem; margin: 0 0 0.55rem;
   }
   .block-head .label { font-size: 0.78rem; color: var(--muted); }
   .block-head .label::before { content: "# "; color: var(--accent); }
+
+  ul.features { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.9rem; }
+  ul.features li {
+    font-size: 0.92rem; line-height: 1.6; color: var(--muted);
+    padding-left: 1.2rem; position: relative;
+  }
+  ul.features li::before { content: "\203A"; position: absolute; left: 0; color: var(--accent); }
+  ul.features strong { color: var(--ink); font-weight: 600; }
 
   .tabs { display: flex; gap: 1.1rem; flex-wrap: wrap; }
   .tab {
@@ -67,6 +101,7 @@
   }
   .tab:hover, .tab:focus-visible { color: var(--ink); }
   .tab.is-active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-row { margin: 0 0 0.9rem; }
 
   button.copy {
     font: inherit; font-size: 0.76rem; color: var(--muted);
@@ -88,8 +123,6 @@
     font-size: 0.9rem; color: var(--ink); margin: 0; line-height: 1.6;
   }
 
-  .tab-row { margin: 0 0 0.9rem; }
-
   table.artifact-table {
     width: 100%; border-collapse: collapse; font-size: 0.88rem;
   }
@@ -103,24 +136,9 @@
   }
   table.artifact-table code { color: var(--ink); }
 
-  .media-slot {
-    position: relative; border: 1px dashed var(--line); border-radius: 10px;
-    overflow: hidden; display: flex; align-items: center; justify-content: center;
-    background: color-mix(in srgb, var(--line) 30%, transparent);
-  }
-  .media-slot .placeholder {
-    text-align: center; color: var(--muted); font-size: 0.8rem;
-    line-height: 1.7; padding: 1.5rem;
-  }
-  .media-slot .placeholder code { color: var(--ink); }
-  .media-slot img, .media-slot video {
-    position: absolute; inset: 0; width: 100%; height: 100%;
-    object-fit: cover; background: var(--bg);
-  }
-
   nav.links {
     font-size: 0.88rem; color: var(--muted);
-    display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 2.4rem;
+    display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.4rem;
   }
   nav.links a { color: var(--ink); text-decoration: none; border-bottom: 1px solid var(--line); }
   nav.links a:hover, nav.links a:focus-visible { border-color: var(--accent); color: var(--accent); }
@@ -128,15 +146,35 @@
 </style>
 </head>
 <body>
+
+<section class="hero">
+  <video class="hero-media" autoplay muted loop playsinline preload="auto" onerror="this.style.display='none'">
+    <source src="media/demo.mp4" type="video/mp4">
+  </video>
+  <div class="hero-scrim"></div>
+  <div class="hero-content">
+    <p class="eyebrow">for data scientists &amp; analysts</p>
+    <h1>dsos</h1>
+    <p class="pitch">
+      An MCP server that keeps your coding agent's queries, datasets,
+      charts, and narratives organized as <em>versioned, searchable
+      artifacts</em> — so your analysis stops scattering across
+      notebooks, chat scrollback, and one-off scripts.
+    </p>
+    <a class="watch-link" href="media/demo.mp4">watch the full recording &#8599;</a>
+  </div>
+</section>
+
 <main>
-  <p class="eyebrow">for data scientists &amp; analysts</p>
-  <h1>dsos</h1>
-  <p class="pitch">
-    An MCP server that keeps your coding agent's queries, datasets,
-    charts, and narratives organized as <em>versioned, searchable
-    artifacts</em> — so your analysis stops scattering across
-    notebooks, chat scrollback, and one-off scripts.
-  </p>
+  <div class="block">
+    <div class="block-head"><span class="label">what it gives you</span></div>
+    <ul class="features">
+      <li><strong>artifact management</strong> — every query, dataset, transform, chart, and narrative saved, versioned, and searchable through one schema.</li>
+      <li><strong>lineage</strong> — parents and children tracked automatically on every run — no manual bookkeeping.</li>
+      <li><strong>skills &amp; templates</strong> — workflow instructions and chart/report styling, both customizable and versioned like everything else.</li>
+      <li><strong>GUI</strong> — a read-only browser over the same store: sessions, tool-call feed, artifact gallery, lineage graph.</li>
+    </ul>
+  </div>
 
   <div class="block">
     <div class="block-head">
@@ -217,24 +255,6 @@
       <tr><th>made via</th><td><code>save_template(kind=..., base=...)</code></td></tr>
       <tr><th>example</th><td>A custom dark report layout your narratives render into.</td></tr>
     </table>
-  </div>
-
-  <div class="block">
-    <div class="block-head"><span class="label">see it work</span></div>
-    <div class="media-slot" style="aspect-ratio: 16 / 9">
-      <div class="placeholder">drop <code>media/demo.mp4</code> next to this file<br>— a short recording of an agent driving dsos</div>
-      <video controls preload="metadata" onerror="this.style.display='none'">
-        <source src="media/demo.mp4" type="video/mp4">
-      </video>
-    </div>
-  </div>
-
-  <div class="block">
-    <div class="block-head"><span class="label">browse the store</span></div>
-    <div class="media-slot" style="aspect-ratio: 16 / 10">
-      <div class="placeholder">drop <code>media/gui-screenshot.png</code> next to this file<br>— the read-only artifact browser (gallery, lineage, tool-call feed)</div>
-      <img src="media/gui-screenshot.png" alt="DS Artifact OS GUI: artifact gallery and lineage view" onerror="this.style.display='none'">
-    </div>
   </div>
 
   <nav class="links">
