@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DS Artifact OS</title>
+<meta name="description" content="An MCP server for data scientists and analysts that keeps queries, datasets, charts, and narratives organized as versioned, searchable artifacts.">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #fbfbfa; --ink: #14161a; --muted: #6b7078; --accent: #2f6f5e; --line: #e4e3df;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #101214; --ink: #eceae4; --muted: #8b9088; --accent: #6fcbb2; --line: #262a26;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #101214; --ink: #eceae4; --muted: #8b9088; --accent: #6fcbb2; --line: #262a26;
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: "JetBrains Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
+    display: flex; align-items: center; justify-content: center;
+    padding-inline: 1.25rem; padding-block: 3rem;
+  }
+  main { max-width: 36rem; width: 100%; }
+
+  .eyebrow {
+    font-size: 0.78rem; color: var(--muted); margin: 0 0 1.1rem;
+    letter-spacing: 0.02em;
+  }
+  .eyebrow::before { content: "# "; color: var(--accent); }
+
+  h1 {
+    font-size: clamp(2rem, 8vw, 2.9rem); line-height: 1.1;
+    margin: 0 0 1.2rem; font-weight: 600; letter-spacing: -0.01em;
+    text-wrap: balance;
+  }
+
+  p.pitch {
+    font-size: 1rem; line-height: 1.7; color: var(--muted);
+    margin: 0 0 2.6rem; max-width: 48ch;
+  }
+  p.pitch em { color: var(--ink); font-style: normal; }
+
+  .block { margin: 0 0 1.6rem; }
+  .block-head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 1rem; margin: 0 0 0.55rem;
+  }
+  .block-head .label { font-size: 0.78rem; color: var(--muted); }
+  .block-head .label::before { content: "# "; color: var(--accent); }
+
+  button.copy {
+    font: inherit; font-size: 0.76rem; color: var(--muted);
+    background: none; border: none; padding: 0; cursor: pointer;
+    text-decoration: underline; text-decoration-color: var(--line);
+    text-underline-offset: 3px;
+  }
+  button.copy:hover, button.copy:focus-visible { color: var(--accent); text-decoration-color: var(--accent); }
+
+  pre.cmd {
+    font-size: 0.9rem; color: var(--ink); margin: 0; padding: 0;
+    overflow-x: auto; white-space: pre; line-height: 1.6;
+  }
+  pre.cmd .p { color: var(--accent); }
+
+  p.prompt-text {
+    font-size: 0.9rem; color: var(--ink); margin: 0; line-height: 1.6;
+  }
+
+  nav.links {
+    font-size: 0.88rem; color: var(--muted);
+    display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 2.4rem;
+  }
+  nav.links a { color: var(--ink); text-decoration: none; border-bottom: 1px solid var(--line); }
+  nav.links a:hover, nav.links a:focus-visible { border-color: var(--accent); color: var(--accent); }
+  nav.links .sep { color: var(--line); }
+</style>
+</head>
+<body>
+<main>
+  <p class="eyebrow">for data scientists &amp; analysts</p>
+  <h1>dsos</h1>
+  <p class="pitch">
+    An MCP server that keeps your coding agent's queries, datasets,
+    charts, and narratives organized as <em>versioned, searchable
+    artifacts</em> — so your analysis stops scattering across
+    notebooks, chat scrollback, and one-off scripts.
+  </p>
+
+  <div class="block">
+    <div class="block-head">
+      <span class="label">install latest</span>
+      <button class="copy" type="button" data-copy="cmd-install">copy</button>
+    </div>
+    <pre class="cmd" id="cmd-install"><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git"
+<span class="p">$</span> claude mcp add dsos -s user -- python -m dsos.mcp_server</pre>
+  </div>
+
+  <div class="block">
+    <div class="block-head">
+      <span class="label">or, hand this to your agent</span>
+      <button class="copy" type="button" data-copy="cmd-prompt">copy</button>
+    </div>
+    <p class="prompt-text" id="cmd-prompt">Please look at https://github.com/zixiaoshawnshi/DataScientist-OS and set up dsos as an MCP server for me.</p>
+  </div>
+
+  <nav class="links">
+    <a href="https://github.com/zixiaoshawnshi/DataScientist-OS">github</a>
+    <span class="sep">·</span>
+    <a href="https://github.com/zixiaoshawnshi/DataScientist-OS#readme">readme</a>
+    <span class="sep">·</span>
+    <a href="https://github.com/zixiaoshawnshi/DataScientist-OS/blob/main/Design/DS%20Artifact%20OS%20%E2%80%94%20Design%20Doc.md">design doc</a>
+    <span class="sep">·</span>
+    <a href="https://github.com/zixiaoshawnshi/DataScientist-OS/releases">releases</a>
+    <span class="sep">·</span>
+    <span>mit</span>
+  </nav>
+</main>
+
+<script>
+  document.querySelectorAll('button.copy').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var target = document.getElementById(btn.getAttribute('data-copy'));
+      var text = target.innerText;
+      var reset = function () { btn.textContent = 'copy'; };
+      var flash = function () {
+        btn.textContent = 'copied';
+        setTimeout(reset, 1200);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(flash).catch(function () {
+          selectText(target);
+          flash();
+        });
+      } else {
+        selectText(target);
+        flash();
+      }
+    });
+  });
+  function selectText(el) {
+    var range = document.createRange();
+    range.selectNodeContents(el);
+    var sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+</script>
+</body>
+</html>
