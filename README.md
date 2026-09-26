@@ -27,6 +27,9 @@ python -m venv .venv
 .venv/Scripts/python tests/mcp_smoke_test.py
 ```
 
+See `examples/README.md` for question pairs to try against a real agent
+session once the server is wired in.
+
 `-e .` is an editable install — no PyPI package, `dsos` just resolves via the
 venv's own site-packages back to this source tree. That's also what lets the
 MCP server run correctly from *any* directory (see below), without needing a
