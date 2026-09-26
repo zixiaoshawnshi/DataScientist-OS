@@ -40,6 +40,16 @@ def _new_id() -> str:
     return uuid.uuid4().hex
 
 
+def safe_table_name(title: str) -> str:
+    """The rule for turning an artifact title into a variable/table name:
+    lowercase, non-alphanumeric -> `_`, never empty. Lives here (not in
+    execution.py) because both run paths — in-process namespace binding and
+    the sandbox's input re-binding — must produce identical names."""
+    import re
+    name = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
+    return name or "t"
+
+
 @dataclass
 class Artifact:
     row_id: str

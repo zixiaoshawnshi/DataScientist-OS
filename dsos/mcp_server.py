@@ -284,6 +284,7 @@ def run_sql(
 def run_python(
     code: str, session_id: str, title: str, description: str, input_row_ids: list[str],
     output_type: str = "transform", scratch: bool = False,
+    requirements: list[str] | None = None, code_paths: list[str] | None = None,
 ) -> dict:
     """Run Python against one or more artifacts. Each input row_id is bound
     to a variable named after that artifact's title; `pd` (pandas) is
@@ -301,6 +302,18 @@ def run_python(
     noise; flip to scratch=False once the idea works. The run still appears
     in the session's tool-call trace.
 
+    requirements=["scikit-learn>=1.3", ...]: extra packages for THIS run
+    only — uv resolves them into a throwaway environment, runs the code
+    there, and discards it; this server's environment is never modified.
+    Anything uv accepts works: PyPI specs, local package paths, wheels,
+    git URLs (path-style entries need a filesystem shared with this
+    server). First run pays the download, repeat runs ~1s (globally
+    cached). Slower than the default path — only pass requirements when
+    you actually need them.
+
+    code_paths=["/abs/dir", ...]: directories holding your own unpackaged
+    .py modules to import from — works with or without requirements.
+
     Example:
       run_python(
         code="result = toy_scores.groupby('team')['score'].mean().reset_index()",
@@ -312,6 +325,7 @@ def run_python(
     result = execution.run_python(
         conn, code=code, session_id=session_id, title=title, description=description,
         input_row_ids=input_row_ids, output_type=output_type, scratch=scratch,
+        requirements=requirements, code_paths=code_paths,
     )
     return result if scratch else _execution_result_payload(result, input_row_ids)
 

@@ -186,7 +186,61 @@ async def main() -> None:
         )
         print("[ok] scratch runs are invisible to search_artifacts (feedback #8)")
 
-        # --- round 4: agent-facing diagnostics (feedback #4, #5, #10) ---
+        # --- round 4: subprocess sandbox — requirements / code_paths (feedback #1, Option B) ---
+        with tempfile.TemporaryDirectory() as tmp:
+            helper_dir = Path(tmp) / "helpers"
+            helper_dir.mkdir()
+            (helper_dir / "semantic_helper.py").write_text(
+                "def answer():\n    return 42\n", encoding="utf-8"
+            )
+            r = await client.call_tool("run_python", {
+                "code": "import semantic_helper; result = semantic_helper.answer()",
+                "session_id": s2, "title": "Scratch via code_paths",
+                "description": "Scratch run importing the agent's own unpackaged module.",
+                "input_row_ids": [], "scratch": True,
+                "code_paths": [str(helper_dir)],
+            })
+            assert r.data["status"] == "ok", r.data
+            assert r.data["content"] == 42, r.data
+            # and the injected path must not leak into the server process
+            import sys as _sys
+            assert str(helper_dir) not in _sys.path, "code_paths must not leak into sys.path"
+        print("[ok] run_python code_paths binds an unpackaged module, no sys.path leak")
+
+        from dsos import sandbox as dsos_sandbox
+        if dsos_sandbox.find_uv() is None:
+            print("[skip] uv not installed — requirements round skipped")
+        else:
+            # a package the sandbox lacks, plus a DataFrame input round-trip
+            # (parquet out, parquet back in), resolved per-call by uv
+            r = await client.call_tool("run_python", {
+                "code": "import tabulate; "
+                        "result = tabulate.tabulate(high_scorers.to_dict('records'), headers='keys')",
+                "session_id": s2, "title": "Scratch via uv",
+                "description": "Scratch run pulling a missing package via uv, with a DataFrame input.",
+                "input_row_ids": [query_row], "scratch": True,
+                "requirements": ["tabulate"],
+            })
+            assert r.data["status"] == "ok", r.data
+            assert "b" in r.data["content"] and "c" in r.data["content"], (
+                "the subprocess should have seen the input artifact's rows"
+            )
+            print("[ok] run_python requirements=[tabulate] resolves via uv, input round-trips")
+
+            r = await client.call_tool("run_python", {
+                "code": "result = 1",
+                "session_id": s2, "title": "Scratch bad requirement",
+                "description": "Scratch run with an unresolvable requirement.",
+                "input_row_ids": [], "scratch": True,
+                "requirements": ["definitely-not-a-real-package-xyz"],
+            })
+            assert r.data["status"] == "error", r.data
+            assert "definitely-not-a-real-package-xyz" in (r.data.get("error") or ""), (
+                "unresolvable requirements should fail with a clear uv error"
+            )
+            print("[ok] unresolvable requirement fails with a clear uv error")
+
+        # --- round 5: agent-facing diagnostics (feedback #4, #5, #10) ---
         r = await client.call_tool("run_python", {
             "code": "print('computing averages'); "
                     "result = toy_scores.groupby('team')['score'].mean().reset_index()",

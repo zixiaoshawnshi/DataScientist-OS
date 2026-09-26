@@ -10,6 +10,12 @@ record: the result comes back inline, but nothing enters search or lineage.
 The run still shows up in the session's tool-call trace (the MCP middleware
 logs every call), and the executions ledger is skipped because its
 output_row_id column is NOT NULL — there's no artifact to point at.
+
+requirements=[...] (feedback #1, Option B) runs the code in a subprocess
+sandbox instead: uv resolves the packages into a throwaway environment, and
+the result flows back through the same save/record/lineage path — see
+dsos/sandbox.py. code_paths=[...] (unpackaged local modules) works on both
+paths: sys.path injection in-process, --sys.path wiring in the wrapper.
 """
 
 from __future__ import annotations
@@ -17,15 +23,17 @@ from __future__ import annotations
 import contextlib
 import io
 import sqlite3
+import sys
 import traceback
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import duckdb
 import pandas as pd
 
-from dsos.store import get_artifact_by_row_id, save_artifact
+from dsos.store import get_artifact_by_row_id, safe_table_name, save_artifact
 
 _STDOUT_LIMIT = 2_000
 _STDERR_LIMIT = 4_000  # tail-capped: the traceback's final frames are the useful ones
@@ -59,8 +67,9 @@ def _missing_package_hint() -> str:
     shown = ", ".join(packages[:80]) + (", ..." if len(packages) > 80 else "")
     return (
         f"Package not installed in this sandbox. Available here: {shown}. "
-        "For anything missing, compute it with your own tools (bash) and "
-        "register the result via save_artifact — don't retry the import."
+        "For anything missing, pass requirements=[...] to run_python (uv "
+        "resolves it in a throwaway environment), or compute it with your "
+        "own tools (bash) and register the result via save_artifact."
     )
 
 
@@ -132,7 +141,7 @@ def run_sql(
     try:
         _check_inputs(inputs)
         for art in inputs:
-            duck.register(_safe_table_name(art.title), art.content)  # content: pandas.DataFrame
+            duck.register(safe_table_name(art.title), art.content)  # content: pandas.DataFrame
         with contextlib.redirect_stdout(stdout):
             result = duck.execute(code).fetchdf()
     except Exception as exc:
@@ -163,53 +172,88 @@ def run_sql(
     return output_row_id
 
 
-def run_python(
-    conn: sqlite3.Connection, *, code: str, session_id: str, title: str, description: str,
-    input_row_ids: list[str], output_type: str = "transform", output_format: str = "parquet",
-    scratch: bool = False,
-) -> str | dict:
-    """Runs `code` with each input artifact bound to a variable named after
-    its title (lowercased, non-alnum -> `_`), plus `pd`. The code must set a
-    variable named `result`; that becomes the new artifact's content — unless
-    scratch=True, in which case the payload comes back inline and nothing is
-    persisted."""
-    started_at = _now()
+def _run_python_inprocess(*, code: str, inputs: list, code_paths: list[str] | None) -> dict:
+    """The default fast path: exec in this process. Same run-dict shape as
+    the sandbox path, so everything downstream is identical."""
     stdout, stderr = io.StringIO(), io.StringIO()
-    status, error, result = "ok", None, None
-
-    inputs = [get_artifact_by_row_id(conn, rid) for rid in input_row_ids]
     namespace: dict[str, Any] = {"pd": pd}
+    for art in inputs:
+        namespace[safe_table_name(art.title)] = art.content
 
+    added_paths: list[str] = []
     try:
-        _check_inputs(inputs)
-        for art in inputs:
-            namespace[_safe_table_name(art.title)] = art.content
+        if code_paths:
+            # Temporary sys.path additions, always restored — the server's
+            # process must not leak one run's import paths into the next.
+            for p in code_paths:
+                if not Path(p).is_dir():
+                    raise ValueError(f"code_path {p!r} is not a directory")
+                sys.path.insert(0, p)
+                added_paths.append(p)
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             exec(code, namespace)  # noqa: S102 — intentional: this is the product
         if "result" not in namespace:
             raise ValueError("run_python code must assign a `result` variable")
-        result = namespace["result"]
+        status, error, result = "ok", None, namespace["result"]
     except ImportError as exc:
         # Feedback #7: a missing package used to cost a full guess-and-fail
-        # cycle. Name what *is* available instead.
+        # cycle. Name what *is* available instead — and how to get more.
         status, error = "error", f"{type(exc).__name__}: {exc}. {_missing_package_hint()}"
         stderr.write(traceback.format_exc())
         result = pd.DataFrame()
-        output_format = "parquet"
     except Exception as exc:
         # `error` is the concise, agent-facing message; the full traceback is
         # appended to stderr, same as a real unhandled exception would do.
         status, error = "error", f"{type(exc).__name__}: {exc}"
         stderr.write(traceback.format_exc())
         result = pd.DataFrame()
-        output_format = "parquet"
+    finally:
+        for p in added_paths:
+            sys.path.remove(p)
+    return {"status": status, "error": error, "stdout": stdout.getvalue(),
+            "stderr": stderr.getvalue(), "result": result}
 
-    run = {"status": status, "error": error, "stderr": stderr.getvalue(),
-           "stdout": stdout.getvalue(), "result": result}
+
+def run_python(
+    conn: sqlite3.Connection, *, code: str, session_id: str, title: str, description: str,
+    input_row_ids: list[str], output_type: str = "transform", output_format: str = "parquet",
+    scratch: bool = False, requirements: list[str] | None = None,
+    code_paths: list[str] | None = None,
+) -> str | dict:
+    """Runs `code` with each input artifact bound to a variable named after
+    its title (lowercased, non-alnum -> `_`), plus `pd`. The code must set a
+    variable named `result`; that becomes the new artifact's content — unless
+    scratch=True, in which case the payload comes back inline and nothing is
+    persisted.
+
+    With `requirements` (non-empty), the code instead runs in a uv-resolved
+    throwaway subprocess environment; the result flows back through the same
+    save/record/lineage path."""
+    started_at = _now()
+    inputs = [get_artifact_by_row_id(conn, rid) for rid in input_row_ids]
+
+    try:
+        _check_inputs(inputs)
+        if requirements:
+            from dsos import sandbox
+            run = sandbox.run_subprocess(
+                code=code, requirements=list(requirements),
+                code_paths=code_paths, inputs=inputs,
+            )
+        else:
+            run = _run_python_inprocess(code=code, inputs=inputs, code_paths=code_paths)
+    except Exception as exc:
+        # dsos-side failures around the run (missing-blob inputs, bad
+        # code_paths, sandbox plumbing) — user-code failures are already
+        # captured inside the run dicts above.
+        run = {"status": "error", "error": f"{type(exc).__name__}: {exc}",
+               "stdout": "", "stderr": traceback.format_exc(), "result": pd.DataFrame()}
+
     if scratch:
         return _scratch_payload(run, input_row_ids)
 
-    output_format = _infer_format(result) if status == "ok" else output_format
+    status, error, result = run["status"], run["error"], run["result"]
+    output_format = _infer_format(result) if status == "ok" else "parquet"
     output_row_id = save_artifact(
         conn, type=output_type, title=title, description=description,
         content=result, content_format=output_format, session_id=session_id,
@@ -221,12 +265,6 @@ def run_python(
         output_summary=_output_summary(result),
     )
     return output_row_id
-
-
-def _safe_table_name(title: str) -> str:
-    import re
-    name = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
-    return name or "t"
 
 
 def _infer_format(result: Any) -> str:
