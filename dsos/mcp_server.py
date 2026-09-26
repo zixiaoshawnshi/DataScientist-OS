@@ -194,9 +194,15 @@ def save_artifact(
     them — and show up as `uses` when this narrative is fetched later.
 
     `source`: freeform, but for a fetched dataset prefer {"url": ...,
-    "fetched_at": ...} (ISO-ish timestamp/description of when) plus
-    whatever else identifies it (e.g. "survey": "Stack Overflow 2024") —
-    this is the only provenance a later session/report has to go on.
+    "fetched_at": ... (ISO-ish timestamp/description of when), "method": ...
+    (how it was fetched, e.g. "WebFetch"/"curl"/"Kaggle API"), "refresh_after":
+    ... (how long this stays fresh, e.g. "7d"/"30d"/"static" — your call, not
+    enforced)} plus whatever else identifies it (e.g. "survey": "Stack
+    Overflow 2024") — this is the only provenance a later session/report has
+    to go on, and the only record of how/when this was retrieved: dsos can't
+    see a fetch you ran with your own tools, only what you put here. Nothing
+    computes staleness automatically — before reusing a dataset, check
+    `fetched_at`/`refresh_after` yourself and decide if it's worth refetching.
 
     The response's `table_name` is this artifact's title, normalized
     exactly the way run_sql/run_python will register it (lowercased,

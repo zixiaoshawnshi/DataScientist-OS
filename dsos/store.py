@@ -241,6 +241,11 @@ def _row_to_artifact(row: sqlite3.Row, *, load_content: bool) -> Artifact:
             # (moved store, cleared cache, ...) — surface that distinctly
             # instead of crashing every caller that fetches this artifact.
             art.content_error = f"content blob missing on disk: {art.content_ref}"
+        except UnicodeDecodeError:
+            # Same reasoning as the missing-blob case: a blob that's present
+            # but not valid UTF-8 (partial write, wrong encoding at save
+            # time, ...) shouldn't 500 every caller either.
+            art.content_error = f"content blob is not valid UTF-8 (corrupt on disk): {art.content_ref}"
     return art
 
 
@@ -392,7 +397,7 @@ def get_execution(conn: sqlite3.Connection, output_row_id: str) -> dict | None:
     if row is None:
         return None
     return {
-        "kind": row["kind"], "status": row["status"],
+        "kind": row["kind"], "code": row["code"], "status": row["status"],
         "stdout": row["stdout"], "stderr": row["stderr"], "error": row["error"],
         "output_summary": json.loads(row["output_summary"]),
     }

@@ -132,12 +132,13 @@ existing one — otherwise dev/test traffic is already sitting in the store the
 
 ## Browsing the store (GUI)
 
-A read-only web view over the same store — sessions, the tool-call feed,
-an artifact gallery/search, artifact detail (preview, execution trace,
-lineage), and a Mermaid.js lineage graph. It's a separate process, not an
-MCP tool: it reads `dsos.store` directly off the same SQLite file the MCP
-server is writing to (safe under concurrent read/write — see `dsos/db.py`'s
-`PRAGMA journal_mode=WAL`).
+A read-only web view over the same store — a persistent left nav (sessions,
+all artifacts, quick per-type filters) around sessions, the tool-call feed,
+an artifact gallery/search, and artifact detail (preview, execution trace),
+with an inline Lineage tab (Mermaid.js graph, no separate page to navigate
+to). It's a separate process, not an MCP tool: it reads `dsos.store`
+directly off the same SQLite file the MCP server is writing to (safe under
+concurrent read/write — see `dsos/db.py`'s `PRAGMA journal_mode=WAL`).
 
 ```sh
 .venv/Scripts/python -m dsos.gui
@@ -145,6 +146,12 @@ server is writing to (safe under concurrent read/write — see `dsos/db.py`'s
 
 Then open `http://127.0.0.1:8420`. Point `DSOS_DB_PATH` at the same file
 you pointed the MCP server at (above) to browse the same live session.
+
+A narrative artifact's detail page also links to `/artifacts/{row_id}/report`
+— its published report rendered live by this same process (same rendering
+core as `publish_report`, just served over HTTP instead of read from a
+local file; nothing is written to disk on this path, so it's always
+current).
 
 ## Publishing a report
 
@@ -213,9 +220,10 @@ dsos/
                  server and the GUI so they can't drift apart
   mcp_server.py  FastMCP wrapper exposing the tools + a middleware that
                  auto-logs every tool call
-  publish.py     renders a narrative + its embeds into one self-contained
-                 .html file via a template; wrapped as the publish_report
-                 MCP tool
+  publish.py     renders a narrative + its embeds into HTML via a template
+                 (render_report_html); publish_report (the MCP tool) writes
+                 that to one self-contained .html file, the GUI's
+                 /artifacts/{row_id}/report route serves it live instead
   assets/        built-in chart styles (.mplstyle) and report layouts
                  (.html) — package files, not artifacts; customs are
                  `template` artifacts

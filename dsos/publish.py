@@ -56,6 +56,11 @@ def _get_narrative(conn: sqlite3.Connection, row_id: str) -> Artifact:
         raise ValueError(f"no artifact with row_id {row_id!r}")
     if art.type != "narrative":
         raise ValueError(f"publish_report expects a narrative artifact, got type={art.type!r}")
+    if art.content_error:
+        raise ValueError(
+            f"narrative {row_id!r}: its content blob can't be read ({art.content_error}) "
+            f"— re-save the narrative"
+        )
     return art
 
 
@@ -93,30 +98,14 @@ def preview_report(conn: sqlite3.Connection, row_id: str) -> dict:
     }
 
 
-def publish_report(
-    conn: sqlite3.Connection, row_id: str, *, output_dir: str = "data/reports",
-    template: str = "report",
-) -> dict:
-    """Render a narrative artifact and every artifact it embeds into one
-    self-contained .html file (images inlined as base64 data URIs — no
-    sibling image files, per the Part 1 scope cut). Returns
-    {"path": ..., "embeds": [...], "artifact_row_ids": [...]}.
-
-    `template`: the HTML layout (the consistency layer — dsos/templating.py).
-    Built-ins: "report" (the dark house layout — the default), "default"
-    (the original plain light look), "minimal" (bare HTML); or a custom
-    report-template artifact's row_id/artifact_id. Resolved before
-    rendering, so a bad reference fails before any file is written.
-
-    `embeds` (feedback #3) lists what actually got pulled into this report
-    — row_id/type/title for each {{artifact:...}} reference, and whether it
-    resolved — a quick confirmation of what's in the report without a
-    separate get_lineage call.
-
-    Does not create a new artifact row: a rendered export isn't itself a
-    versioned analysis artifact, it's the exit from this layer — publish
-    the narrative itself first (save_artifact) if it should stay reusable.
-    """
+def render_report_html(
+    conn: sqlite3.Connection, row_id: str, *, template: str = "report",
+) -> tuple[str, Artifact, list[dict]]:
+    """The rendering core of publish_report, minus the file write — shared
+    with the GUI's on-demand `/artifacts/{row_id}/report` route (serve a
+    narrative straight from the running server, no local .html file needed)
+    so the two paths can't drift apart. Returns (page_html, narrative
+    artifact, embeds)."""
     art = _get_narrative(conn, row_id)
     embeds = _resolve_embeds(conn, art.content)
     template_text = templating.resolve_report_template(conn, template)
@@ -146,6 +135,34 @@ def publish_report(
         published_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         session_question=html.escape(session["question"]) if session else "",
     )
+    return page, art, embeds
+
+
+def publish_report(
+    conn: sqlite3.Connection, row_id: str, *, output_dir: str = "data/reports",
+    template: str = "report",
+) -> dict:
+    """Render a narrative artifact and every artifact it embeds into one
+    self-contained .html file (images inlined as base64 data URIs — no
+    sibling image files, per the Part 1 scope cut). Returns
+    {"path": ..., "embeds": [...], "artifact_row_ids": [...]}.
+
+    `template`: the HTML layout (the consistency layer — dsos/templating.py).
+    Built-ins: "report" (the dark house layout — the default), "default"
+    (the original plain light look), "minimal" (bare HTML); or a custom
+    report-template artifact's row_id/artifact_id. Resolved before
+    rendering, so a bad reference fails before any file is written.
+
+    `embeds` (feedback #3) lists what actually got pulled into this report
+    — row_id/type/title for each {{artifact:...}} reference, and whether it
+    resolved — a quick confirmation of what's in the report without a
+    separate get_lineage call.
+
+    Does not create a new artifact row: a rendered export isn't itself a
+    versioned analysis artifact, it's the exit from this layer — publish
+    the narrative itself first (save_artifact) if it should stay reusable.
+    """
+    page, art, embeds = render_report_html(conn, row_id, template=template)
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
