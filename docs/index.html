@@ -7,6 +7,7 @@
 <meta name="description" content="An MCP server for data scientists and analysts that keeps queries, datasets, charts, and narratives organized as versioned, searchable artifacts.">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swiper@11/swiper-bundle.min.css">
 <style>
   :root {
     --bg: #fbfbfa; --ink: #14161a; --muted: #6b7078; --accent: #2f6f5e; --line: #e4e3df;
@@ -25,20 +26,17 @@
   }
 
   * { box-sizing: border-box; }
-  html { height: 100%; }
+  html, body { height: 100%; }
   body {
     margin: 0; background: var(--bg); color: var(--ink);
     font-family: "JetBrains Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
-    height: 100vh; height: 100dvh;
-    overflow-y: auto; overscroll-behavior-y: contain;
+    overflow: hidden; /* Swiper owns all scrolling/paging via its own transforms */
   }
 
-  /* --- each top-level section is exactly one viewport, no internal scroll ---
-     navigation between them is fully JS-driven (see script at the bottom);
-     no CSS scroll-snap here on purpose — it was fighting the JS-driven
-     smooth scroll (double animation, imprecise landing) */
+  .swiper { width: 100%; height: 100vh; height: 100dvh; }
+
+  /* --- each slide is exactly one viewport, no internal scroll --- */
   .panel {
-    height: 100vh; height: 100dvh;
     display: flex; flex-direction: column; justify-content: center;
     overflow: hidden;
     padding: 2.75rem 1.25rem calc(2.75rem + var(--footer-h));
@@ -75,7 +73,7 @@
     color: #6fcbb2; text-decoration-color: #6fcbb2;
   }
 
-  /* --- phase-in intro on the hero's own text --- */
+  /* --- phase-in intro on the hero's own text, on page load --- */
   @keyframes phase-in {
     from { opacity: 0; transform: translateY(10px); }
     to { opacity: 1; transform: translateY(0); }
@@ -89,7 +87,7 @@
   .hero-content p.pitch { animation-delay: 0.5s; }
   .hero-content .watch-link { animation-delay: 0.72s; }
 
-  /* --- replayable enter transition for every other panel, toggled by the scroll controller --- */
+  /* --- replayable enter transition for every other slide's content --- */
   @keyframes panel-in {
     from { opacity: 0; transform: translateY(18px); }
     to { opacity: 1; transform: translateY(0); }
@@ -177,7 +175,7 @@
   }
   table.artifact-table code { color: var(--ink); }
 
-  /* --- persistent footer, fixed over every panel --- */
+  /* --- persistent footer, fixed over every slide --- */
   .site-footer {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
     height: var(--footer-h);
@@ -195,141 +193,142 @@
   nav.links a:hover, nav.links a:focus-visible { border-color: var(--accent); color: var(--accent); }
   nav.links .sep { color: var(--line); }
 
-  /* --- scroll-position dots --- */
-  .dots {
-    position: fixed; right: 1.1rem; top: 50%; transform: translateY(-50%);
-    z-index: 20; display: flex; flex-direction: column; gap: 0.6rem;
+  /* --- Swiper's own pagination dots, restyled to match the site --- */
+  .swiper-pagination-vertical.swiper-pagination-bullets {
+    right: 1.1rem; z-index: 20;
   }
-  .dots button {
-    width: 0.5rem; height: 0.5rem; padding: 0; border-radius: 50%;
-    border: 1px solid var(--muted); background: transparent; cursor: pointer;
+  .swiper-pagination-bullet {
+    width: 0.5rem; height: 0.5rem; margin: 0.4rem 0 !important;
+    background: transparent; opacity: 1;
+    border: 1px solid var(--muted);
   }
-  .dots button.is-active { background: var(--accent); border-color: var(--accent); }
-  @media (max-width: 640px) { .dots { display: none; } }
+  .swiper-pagination-bullet-active { background: var(--accent); border-color: var(--accent); }
+  @media (max-width: 640px) { .swiper-pagination { display: none; } }
 </style>
 </head>
 <body>
 
-<section class="panel hero" id="panel-hero">
-  <video class="hero-media" autoplay muted loop playsinline preload="auto" onerror="this.style.display='none'">
-    <source src="media/demo.mp4" type="video/mp4">
-  </video>
-  <div class="hero-scrim"></div>
-  <div class="panel-inner hero-content">
-    <p class="eyebrow">for data scientists &amp; analysts</p>
-    <h1>dsos</h1>
-    <p class="pitch">
-      An MCP server that keeps your coding agent's queries, datasets,
-      charts, and narratives organized as <em>versioned, searchable
-      artifacts</em> — so your analysis stops scattering across
-      notebooks, chat scrollback, and one-off scripts.
-    </p>
-    <a class="watch-link" href="media/demo.mp4">watch the full recording &#8599;</a>
-  </div>
-</section>
+<div class="swiper" id="site-swiper">
+  <div class="swiper-wrapper">
 
-<section class="panel" id="panel-features">
-  <div class="panel-inner">
-    <div class="block-head"><span class="label">what it gives you</span></div>
-    <ul class="features">
-      <li><strong>artifact management</strong> — every query, dataset, transform, chart, and narrative saved, versioned, and searchable through one schema.</li>
-      <li><strong>lineage</strong> — parents and children tracked automatically on every run — no manual bookkeeping.</li>
-      <li><strong>skills &amp; templates</strong> — workflow instructions and chart/report styling, both customizable and versioned like everything else.</li>
-      <li><strong>GUI</strong> — a read-only browser over the same store: sessions, tool-call feed, artifact gallery, lineage graph.</li>
-    </ul>
-  </div>
-</section>
-
-<section class="panel" id="panel-install">
-  <div class="panel-inner">
-    <div class="block-head">
-      <div class="tabs" role="tablist" aria-label="Coding agent">
-        <button class="tab is-active" type="button" role="tab" aria-selected="true" data-tab="claude">claude code</button>
-        <button class="tab" type="button" role="tab" aria-selected="false" data-tab="pi">pi</button>
-        <button class="tab" type="button" role="tab" aria-selected="false" data-tab="codex">codex</button>
-        <button class="tab" type="button" role="tab" aria-selected="false" data-tab="opencode">opencode</button>
+    <section class="swiper-slide panel hero" id="panel-hero">
+      <video class="hero-media" autoplay muted loop playsinline preload="auto" onerror="this.style.display='none'">
+        <source src="media/demo.mp4" type="video/mp4">
+      </video>
+      <div class="hero-scrim"></div>
+      <div class="panel-inner hero-content">
+        <p class="eyebrow">for data scientists &amp; analysts</p>
+        <h1>dsos</h1>
+        <p class="pitch">
+          An MCP server that keeps your coding agent's queries, datasets,
+          charts, and narratives organized as <em>versioned, searchable
+          artifacts</em> — so your analysis stops scattering across
+          notebooks, chat scrollback, and one-off scripts.
+        </p>
+        <a class="watch-link" href="media/demo.mp4">watch the full recording &#8599;</a>
       </div>
-      <button class="copy" type="button">copy</button>
-    </div>
-    <pre class="cmd" data-panel="claude"><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
+    </section>
+
+    <section class="swiper-slide panel" id="panel-features">
+      <div class="panel-inner">
+        <div class="block-head"><span class="label">what it gives you</span></div>
+        <ul class="features">
+          <li><strong>artifact management</strong> — every query, dataset, transform, chart, and narrative saved, versioned, and searchable through one schema.</li>
+          <li><strong>lineage</strong> — parents and children tracked automatically on every run — no manual bookkeeping.</li>
+          <li><strong>skills &amp; templates</strong> — workflow instructions and chart/report styling, both customizable and versioned like everything else.</li>
+          <li><strong>GUI</strong> — a read-only browser over the same store: sessions, tool-call feed, artifact gallery, lineage graph.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="swiper-slide panel" id="panel-install">
+      <div class="panel-inner">
+        <div class="block-head">
+          <div class="tabs" role="tablist" aria-label="Coding agent">
+            <button class="tab is-active" type="button" role="tab" aria-selected="true" data-tab="claude">claude code</button>
+            <button class="tab" type="button" role="tab" aria-selected="false" data-tab="pi">pi</button>
+            <button class="tab" type="button" role="tab" aria-selected="false" data-tab="codex">codex</button>
+            <button class="tab" type="button" role="tab" aria-selected="false" data-tab="opencode">opencode</button>
+          </div>
+          <button class="copy" type="button">copy</button>
+        </div>
+        <pre class="cmd" data-panel="claude"><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
 <span class="p">$</span> claude mcp add dsos -s user -- python -m dsos.mcp_server</pre>
-    <pre class="cmd" data-panel="pi" hidden><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
+        <pre class="cmd" data-panel="pi" hidden><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
 <span class="p">$</span> pi install npm:pi-mcp-adapter
 <span class="c"># then add to ~/.config/mcp/mcp.json</span>
 { "mcpServers": { "dsos": { "command": "python", "args": ["-m", "dsos.mcp_server"] } } }</pre>
-    <pre class="cmd" data-panel="codex" hidden><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
+        <pre class="cmd" data-panel="codex" hidden><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
 <span class="p">$</span> codex mcp add dsos -- python -m dsos.mcp_server</pre>
-    <pre class="cmd" data-panel="opencode" hidden><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
+        <pre class="cmd" data-panel="opencode" hidden><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
 <span class="c"># then add to opencode.json</span>
 { "mcp": { "dsos": { "type": "local", "command": ["python", "-m", "dsos.mcp_server"] } } }</pre>
 
-    <div class="sub-block">
-      <div class="block-head">
-        <span class="label">or, hand this to your agent</span>
-        <button class="copy" type="button" data-copy="cmd-prompt">copy</button>
+        <div class="sub-block">
+          <div class="block-head">
+            <span class="label">or, hand this to your agent</span>
+            <button class="copy" type="button" data-copy="cmd-prompt">copy</button>
+          </div>
+          <p class="prompt-text" id="cmd-prompt">Please look at https://github.com/zixiaoshawnshi/DataScientist-OS and set up dsos as an MCP server for me.</p>
+        </div>
       </div>
-      <p class="prompt-text" id="cmd-prompt">Please look at https://github.com/zixiaoshawnshi/DataScientist-OS and set up dsos as an MCP server for me.</p>
-    </div>
-  </div>
-</section>
+    </section>
 
-<section class="panel" id="panel-artifacts">
-  <div class="panel-inner">
-    <div class="block-head">
-      <span class="label">everything is an artifact</span>
-    </div>
-    <div class="tabs tab-row" role="tablist" aria-label="Artifact type">
-      <button class="tab is-active" type="button" role="tab" aria-selected="true" data-tab="dataset">dataset</button>
-      <button class="tab" type="button" role="tab" aria-selected="false" data-tab="query">query</button>
-      <button class="tab" type="button" role="tab" aria-selected="false" data-tab="transform">transform</button>
-      <button class="tab" type="button" role="tab" aria-selected="false" data-tab="chart">chart</button>
-      <button class="tab" type="button" role="tab" aria-selected="false" data-tab="narrative">narrative</button>
-      <button class="tab" type="button" role="tab" aria-selected="false" data-tab="skill">skill</button>
-      <button class="tab" type="button" role="tab" aria-selected="false" data-tab="template">template</button>
-    </div>
-    <table class="artifact-table" data-panel="dataset">
-      <tr><th>what</th><td>A registered source of data — <code>source</code> captures url, method, and fetch time, not just the file itself.</td></tr>
-      <tr><th>made via</th><td><code>save_artifact(type="dataset", source=...)</code></td></tr>
-      <tr><th>example</th><td>A CSV pulled from a public API, registered once before anything queries it.</td></tr>
-    </table>
-    <table class="artifact-table" data-panel="query" hidden>
-      <tr><th>what</th><td>A SQL query run against a dataset — the query text and its result both become artifacts, automatically.</td></tr>
-      <tr><th>made via</th><td><code>run_sql(...)</code></td></tr>
-      <tr><th>example</th><td>"group by category, count rows" — reusable the next time the same question comes up.</td></tr>
-    </table>
-    <table class="artifact-table" data-panel="transform" hidden>
-      <tr><th>what</th><td>A Python transformation of one or more prior artifacts, recorded with its code, inputs, and status.</td></tr>
-      <tr><th>made via</th><td><code>run_python(...)</code></td></tr>
-      <tr><th>example</th><td>Joining two datasets, or computing a derived column.</td></tr>
-    </table>
-    <table class="artifact-table" data-panel="chart" hidden>
-      <tr><th>what</th><td>A rendered PNG, styled by whichever chart-style template is active.</td></tr>
-      <tr><th>made via</th><td><code>run_python(output_type="chart", style=...)</code></td></tr>
-      <tr><th>example</th><td>A bar chart that later embeds into a report unchanged.</td></tr>
-    </table>
-    <table class="artifact-table" data-panel="narrative" hidden>
-      <tr><th>what</th><td>Markdown that embeds other artifacts by reference — the composition layer everything else feeds into.</td></tr>
-      <tr><th>made via</th><td><code>save_artifact(type="narrative", content="... {{artifact:42}} ...")</code></td></tr>
-      <tr><th>example</th><td>A write-up that pulls in three prior charts and a table, then <code>publish_report</code> renders it to one self-contained HTML file.</td></tr>
-    </table>
-    <table class="artifact-table" data-panel="skill" hidden>
-      <tr><th>what</th><td>Markdown workflow instructions the agent reads and follows — teaches process, not code.</td></tr>
-      <tr><th>made via</th><td><code>save_skill(...)</code> — an edit is a new version of the same skill</td></tr>
-      <tr><th>example</th><td>"how to discover a new dataset," seeded into every fresh store.</td></tr>
-    </table>
-    <table class="artifact-table" data-panel="template" hidden>
-      <tr><th>what</th><td>A chart style or report layout — versioned like everything else, not a hardcoded default.</td></tr>
-      <tr><th>made via</th><td><code>save_template(kind=..., base=...)</code></td></tr>
-      <tr><th>example</th><td>A custom dark report layout your narratives render into.</td></tr>
-    </table>
-  </div>
-</section>
+    <section class="swiper-slide panel" id="panel-artifacts">
+      <div class="panel-inner">
+        <div class="block-head">
+          <span class="label">everything is an artifact</span>
+        </div>
+        <div class="tabs tab-row" role="tablist" aria-label="Artifact type">
+          <button class="tab is-active" type="button" role="tab" aria-selected="true" data-tab="dataset">dataset</button>
+          <button class="tab" type="button" role="tab" aria-selected="false" data-tab="query">query</button>
+          <button class="tab" type="button" role="tab" aria-selected="false" data-tab="transform">transform</button>
+          <button class="tab" type="button" role="tab" aria-selected="false" data-tab="chart">chart</button>
+          <button class="tab" type="button" role="tab" aria-selected="false" data-tab="narrative">narrative</button>
+          <button class="tab" type="button" role="tab" aria-selected="false" data-tab="skill">skill</button>
+          <button class="tab" type="button" role="tab" aria-selected="false" data-tab="template">template</button>
+        </div>
+        <table class="artifact-table" data-panel="dataset">
+          <tr><th>what</th><td>A registered source of data — <code>source</code> captures url, method, and fetch time, not just the file itself.</td></tr>
+          <tr><th>made via</th><td><code>save_artifact(type="dataset", source=...)</code></td></tr>
+          <tr><th>example</th><td>A CSV pulled from a public API, registered once before anything queries it.</td></tr>
+        </table>
+        <table class="artifact-table" data-panel="query" hidden>
+          <tr><th>what</th><td>A SQL query run against a dataset — the query text and its result both become artifacts, automatically.</td></tr>
+          <tr><th>made via</th><td><code>run_sql(...)</code></td></tr>
+          <tr><th>example</th><td>"group by category, count rows" — reusable the next time the same question comes up.</td></tr>
+        </table>
+        <table class="artifact-table" data-panel="transform" hidden>
+          <tr><th>what</th><td>A Python transformation of one or more prior artifacts, recorded with its code, inputs, and status.</td></tr>
+          <tr><th>made via</th><td><code>run_python(...)</code></td></tr>
+          <tr><th>example</th><td>Joining two datasets, or computing a derived column.</td></tr>
+        </table>
+        <table class="artifact-table" data-panel="chart" hidden>
+          <tr><th>what</th><td>A rendered PNG, styled by whichever chart-style template is active.</td></tr>
+          <tr><th>made via</th><td><code>run_python(output_type="chart", style=...)</code></td></tr>
+          <tr><th>example</th><td>A bar chart that later embeds into a report unchanged.</td></tr>
+        </table>
+        <table class="artifact-table" data-panel="narrative" hidden>
+          <tr><th>what</th><td>Markdown that embeds other artifacts by reference — the composition layer everything else feeds into.</td></tr>
+          <tr><th>made via</th><td><code>save_artifact(type="narrative", content="... {{artifact:42}} ...")</code></td></tr>
+          <tr><th>example</th><td>A write-up that pulls in three prior charts and a table, then <code>publish_report</code> renders it to one self-contained HTML file.</td></tr>
+        </table>
+        <table class="artifact-table" data-panel="skill" hidden>
+          <tr><th>what</th><td>Markdown workflow instructions the agent reads and follows — teaches process, not code.</td></tr>
+          <tr><th>made via</th><td><code>save_skill(...)</code> — an edit is a new version of the same skill</td></tr>
+          <tr><th>example</th><td>"how to discover a new dataset," seeded into every fresh store.</td></tr>
+        </table>
+        <table class="artifact-table" data-panel="template" hidden>
+          <tr><th>what</th><td>A chart style or report layout — versioned like everything else, not a hardcoded default.</td></tr>
+          <tr><th>made via</th><td><code>save_template(kind=..., base=...)</code></td></tr>
+          <tr><th>example</th><td>A custom dark report layout your narratives render into.</td></tr>
+        </table>
+      </div>
+    </section>
 
-<div class="dots" aria-hidden="true">
-  <button data-goto="panel-hero" class="is-active" aria-label="Intro"></button>
-  <button data-goto="panel-features" aria-label="Features"></button>
-  <button data-goto="panel-install" aria-label="Install"></button>
-  <button data-goto="panel-artifacts" aria-label="Artifact types"></button>
+  </div>
+
+  <div class="swiper-pagination"></div>
 </div>
 
 <footer class="site-footer">
@@ -346,6 +345,7 @@
   </nav>
 </footer>
 
+<script src="https://cdn.jsdelivr.net/npm/swiper@11/swiper-bundle.min.js"></script>
 <script>
   document.querySelectorAll('.tabs').forEach(function (tabs) {
     var buttons = tabs.querySelectorAll('.tab');
@@ -396,133 +396,27 @@
     sel.addRange(range);
   }
 
-  // --- paginated navigation: one wheel notch / key press / swipe = exactly one panel ---
-  //
-  // Previous version guessed how long the browser's smooth-scroll animation
-  // would take (a fixed timeout) and unlocked input on that guess. When the
-  // guess was even slightly off, a stray input mid-animation could retarget
-  // the scroll before it finished, landing between two panels instead of on
-  // one — which read as "the text isn't centered." This version instead
-  // waits for the browser's own `scrollend` event (the actual signal that
-  // scrolling has settled, not an estimate of it) and then force-corrects
-  // the scroll position to the exact top of the nearest panel — so no
-  // matter what caused the scroll, it always finishes precisely aligned.
-  (function () {
-    var scroller = document.body;
-    var panels = Array.prototype.slice.call(document.querySelectorAll('.panel'));
-    var dotButtons = Array.prototype.slice.call(document.querySelectorAll('.dots button'));
-    var current = 0;
-    var busy = false;
+  function replayContent(slideEl) {
+    var inner = slideEl && slideEl.querySelector('.panel-inner');
+    if (!inner || slideEl.classList.contains('hero')) return;
+    inner.classList.remove('is-in');
+    void inner.offsetWidth; // force reflow so the animation restarts
+    inner.classList.add('is-in');
+  }
 
-    function updateDots() {
-      var id = panels[current].id;
-      dotButtons.forEach(function (dot) {
-        dot.classList.toggle('is-active', dot.getAttribute('data-goto') === id);
-      });
-    }
-
-    function replayContent(panel) {
-      var inner = panel.querySelector('.panel-inner');
-      if (!inner || panel.classList.contains('hero')) return;
-      inner.classList.remove('is-in');
-      void inner.offsetWidth; // force reflow so the animation restarts
-      inner.classList.add('is-in');
-    }
-
-    function nearestIndex() {
-      var vh = scroller.clientHeight || 1;
-      return Math.max(0, Math.min(panels.length - 1, Math.round(scroller.scrollTop / vh)));
-    }
-
-    function settle(behavior) {
-      current = nearestIndex();
-      var vh = scroller.clientHeight;
-      // only force a correction if we're not already essentially on it —
-      // avoids re-triggering scrollend in a loop.
-      if (Math.abs(scroller.scrollTop - current * vh) > 1) {
-        panels[current].scrollIntoView({ behavior: behavior || 'auto', block: 'start' });
-      }
-      updateDots();
-    }
-
-    var settleTimer = null;
-    var backstopTimer = null;
-
-    function onScrollSettled() {
-      clearTimeout(backstopTimer);
-      busy = false;
-      settle('auto');
-    }
-
-    function goTo(index) {
-      index = Math.max(0, Math.min(panels.length - 1, index));
-      if (index === current) return;
-      current = index;
-      busy = true;
-      panels[current].scrollIntoView({ behavior: 'smooth', block: 'start' });
-      updateDots();
-      replayContent(panels[current]);
-      // guaranteed unlock even if scrollend never fires for this scroller/
-      // browser/trigger (seen in practice: input stayed locked forever
-      // after the first transition once scrollend silently never arrived).
-      // Harmless to double-call onScrollSettled if the real event does
-      // also fire — settle()/updateDots() are idempotent.
-      clearTimeout(backstopTimer);
-      backstopTimer = setTimeout(onScrollSettled, 900);
-    }
-
-    if ('onscrollend' in window) {
-      scroller.addEventListener('scrollend', onScrollSettled);
-    }
-    // always keep the debounced scroll fallback too, not just when
-    // scrollend is unsupported — cheap, and another way to recover early
-    // if scrollend turns out not to fire for this element in practice.
-    scroller.addEventListener('scroll', function () {
-      clearTimeout(settleTimer);
-      settleTimer = setTimeout(onScrollSettled, 120);
-    }, { passive: true });
-
-    window.addEventListener('wheel', function (e) {
-      e.preventDefault();
-      // trackpads emit a near-zero deltaY as a gesture ramps up; treating
-      // that as a real tick misfires goTo() the wrong way on the very
-      // first scroll of a gesture (looked like "nothing happened").
-      if (busy || Math.abs(e.deltaY) < 4) return;
-      goTo(current + (e.deltaY > 0 ? 1 : -1));
-    }, { passive: false });
-
-    window.addEventListener('keydown', function (e) {
-      if (e.key === 'ArrowDown' || e.key === 'PageDown' || e.key === ' ') {
-        e.preventDefault();
-        if (!busy) goTo(current + 1);
-      } else if (e.key === 'ArrowUp' || e.key === 'PageUp') {
-        e.preventDefault();
-        if (!busy) goTo(current - 1);
-      }
-    });
-
-    var touchStartY = null;
-    window.addEventListener('touchstart', function (e) {
-      touchStartY = e.touches[0].clientY;
-    }, { passive: true });
-    window.addEventListener('touchmove', function (e) {
-      e.preventDefault();
-    }, { passive: false });
-    window.addEventListener('touchend', function (e) {
-      if (touchStartY === null || busy) return;
-      var dy = touchStartY - e.changedTouches[0].clientY;
-      touchStartY = null;
-      if (Math.abs(dy) > 40) goTo(current + (dy > 0 ? 1 : -1));
-    }, { passive: true });
-
-    dotButtons.forEach(function (dot) {
-      dot.addEventListener('click', function () {
-        goTo(panels.findIndex(function (p) { return p.id === dot.getAttribute('data-goto'); }));
-      });
-    });
-
-    updateDots();
-  })();
+  var swiper = new Swiper('#site-swiper', {
+    direction: 'vertical',
+    slidesPerView: 1,
+    speed: 500,
+    mousewheel: true,
+    keyboard: { enabled: true, pageUpDown: true },
+    pagination: { el: '.swiper-pagination', clickable: true },
+    on: {
+      slideChangeTransitionEnd: function (sw) {
+        replayContent(sw.slides[sw.activeIndex]);
+      },
+    },
+  });
 </script>
 </body>
 </html>
