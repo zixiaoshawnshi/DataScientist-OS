@@ -142,7 +142,10 @@ def artifact_lineage(request: Request, row_id: str):
 
 
 def _mermaid_node(a: store.Artifact) -> str:
-    title = a.title.replace('"', "'")
+    # The template renders the graph with |safe (Mermaid syntax can't survive
+    # HTML escaping), so strip angle brackets here — a title containing HTML
+    # must not end up injected raw into the page.
+    title = a.title.replace('"', "'").replace("<", "&lt;").replace(">", "&gt;")
     return f'{a.row_id}["{title} ({a.type})"]'
 
 

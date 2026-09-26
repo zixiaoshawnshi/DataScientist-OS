@@ -3,10 +3,24 @@
 {% block head %}
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
 <script>
-  window.addEventListener("DOMContentLoaded", () => mermaid.initialize({ startOnLoad: true }));
+  // startOnLoad: false + explicit run() so the graph is only rendered once
+  // it's visible — Mermaid measures text while rendering, and a
+  // display:none container yields a broken, zero-size SVG.
+  window.addEventListener("DOMContentLoaded", () => {
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: document.documentElement.dataset.theme === "dark" ? "dark" : "default",
+    });
+    dsosRenderVisibleMermaid();
+  });
+  function dsosRenderVisibleMermaid() {
+    var nodes = document.querySelectorAll(".tab-pane.active .mermaid:not([data-processed])");
+    if (nodes.length) mermaid.run({ nodes: Array.from(nodes) }).catch(console.error);
+  }
   function dsosShowTab(name) {
     document.querySelectorAll(".tab-pane").forEach(el => el.classList.toggle("active", el.dataset.tab === name));
     document.querySelectorAll(".tabs button").forEach(el => el.classList.toggle("active", el.dataset.tab === name));
+    dsosRenderVisibleMermaid();
   }
 </script>
 {% endblock %}
@@ -102,7 +116,7 @@ ERROR: {{ execution.error }}{% endif %}</pre>
 {% else %}
 <h2>Graph</h2>
 <div class="mermaid">
-{{ graph }}
+{{ graph|safe }}
 </div>
 {% endif %}
 </div>
