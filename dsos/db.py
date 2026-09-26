@@ -104,7 +104,11 @@ def connect(db_path: str | Path = "data/store.db") -> sqlite3.Connection:
     """Open (and if needed, initialize) the store's SQLite database."""
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, factory=_Connection)
+    # check_same_thread=False: the MCP server runs tools in a thread pool by
+    # default (FastMCP's run_in_thread), so this connection is used from
+    # whichever thread handles each call. Fine at demo scale (effectively
+    # one call in flight at a time) — not a claim of real concurrency safety.
+    conn = sqlite3.connect(path, factory=_Connection, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     conn.commit()

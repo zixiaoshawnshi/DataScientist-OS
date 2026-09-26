@@ -21,14 +21,14 @@ any other research task.
 Before committing to a dataset: check its size and inspect its schema/columns
 — don't fetch something huge you'll only use a slice of.
 
-After fetching, you MUST register it:
+After fetching to a local file (csv/tsv/json/parquet), you MUST register it:
 
     save_artifact(
         type="dataset",
         title="...",
         description="1-2 sentences: what this contains and why you fetched it",
-        content=<the data>,
-        content_format="parquet" | "csv",
+        content_path="<local path to the file you fetched>",
+        content_format="parquet",   # datasets are normalized to parquet on ingest
         source={"url": "<where it came from>", "fetched_at": "<timestamp>"},
         session_id=<current session>,
     )
