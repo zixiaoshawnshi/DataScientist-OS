@@ -20,6 +20,7 @@ from dsos.db import connect
 from dsos.execution import run_sql
 from dsos.seed import seed
 from dsos.store import (
+    get_artifact_by_row_id,
     get_lineage,
     log_tool_call,
     reused_artifact_row_ids,
@@ -93,6 +94,21 @@ def main() -> None:
     )
     print("[ok] narrative's {{artifact:...}} embed auto-derived lineage to the dataset")
 
+    # --- Unicode round-trip: blob write/read must be UTF-8 regardless of the
+    # OS locale. This is a regression test for a real crash on a
+    # GBK-locale Windows machine (emoji in a narrative hit
+    # "'gbk' codec can't encode character '\U0001f3c6'" on save). ---
+    unicode_text = "🏆 报告 — café naïve — λ² Σ ✓"
+    unicode_row = save_artifact(
+        conn, type="narrative", title="Unicode Report",
+        description="Regression test for UTF-8 blob storage under any OS locale.",
+        content=unicode_text, content_format="markdown", session_id=s1,
+    )
+    assert get_artifact_by_row_id(conn, unicode_row).content == unicode_text, (
+        "blob text must round-trip byte-exact through UTF-8, not the locale codec"
+    )
+    print("[ok] emoji + CJK + accented text round-trips through blob storage")
+
     # --- round 2: reuse round 1's dataset ---
     s2 = start_session(conn, "round 2: deeper synthetic question")
     query2_row = run_sql(
@@ -108,8 +124,6 @@ def main() -> None:
 
     # --- a blob missing from disk (e.g. an accidental cleanup elsewhere)
     # should degrade gracefully, not crash every caller that fetches it ---
-    from dsos.store import get_artifact_by_row_id
-
     dataset_ref = get_artifact_by_row_id(conn, dataset_row, load_content=False).content_ref
     Path(dataset_ref).unlink()
     art = get_artifact_by_row_id(conn, dataset_row)

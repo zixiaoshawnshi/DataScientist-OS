@@ -168,11 +168,16 @@ def _write_blob(
     if content_format == "parquet":
         content.to_parquet(path)  # content: pandas.DataFrame
     elif content_format == "json":
-        path.write_text(json.dumps(content, indent=2))
+        # encoding is explicit because write_text defaults to the locale
+        # codec (GBK on Chinese-locale Windows), which can't encode emoji
+        # or other common Unicode — a real crash seen in a live session.
+        path.write_text(json.dumps(content, indent=2), encoding="utf-8")
     elif content_format == "png":
         path.write_bytes(content)  # content: raw png bytes
     else:  # python, sql, markdown, csv, ... — treat as text
-        path.write_text(content if isinstance(content, str) else str(content))
+        path.write_text(
+            content if isinstance(content, str) else str(content), encoding="utf-8"
+        )
     return str(path)
 
 
@@ -182,10 +187,10 @@ def _load_blob(content_ref: str, content_format: str) -> Any:
         import pandas as pd
         return pd.read_parquet(path)
     if content_format == "json":
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     if content_format == "png":
         return path.read_bytes()
-    return path.read_text()
+    return path.read_text(encoding="utf-8")  # must match _write_blob's encoding
 
 
 def _row_to_artifact(row: sqlite3.Row, *, load_content: bool) -> Artifact:
