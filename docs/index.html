@@ -88,6 +88,16 @@
   .hero-content p.pitch { animation-delay: 0.5s; }
   .hero-content .watch-link { animation-delay: 0.72s; }
 
+  /* --- replayable enter transition for every other panel, toggled by the scroll controller --- */
+  @keyframes panel-in {
+    from { opacity: 0; transform: translateY(18px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .panel:not(.hero) .panel-inner { opacity: 0; }
+  .panel:not(.hero) .panel-inner.is-in {
+    animation: panel-in 0.5s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  }
+
   .eyebrow {
     font-size: 0.78rem; color: var(--muted); margin: 0 0 1.1rem;
     letter-spacing: 0.02em;
@@ -391,7 +401,7 @@
     var dotButtons = Array.prototype.slice.call(document.querySelectorAll('.dots button'));
     var current = 0;
     var locked = false;
-    var LOCK_MS = 550;
+    var LOCK_MS = 700;
 
     function updateDots() {
       var id = panels[current].id;
@@ -400,13 +410,22 @@
       });
     }
 
+    function replayContent(panel) {
+      var inner = panel.querySelector('.panel-inner');
+      if (!inner || panel.classList.contains('hero')) return;
+      inner.classList.remove('is-in');
+      void inner.offsetWidth; // force reflow so the animation restarts
+      inner.classList.add('is-in');
+    }
+
     function goTo(index) {
       index = Math.max(0, Math.min(panels.length - 1, index));
       if (index === current) return;
       current = index;
       locked = true;
-      panels[current].scrollIntoView({ behavior: 'auto', block: 'start' });
+      panels[current].scrollIntoView({ behavior: 'smooth', block: 'start' });
       updateDots();
+      replayContent(panels[current]);
       setTimeout(function () { locked = false; }, LOCK_MS);
     }
 
