@@ -203,7 +203,9 @@ def _ingest_path(path: str, type: str, content_format: str) -> tuple:
     if not p.exists():
         raise ValueError(f"no such file: {path}")
     if type != "dataset":
-        return p.read_text(), content_format
+        # encoding explicit: read_text defaults to the locale codec (e.g.
+        # GBK on Chinese-locale Windows), which chokes on Unicode content
+        return p.read_text(encoding="utf-8"), content_format
 
     ext = p.suffix.lower()
     if ext == ".csv":
