@@ -11,11 +11,25 @@
       font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
       margin: 0; background: #fafafa; color: #1a1a1a;
     }
-    header {
-      padding: 1rem 1.5rem; border-bottom: 1px solid #ddd; background: #fff;
+    .shell { display: flex; min-height: 100vh; }
+    nav.sidebar {
+      width: 200px; flex: 0 0 200px; border-right: 1px solid #ddd; background: #fff;
+      padding: 1.25rem 1rem; box-sizing: border-box;
     }
-    header a { color: #1a1a1a; text-decoration: none; font-weight: 600; }
-    main { padding: 1.5rem; max-width: 960px; margin: 0 auto; }
+    nav.sidebar a.brand {
+      display: block; color: #1a1a1a; text-decoration: none; font-weight: 600;
+      margin-bottom: 1.25rem;
+    }
+    nav.sidebar .group { margin-bottom: 1.25rem; }
+    nav.sidebar .group h3 {
+      font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em;
+      color: #999; margin: 0 0 0.4rem;
+    }
+    nav.sidebar a {
+      display: block; padding: 0.3rem 0; color: #333; text-decoration: none; font-size: 0.9rem;
+    }
+    nav.sidebar a:hover { color: #2563eb; }
+    main { flex: 1; padding: 1.5rem 2rem; max-width: 960px; box-sizing: border-box; }
     h1 { font-size: 1.4rem; }
     h2 { font-size: 1.05rem; margin-top: 2rem; color: #333; }
     table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
@@ -41,11 +55,34 @@
     .feed-item { border-left: 3px solid #2563eb; padding-left: 0.75rem; margin-bottom: 0.75rem; }
     .crumbs { margin-bottom: 1rem; }
     img { max-width: 100%; border-radius: 8px; border: 1px solid #eee; }
+    .tabs { display: flex; gap: 0.25rem; border-bottom: 1px solid #ddd; margin: 1rem 0 1.5rem; }
+    .tabs button {
+      background: none; border: none; padding: 0.5rem 0.9rem; font-size: 0.9rem;
+      cursor: pointer; color: #666; border-bottom: 2px solid transparent;
+    }
+    .tabs button.active { color: #1a1a1a; border-bottom-color: #2563eb; font-weight: 600; }
+    .tab-pane { display: none; }
+    .tab-pane.active { display: block; }
   </style>
   {% block head %}{% endblock %}
 </head>
 <body>
-  <header><a href="/">DS Artifact OS — GUI (read-only)</a></header>
-  <main>{% block content %}{% endblock %}</main>
+  <div class="shell">
+    <nav class="sidebar">
+      <a class="brand" href="/">DS Artifact OS</a>
+      <div class="group">
+        <h3>Browse</h3>
+        <a href="/">Sessions</a>
+        <a href="/artifacts">All artifacts</a>
+      </div>
+      <div class="group">
+        <h3>By type</h3>
+        {% for t in ["dataset", "query", "transform", "chart", "narrative", "skill", "template"] %}
+        <a href="/artifacts?type={{ t }}">{{ t }}</a>
+        {% endfor %}
+      </div>
+    </nav>
+    <main>{% block content %}{% endblock %}</main>
+  </div>
 </body>
 </html>

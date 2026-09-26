@@ -1,10 +1,20 @@
 {% extends "base.html" %}
 {% block title %}{{ art.title }} — DS Artifact OS{% endblock %}
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  window.addEventListener("DOMContentLoaded", () => mermaid.initialize({ startOnLoad: true }));
+  function dsosShowTab(name) {
+    document.querySelectorAll(".tab-pane").forEach(el => el.classList.toggle("active", el.dataset.tab === name));
+    document.querySelectorAll(".tabs button").forEach(el => el.classList.toggle("active", el.dataset.tab === name));
+  }
+</script>
+{% endblock %}
 {% block content %}
 <p class="crumbs">
   <a href="/artifacts">← Artifacts</a> ·
-  <a href="/sessions/{{ art.session_id }}">session</a> ·
-  <a href="/artifacts/{{ art.row_id }}/lineage">lineage graph →</a>
+  <a href="/sessions/{{ art.session_id }}">session</a>
+  {% if art.type == "narrative" %}· <a href="/artifacts/{{ art.row_id }}/report">view report →</a>{% endif %}
 </p>
 <h1>{{ art.title }} <span class="badge badge-type">{{ art.type }}</span></h1>
 <p>{{ art.description }}</p>
@@ -13,9 +23,19 @@
 <p>{% for t in art.tags %}<span class="badge badge-type">{{ t }}</span> {% endfor %}</p>
 {% endif %}
 {% if art.source %}
-<p class="muted">source: <a href="{{ art.source.url }}">{{ art.source.url }}</a> (fetched {{ art.source.fetched_at }})</p>
+<p class="muted">source:
+{% for k, v in art.source.items() %}
+{% if k == "url" %}<a href="{{ v }}">{{ v }}</a>{% else %}{{ k }}: {{ v }}{% endif %}{% if not loop.last %} · {% endif %}
+{% endfor %}
+</p>
 {% endif %}
 
+<div class="tabs">
+  <button type="button" class="active" data-tab="overview" onclick="dsosShowTab('overview')">Overview</button>
+  <button type="button" data-tab="lineage" onclick="dsosShowTab('lineage')">Lineage</button>
+</div>
+
+<div class="tab-pane active" data-tab="overview">
 {% if payload.content_error %}
 <h2>Content</h2>
 <p class="muted">⚠ {{ payload.content_error }}</p>
@@ -38,13 +58,31 @@
 {% endif %}
 
 {% if execution %}
-<h2>Execution</h2>
+<h2>Code</h2>
 <p class="muted">{{ execution.kind }} · status {{ execution.status }}</p>
-<pre>{{ execution.stdout }}{% if execution.error %}
+<pre>{{ execution.code }}</pre>
+{% if execution.stdout or execution.stderr or execution.error %}
+<h2>Output</h2>
+<pre>{% if execution.stdout %}{{ execution.stdout }}{% endif %}{% if execution.stderr %}{{ execution.stderr }}{% endif %}{% if execution.error %}
 
 ERROR: {{ execution.error }}{% endif %}</pre>
 {% endif %}
+{% endif %}
 
+{% if versions|length > 1 %}
+<h2>Other versions</h2>
+<ul>
+{% for v in versions %}
+  <li>
+    <a href="/artifacts/{{ v.row_id }}">v{{ v.version }}</a>{% if v.row_id == art.row_id %} (current){% endif %}
+    — {{ v.created_at }}
+  </li>
+{% endfor %}
+</ul>
+{% endif %}
+</div>
+
+<div class="tab-pane" data-tab="lineage">
 {% if uses %}
 <h2>Uses (built from)</h2>
 <ul>
@@ -59,15 +97,13 @@ ERROR: {{ execution.error }}{% endif %}</pre>
 </ul>
 {% endif %}
 
-{% if versions|length > 1 %}
-<h2>Other versions</h2>
-<ul>
-{% for v in versions %}
-  <li>
-    <a href="/artifacts/{{ v.row_id }}">v{{ v.version }}</a>{% if v.row_id == art.row_id %} (current){% endif %}
-    — {{ v.created_at }}
-  </li>
-{% endfor %}
-</ul>
+{% if not uses and not used_by %}
+<p class="muted">No lineage — nothing built from this, and nothing built with it.</p>
+{% else %}
+<h2>Graph</h2>
+<div class="mermaid">
+{{ graph }}
+</div>
 {% endif %}
+</div>
 {% endblock %}

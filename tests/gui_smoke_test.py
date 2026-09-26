@@ -51,7 +51,10 @@ def main() -> None:
         conn, type="dataset", title="Toy Scores",
         description="Synthetic 3-row dataset used only to smoke-test the GUI.",
         content=toy, content_format="parquet", session_id=s1,
-        source={"url": "synthetic://gui-smoke-test", "fetched_at": "now"},
+        source={
+            "url": "synthetic://gui-smoke-test", "fetched_at": "now",
+            "method": "synthetic", "refresh_after": "static",
+        },
     )
     query_row = run_sql(
         conn, code="SELECT team, score FROM toy_scores WHERE score > 10",
@@ -121,11 +124,20 @@ def main() -> None:
     assert r.status_code == 200
     assert "team" in r.text and "score" in r.text, "tabular preview should render as a table"
     assert "Other versions" in r.text, "a second version should surface version history"
-    print("[ok] GET /artifacts/{row_id} renders a tabular preview + version history")
+    assert "synthetic://gui-smoke-test" in r.text
+    assert "fetched_at: now" in r.text and "method: synthetic" in r.text
+    assert "refresh_after: static" in r.text, (
+        "source's freeform fields (method, refresh_after — the SLA convention) "
+        "should render generically, not just url/fetched_at"
+    )
+    print("[ok] GET /artifacts/{row_id} renders a tabular preview + version history + full source")
 
     r = client.get(f"/artifacts/{query_row}")
-    assert r.status_code == 200 and "Execution" in r.text and "sql" in r.text
-    print("[ok] GET /artifacts/{row_id} for a query shows its execution trace")
+    assert r.status_code == 200 and "Code" in r.text and "sql" in r.text
+    assert "SELECT team, score FROM toy_scores WHERE score &gt; 10" in r.text, (
+        "the query's actual SQL code should render, not just an empty output block"
+    )
+    print("[ok] GET /artifacts/{row_id} for a query shows its SQL code + execution trace")
 
     # A blob missing from disk (this is exactly what happened to the real
     # store: a test's cleanup step once rmtree'd the shared data/ dir,
@@ -143,6 +155,28 @@ def main() -> None:
     assert "content blob missing on disk" in r.text
     print("[ok] GET /artifacts/{row_id} with a missing blob renders a friendly message, not a 500")
 
+    # A blob present on disk but not valid UTF-8 (partial write, wrong
+    # encoding at save time, ...) — this is exactly what happened to a real
+    # narrative in the store: _load_blob only caught FileNotFoundError, so
+    # a corrupt-but-present blob crashed the whole detail page with a raw
+    # UnicodeDecodeError (500) instead of degrading like the missing-blob
+    # case above.
+    corrupt_narrative_row = save_artifact(
+        conn, type="narrative", title="Corrupt narrative",
+        description="Its blob is overwritten with invalid UTF-8 below.",
+        content="placeholder", content_format="markdown", session_id=s1,
+    )
+    corrupt_ref = get_artifact_by_row_id(conn, corrupt_narrative_row, load_content=False).content_ref
+    Path(corrupt_ref).write_bytes(b"not valid utf-8: \xa1\xa1")
+    r = client.get(f"/artifacts/{corrupt_narrative_row}")
+    assert r.status_code == 200, "a corrupt (non-UTF-8) blob must not 500 the whole page"
+    assert "not valid UTF-8" in r.text
+    print("[ok] GET /artifacts/{row_id} with a corrupt (non-UTF-8) blob renders a friendly message, not a 500")
+
+    r = client.get(f"/artifacts/{corrupt_narrative_row}/report")
+    assert r.status_code == 400, "a narrative with an unreadable blob should fail cleanly, not 500"
+    print("[ok] GET /artifacts/{row_id}/report on a narrative with a corrupt blob 400s cleanly")
+
     r = client.get(f"/artifacts/{chart_row}")
     assert r.status_code == 200 and "data:image/png;base64," in r.text
     print("[ok] GET /artifacts/{row_id} for a chart inlines the PNG as a base64 data URI")
@@ -155,6 +189,27 @@ def main() -> None:
     r = client.get(f"/artifacts/{dataset_row}/lineage")
     assert r.status_code == 200 and "graph LR" in r.text and query_row in r.text
     print("[ok] GET /artifacts/{row_id}/lineage renders a Mermaid graph with neighbors")
+
+    r = client.get(f"/artifacts/{query_row}")
+    assert r.status_code == 200 and 'data-tab="lineage"' in r.text and "graph LR" in r.text
+    print("[ok] GET /artifacts/{row_id} embeds the lineage graph inline as a tab, no extra page")
+
+    assert 'href="/artifacts?type=chart"' in r.text
+    print("[ok] the sidebar nav lists per-type quick links on every page")
+
+    r = client.get(f"/artifacts/{narrative_row}/report")
+    assert r.status_code == 200
+    assert "{{artifact:" not in r.text, "the served report should have its embeds substituted"
+    assert "team" in r.text and "data:image/png;base64," in r.text
+    print("[ok] GET /artifacts/{row_id}/report serves a narrative's rendered report live, no file written")
+
+    r = client.get(f"/artifacts/{dataset_row}/report")
+    assert r.status_code == 400, "a non-narrative row_id should fail cleanly, not 500"
+    print("[ok] GET /artifacts/{row_id}/report on a non-narrative artifact 400s cleanly")
+
+    r = client.get("/artifacts/does-not-exist/report")
+    assert r.status_code == 404
+    print("[ok] GET /artifacts/{row_id}/report on an unknown row_id 404s")
 
     r = client.get("/artifacts/does-not-exist")
     assert r.status_code == 404

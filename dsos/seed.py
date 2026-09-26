@@ -40,13 +40,26 @@ After fetching to a local file (csv/tsv/json/parquet), you MUST register it:
         description="1-2 sentences: what this contains and why you fetched it",
         content_path="<local path to the file you fetched>",
         content_format="parquet",   # datasets are normalized to parquet on ingest
-        source={"url": "<where it came from>", "fetched_at": "<timestamp>"},
+        source={
+            "url": "<where it came from>",
+            "fetched_at": "<timestamp you fetched it>",
+            "method": "<how you fetched it, e.g. 'WebFetch', 'curl', 'Kaggle API'>",
+            "refresh_after": "<how long this stays fresh, e.g. '7d', '30d', or "
+                              "'static' for data that won't change — your call>",
+        },
         session_id=<current session>,
     )
 
 No dataset is real to the rest of this system until it's registered this
 way — an artifact with no save_artifact call is invisible to search,
 lineage, and every future question that could have reused it.
+
+This is also the only record of *how* the data was retrieved — dsos can't
+see a fetch you ran with your own tools, only what you register here.
+`fetched_at` + `refresh_after` are provenance, not an automatic staleness
+check: nothing here computes "stale" for you. Before reusing an existing
+dataset artifact for a new question, look at both and decide for yourself
+whether it's still good enough or worth refetching.
 
 Once registered, use run_sql / run_python against the artifact's row_id
 for every query, transform, or chart you build from it, so lineage stays

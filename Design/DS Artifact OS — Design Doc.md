@@ -88,7 +88,9 @@ id, question, started_at
 **`artifacts`** — one row per *version*, not per logical artifact. `(artifact_id, version)` is unique internally, but the MCP surface only ever deals in `row_id` — every tool that returns or accepts an artifact reference uses it, so there's one id to track, not two. `type` ∈ {dataset, query, transform, chart, narrative, **skill**} — skills are just artifacts (`content_format="markdown"`), no separate table or tools. One skill row (dataset-discovery instructions) is seeded at store-init, before the demo starts.
 ```
 row_id (pk), artifact_id, version, type, title, description, tags,
-content_ref, content_format, source,     -- source: provenance for fetched datasets (url, fetched_at)
+content_ref, content_format, source,     -- source: provenance for fetched datasets (url,
+                                          -- fetched_at, method, refresh_after — freeform,
+                                          -- staleness is the agent's call, not computed)
 embedding,                                -- vector, for semantic search
 created_at, session_id, status
 ```
