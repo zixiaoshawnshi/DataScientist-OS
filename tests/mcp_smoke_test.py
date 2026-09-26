@@ -74,7 +74,11 @@ async def main() -> None:
             })
             assert "row_id" in r.data, r.data
             dataset_row = r.data["row_id"]
-            print(f"[ok] save_artifact ingested csv -> dataset row {dataset_row}")
+            assert r.data.get("table_name") == "toy_scores", (
+                "save_artifact should surface the normalized table/variable name "
+                "up front, not make the agent guess or wait for an error (feedback #1)"
+            )
+            print(f"[ok] save_artifact ingested csv -> dataset row {dataset_row}, table_name inlined")
 
         r = await client.call_tool("run_sql", {
             "code": "SELECT team, score FROM toy_scores WHERE score > 10",
@@ -89,7 +93,15 @@ async def main() -> None:
         # id run_sql actually returns) was itself broken. Both fixed now.
         assert r.data["row_count"] == 2, r.data
         assert r.data["preview"], "run_sql should inline a preview, not just a row_id"
-        print(f"[ok] run_sql (over the wire) -> query row {query_row}, preview inlined")
+        assert r.data.get("table_name") == "high_scorers", (
+            "the output artifact's own table name should be inlined too, for chaining "
+            "into a later run_sql/run_python call (feedback #1)"
+        )
+        assert r.data.get("input_tables") == {dataset_row: "toy_scores"}, (
+            "run_sql should map each input row_id to the table name it registered "
+            "it under (feedback #1)"
+        )
+        print(f"[ok] run_sql (over the wire) -> query row {query_row}, preview + table names inlined")
 
         r = await client.call_tool("get_artifact", {"row_id": query_row, "session_id": s1})
         assert "error" not in r.data, r.data
@@ -124,6 +136,10 @@ async def main() -> None:
         )
         assert "Traceback" not in r.data["error"], "error should exclude internal frame noise"
         assert "Traceback" in r.data.get("stderr", ""), "full traceback should still be in stderr"
+        assert "toy_scores(team, score)" in r.data["error"], (
+            "a failed run_sql should name the available tables/columns, not just "
+            "the bad reference (feedback #8)"
+        )
         print(f"[ok] failed run_sql surfaces a concise error: {r.data['error']}")
 
         r = await client.call_tool(
@@ -253,6 +269,106 @@ async def main() -> None:
             "successful runs must surface stdout top-level (feedback #10)"
         )
         print("[ok] run_python over the wire -> stdout surfaced on success (feedback #10)")
+
+        # --- round 6: chart auto-render, scratch promotion, publish dry-run
+        # (feedback #1, #2, #3, #4, #7) ---
+        r = await client.call_tool("run_python", {
+            "code": (
+                "import matplotlib.pyplot as plt\n"
+                "fig, ax = plt.subplots()\n"
+                "ax.plot(toy_scores['score'])\n"
+                "result = fig\n"
+            ),
+            "session_id": s2, "title": "Score chart", "description": "A plot of scores.",
+            "input_row_ids": [dataset_row], "output_type": "chart",
+        })
+        assert r.data["status"] == "ok", r.data
+        assert r.data["content_format"] == "png", (
+            "assigning a matplotlib Figure as `result` should auto-render to png, "
+            "not land in storage as a 'Figure(...)' string (feedback #2)"
+        )
+        assert any(c.type == "image" for c in r.content), (
+            "a chart result should come back as an actual inline image content "
+            "block, not just a text placeholder (feedback #2)"
+        )
+        print("[ok] run_python: a matplotlib Figure `result` auto-renders to an inline PNG image")
+
+        r = await client.call_tool("run_sql", {
+            "code": "SELECT COUNT(*) AS n FROM toy_scores",
+            "session_id": s2, "title": "Scratch to promote",
+            "description": "A scratch run worth keeping after all.",
+            "input_row_ids": [dataset_row], "scratch": True,
+        })
+        assert r.data["status"] == "ok", r.data
+        scratch_id = r.data.get("scratch_id")
+        assert scratch_id, "a scratch run should return a scratch_id (feedback #4)"
+        assert r.data.get("input_tables") == {dataset_row: "toy_scores"}
+        print(f"[ok] scratch run_sql -> scratch_id {scratch_id}, input_tables inlined")
+
+        r = await client.call_tool("promote_scratch", {
+            "scratch_id": scratch_id, "session_id": s2,
+            "title": "Row count", "description": "Promoted from a scratch check.",
+        })
+        assert "error" not in r.data, r.data
+        promoted_row = r.data["row_id"]
+        assert r.data["row_count"] == 1, r.data
+        print(f"[ok] promote_scratch persisted the cached scratch run without re-running it -> {promoted_row}")
+
+        r = await client.call_tool(
+            "search_artifacts", {"query": "Row count", "session_id": s2}
+        )
+        assert any(h["row_id"] == promoted_row for h in r.data["results"]), (
+            "a promoted scratch run must become a real, searchable artifact"
+        )
+        print("[ok] promoted artifact is searchable, unlike the scratch run it came from")
+
+        r = await client.call_tool("promote_scratch", {
+            "scratch_id": scratch_id, "session_id": s2,
+            "title": "Row count again", "description": "Re-promoting an already-consumed id.",
+        })
+        assert "error" in r.data and "no cached scratch run" in r.data["error"], (
+            "promoting an already-consumed (or unknown) scratch_id should fail clearly, "
+            "not silently re-run or duplicate"
+        )
+        print("[ok] promote_scratch on a consumed/unknown scratch_id fails clearly")
+
+        r = await client.call_tool("save_artifact", {
+            "type": "narrative", "title": "Preview Report", "session_id": s2,
+            "description": "Narrative for exercising publish_report's dry-run mode.",
+            "content_format": "markdown",
+            "content_text": (
+                f"See {{{{artifact:{dataset_row}}}}} and "
+                "{{artifact:not-a-real-row-id}} for details."
+            ),
+        })
+        preview_narrative_row = r.data["row_id"]
+        r = await client.call_tool("publish_report", {
+            "row_id": preview_narrative_row, "session_id": s2, "dry_run": True,
+        })
+        assert "error" not in r.data, r.data
+        assert "path" not in r.data, "dry_run must not write an HTML file"
+        assert any(e["row_id"] == dataset_row and e["resolved"] for e in r.data["embeds"]), r.data
+        assert "not-a-real-row-id" in r.data["broken_row_ids"], (
+            "dry_run should flag an embed that doesn't resolve (feedback #3, #7)"
+        )
+        print(f"[ok] publish_report(dry_run=True) reports resolved/broken embeds without writing a file: "
+              f"broken={r.data['broken_row_ids']}")
+
+        r = await client.call_tool("save_artifact", {
+            "type": "narrative", "title": "Real Report", "session_id": s2,
+            "description": "Narrative for exercising the real publish's embeds list.",
+            "content_format": "markdown",
+            "content_text": f"See {{{{artifact:{dataset_row}}}}} for details.",
+        })
+        real_narrative_row = r.data["row_id"]
+        r = await client.call_tool("publish_report", {
+            "row_id": real_narrative_row, "session_id": s2,
+        })
+        assert "error" not in r.data, r.data
+        assert any(e["row_id"] == dataset_row and e["resolved"] for e in r.data["embeds"]), (
+            "a real publish should also report which artifacts it embedded (feedback #3)"
+        )
+        print("[ok] publish_report (real) reports its resolved embeds alongside the file path")
 
         r = await client.call_tool("save_artifact", {
             "type": "narrative", "title": "Huge Report", "session_id": s2,

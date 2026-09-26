@@ -74,30 +74,71 @@ def _render_embed(conn: sqlite3.Connection, row_id: str) -> tuple[str, Artifact 
     return fragment, art
 
 
+def _get_narrative(conn: sqlite3.Connection, row_id: str) -> Artifact:
+    art = get_artifact_by_row_id(conn, row_id, load_content=True)
+    if art is None:
+        raise ValueError(f"no artifact with row_id {row_id!r}")
+    if art.type != "narrative":
+        raise ValueError(f"publish_report expects a narrative artifact, got type={art.type!r}")
+    return art
+
+
+def _resolve_embeds(conn: sqlite3.Connection, content: str) -> list[dict]:
+    """Every {{artifact:row_id}} in `content`, in order, with whether it
+    resolved — the shared basis for both the real publish's embed list and
+    preview_report's dry-run report (feedback #3, #7)."""
+    embeds = []
+    for m in _EMBED_RE.finditer(content):
+        rid = m.group(1)
+        resolved = get_artifact_by_row_id(conn, rid, load_content=False)
+        embeds.append({
+            "row_id": rid,
+            "resolved": resolved is not None,
+            "type": resolved.type if resolved else None,
+            "title": resolved.title if resolved else None,
+        })
+    return embeds
+
+
+def preview_report(conn: sqlite3.Connection, row_id: str) -> dict:
+    """Dry-run for publish_report: resolve every {{artifact:...}} embed in
+    the narrative and report on it — without rendering or writing anything
+    — so a stale/typo'd row_id is caught before spending a real publish
+    (feedback #7). `broken_row_ids` is the actionable part: fix those, then
+    publish for real."""
+    art = _get_narrative(conn, row_id)
+    embeds = _resolve_embeds(conn, art.content)
+    broken = [e["row_id"] for e in embeds if not e["resolved"]]
+    return {
+        "title": art.title,
+        "embeds": embeds,
+        "broken_row_ids": broken,
+        "artifact_row_ids": [row_id, *(e["row_id"] for e in embeds if e["resolved"])],
+    }
+
+
 def publish_report(
     conn: sqlite3.Connection, row_id: str, *, output_dir: str = "data/reports",
 ) -> dict:
     """Render a narrative artifact and every artifact it embeds into one
     self-contained .html file (images inlined as base64 data URIs — no
     sibling image files, per the Part 1 scope cut). Returns
-    {"path": ..., "artifact_row_ids": [...]}.
+    {"path": ..., "embeds": [...], "artifact_row_ids": [...]}.
+
+    `embeds` (feedback #3) lists what actually got pulled into this report
+    — row_id/type/title for each {{artifact:...}} reference, and whether it
+    resolved — a quick confirmation of what's in the report without a
+    separate get_lineage call.
 
     Does not create a new artifact row: a rendered export isn't itself a
     versioned analysis artifact, it's the exit from this layer — publish
     the narrative itself first (save_artifact) if it should stay reusable.
     """
-    art = get_artifact_by_row_id(conn, row_id, load_content=True)
-    if art is None:
-        raise ValueError(f"no artifact with row_id {row_id!r}")
-    if art.type != "narrative":
-        raise ValueError(f"publish_report expects a narrative artifact, got type={art.type!r}")
-
-    touched: list[str] = [row_id]
+    art = _get_narrative(conn, row_id)
+    embeds = _resolve_embeds(conn, art.content)
 
     def _substitute(m: re.Match) -> str:
-        fragment, resolved = _render_embed(conn, m.group(1))
-        if resolved:
-            touched.append(resolved.row_id)
+        fragment, _resolved = _render_embed(conn, m.group(1))
         return fragment
 
     # Substitute embeds into the HTML *after* markdown conversion, not into
@@ -115,4 +156,5 @@ def publish_report(
         _PAGE_TEMPLATE.format(title=html.escape(art.title), body=body_html), encoding="utf-8"
     )
 
-    return {"path": str(out_path), "artifact_row_ids": touched}
+    touched = [row_id, *(e["row_id"] for e in embeds if e["resolved"])]
+    return {"path": str(out_path), "embeds": embeds, "artifact_row_ids": touched}

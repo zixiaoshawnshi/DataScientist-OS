@@ -104,13 +104,13 @@ def start_session(question: str) -> dict:
 def search_artifacts(
     query: str, session_id: str, top_k: int = 5, type: str | None = None
 ) -> dict:
-    """Search over everything saved so far (datasets, queries, charts,
-    narratives, skills) — an exact term (a title, a column name) reliably
-    matches even with the fallback embedding model; a vaguer query still
-    finds something via semantic similarity. Call this before fetching new
-    data or rebuilding anything — if a past artifact already covers part of
-    the question, reuse it via get_artifact/run_sql/run_python instead of
-    redoing the work."""
+    """Search over everything saved so far, across every past session, not
+    just this one — an exact term (a title, a column name) reliably matches
+    even with the fallback embedding model; a vaguer query still finds
+    something via semantic similarity. Call this before fetching new data
+    or rebuilding anything — if a past artifact already covers part of the
+    question (this session's or an earlier one's), reuse it via
+    get_artifact/run_sql/run_python instead of redoing the work."""
     hits = store.search_artifacts(conn, query, top_k=top_k, type=type)
     results = [
         {
@@ -142,7 +142,8 @@ def get_artifact(row_id: str, session_id: str) -> dict:
     art = store.get_artifact_by_row_id(conn, row_id)
     if art is None:
         return {"error": f"no artifact with row_id {row_id!r}", "artifact_row_ids": []}
-    return {**_artifact_payload(art), "artifact_row_ids": [art.row_id]}
+    payload = {**_artifact_payload(art), "artifact_row_ids": [art.row_id]}
+    return _with_inline_image(payload, art)
 
 
 @mcp.tool()
@@ -179,6 +180,17 @@ def save_artifact(
     dataset/chart/query it discusses. Those row_ids are automatically added
     to this artifact's lineage — no need to also pass parent_row_ids for
     them — and show up as `uses` when this narrative is fetched later.
+
+    `source`: freeform, but for a fetched dataset prefer {"url": ...,
+    "fetched_at": ...} (ISO-ish timestamp/description of when) plus
+    whatever else identifies it (e.g. "survey": "Stack Overflow 2024") —
+    this is the only provenance a later session/report has to go on.
+
+    The response's `table_name` is this artifact's title, normalized
+    exactly the way run_sql/run_python will register it (lowercased,
+    non-alphanumeric -> `_`) — use it directly as the table/variable name
+    in your next run_sql/run_python call instead of guessing or waiting
+    for a "table does not exist" error.
     """
     if content_path:
         try:
@@ -198,7 +210,10 @@ def save_artifact(
         )
     except ValueError as exc:
         return {"error": str(exc), "artifact_row_ids": []}
-    return {"row_id": row_id, "artifact_row_ids": [row_id]}
+    return {
+        "row_id": row_id, "table_name": store.safe_table_name(title),
+        "artifact_row_ids": [row_id],
+    }
 
 
 def _ingest_path(path: str, type: str, content_format: str) -> tuple:
@@ -224,7 +239,7 @@ def _ingest_path(path: str, type: str, content_format: str) -> tuple:
     return df, "parquet"
 
 
-def _execution_result_payload(row_id: str, input_row_ids: list[str]) -> dict:
+def _execution_result_payload(row_id: str, input_row_ids: list[str]) -> dict | object:
     """Shared by run_sql/run_python: always inline the result (or, on
     failure, the diagnostics) — never make the agent make a second call
     just to see what its own run produced."""
@@ -233,6 +248,15 @@ def _execution_result_payload(row_id: str, input_row_ids: list[str]) -> dict:
     payload = {
         **_artifact_payload(art),
         "status": art.status,
+        # This run's own output, normalized the same way as any input table
+        # (feedback #1) — chain it straight into your next run_sql/
+        # run_python call instead of re-deriving it from the title.
+        "table_name": store.safe_table_name(art.title),
+        "input_tables": {
+            rid: store.safe_table_name(in_art.title)
+            for rid in input_row_ids
+            if (in_art := store.get_artifact_by_row_id(conn, rid, load_content=False))
+        },
         "artifact_row_ids": [row_id, *input_row_ids],
     }
     # stdout is top-level on success AND failure (feedback #10): it's where
@@ -243,6 +267,20 @@ def _execution_result_payload(row_id: str, input_row_ids: list[str]) -> dict:
         payload["error"] = info.get("error")
         # stderr's tail carries the traceback's final (most useful) frames.
         payload["stderr"] = (info.get("stderr") or "")[-4_000:]
+    return _with_inline_image(payload, art)
+
+
+def _with_inline_image(payload: dict, art: store.Artifact):
+    """A chart artifact's png bytes rendered as an actual inline image
+    block in the tool response — not just a "Figure(1400x800)"-style text
+    placeholder the agent has to trust blindly (feedback #2). structured_content
+    stays the same payload dict either way, so callers/logging/tests don't
+    need to branch on which shape came back."""
+    if art.content_format == "png" and isinstance(art.content, bytes):
+        from fastmcp.tools import ToolResult
+        from fastmcp.utilities.types import Image
+
+        return ToolResult(content=Image(data=art.content, format="png"), structured_content=payload)
     return payload
 
 
@@ -262,8 +300,12 @@ def run_sql(
     scratch=True: run and return the result inline but persist nothing —
     no artifact, no lineage, not searchable. For quick checks (row counts,
     schema pokes) where an artifact would be noise. The run still appears
-    in the session's tool-call trace. Do NOT use scratch for anything you
-    or a later session might want to build on — then it never happened.
+    in the session's tool-call trace. The response's scratch_id lets you
+    promote it later via promote_scratch(scratch_id=...) without
+    re-running the query, if it turns out you do want to keep it after all.
+
+    On failure, the error includes the schema (columns) of every registered
+    input table, so a column/table typo is fixable from the error alone.
 
     Example:
       run_sql(
@@ -287,20 +329,29 @@ def run_python(
     requirements: list[str] | None = None, code_paths: list[str] | None = None,
 ) -> dict:
     """Run Python against one or more artifacts. Each input row_id is bound
-    to a variable named after that artifact's title; `pd` (pandas) is
-    available. Your code MUST assign a `result` variable — a DataFrame, a
-    dict/list (saved as JSON), raw png bytes (a chart), or a string. The
-    result is returned inline below — you do NOT need a second call to see
-    it. It's also saved as a new artifact (default type="transform"; pass
-    output_type="chart" for a plot), lineage-linked to every input and
-    recorded automatically. On failure, status="error" and `error`/`stdout`/
-    `stderr` below show the traceback and anything printed before it failed.
+    to a variable named after that artifact's title (see `input_tables` in
+    the response for the exact name used); `pd` (pandas) is available. Your
+    code MUST assign a `result` variable — a DataFrame, a dict/list (saved
+    as JSON), a string, or for output_type="chart" a matplotlib Figure/Axes
+    (e.g. whatever `plt.gcf()`/`plt.subplots()` gives you — it's rendered to
+    PNG for you) or raw png bytes directly. On a persisted (non-scratch)
+    call the result is returned inline below as an actual rendered image
+    for a chart (not just a text placeholder) — you do NOT need a second
+    call to see it. It's also saved as a new artifact (default
+    type="transform"; pass output_type="chart" for a plot), lineage-linked
+    to every input and recorded automatically. On failure, status="error"
+    and `error`/`stdout`/`stderr` below show the traceback and anything
+    printed before it failed.
 
     scratch=True: run and return the result inline but persist nothing —
-    no artifact, no lineage, not searchable. For rapid iteration (check a
-    correlation, test an idea, debug a plot) where an artifact would be
-    noise; flip to scratch=False once the idea works. The run still appears
-    in the session's tool-call trace.
+    no artifact, no lineage, not searchable (a chart still comes back as a
+    text placeholder in scratch mode, not a rendered image — drop scratch
+    once you're iterating on plot styling, to see it rendered). For rapid
+    iteration (check a correlation, test an idea) where an artifact would
+    be noise. The run still appears in the session's tool-call trace. The
+    response's scratch_id lets you promote it later via
+    promote_scratch(scratch_id=...) without re-running the code, once the
+    idea works and it's worth keeping.
 
     requirements=["scikit-learn>=1.3", ...]: extra packages for THIS run
     only — uv resolves them into a throwaway environment, runs the code
@@ -331,6 +382,39 @@ def run_python(
 
 
 @mcp.tool()
+def promote_scratch(scratch_id: str, session_id: str, title: str, description: str) -> dict:
+    """Persist a previous scratch=True run_sql/run_python call (by the
+    scratch_id its response returned) as a real artifact — without
+    re-running the code. The "spike, then keep it" shortcut: iterate freely
+    with scratch=True, then promote the one that worked instead of copying
+    its code into a fresh scratch=False call.
+
+    `title`/`description` name the artifact now that it's staying — they
+    don't have to match whatever the scratch call was originally titled.
+
+    The cache this reads from is in-memory and per server process: it does
+    not survive a restart, and only holds a bounded number of recent
+    scratch runs. If scratch_id isn't found (aged out, wrong id, or already
+    promoted), you'll get an error telling you to re-run with scratch=False.
+
+    Example: promote_scratch(
+        scratch_id="<scratch_id from a run_sql/run_python response>",
+        session_id="s1", title="High scorers",
+        description="Teams scoring above 10.",
+    )
+    """
+    try:
+        row_id = execution.promote_scratch(
+            conn, scratch_id=scratch_id, session_id=session_id,
+            title=title, description=description,
+        )
+    except ValueError as exc:
+        return {"error": str(exc), "artifact_row_ids": []}
+    input_row_ids = [a.row_id for a in store.get_lineage(conn, row_id, direction="ancestors")]
+    return _execution_result_payload(row_id, input_row_ids)
+
+
+@mcp.tool()
 def get_lineage(row_id: str, session_id: str, direction: str = "ancestors") -> dict:
     """See what an artifact was built from (direction="ancestors", the
     default) or what has been built from it (direction="descendants")."""
@@ -340,7 +424,7 @@ def get_lineage(row_id: str, session_id: str, direction: str = "ancestors") -> d
 
 
 @mcp.tool()
-def publish_report(row_id: str, session_id: str) -> dict:
+def publish_report(row_id: str, session_id: str, dry_run: bool = False) -> dict:
     """Render a narrative artifact and everything its {{artifact:...}}
     embeds reference — datasets/queries/transforms as HTML tables, charts as
     inlined images — into one self-contained local .html file. This is the
@@ -351,10 +435,21 @@ def publish_report(row_id: str, session_id: str) -> dict:
     haven't). This does not create a new artifact row itself — a rendered
     export isn't a versioned analysis artifact.
 
+    dry_run=True: resolve every {{artifact:...}} embed and report on it
+    (row_id, type, title, and whether it actually resolved) without writing
+    the HTML file — check that nothing is missing or stale before spending
+    a real publish. `broken_row_ids` lists any embed that didn't resolve
+    (a typo, or a row_id from a different session/store); fix those in the
+    narrative's content (save_artifact a new version) before publishing
+    for real.
+
     Example: publish_report(row_id="<narrative row_id>", session_id="s1")
     """
     try:
-        result = publish.publish_report(conn, row_id)
+        if dry_run:
+            result = publish.preview_report(conn, row_id)
+        else:
+            result = publish.publish_report(conn, row_id)
     except ValueError as exc:
         return {"error": str(exc), "artifact_row_ids": []}
     return result

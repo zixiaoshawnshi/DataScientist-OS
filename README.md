@@ -116,6 +116,10 @@ base64 images — into one self-contained local `.html` file (default:
 `data/reports/`). This is the seam where a finished report leaves the
 working layer; it does not itself create a new artifact row.
 
+`publish_report(..., dry_run=True)` resolves every `{{artifact:...}}` embed
+and reports which ones exist and which are broken/stale, without writing a
+file — a cheap check before spending a real publish.
+
 ## Project layout
 
 ```

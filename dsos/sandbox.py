@@ -56,12 +56,38 @@ for _p in #__DSOS_CODE_PATHS__#:
 
 import pandas as pd
 
+try:
+    # Same reasoning as execution.py's module-level matplotlib.use("Agg"):
+    # force the headless backend before the agent's code can import pyplot
+    # and pick the platform default, which assumes a GUI main-loop thread
+    # this subprocess doesn't have.
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+except ImportError:
+    pass
+
 #__DSOS_INPUT_BINDINGS__#
 
 #__DSOS_USER_CODE__#
 
-# --- serialize `result` back for the parent process ---
+# --- coerce a matplotlib Figure/Axes `result` to png bytes (feedback #2) —
+# mirrors execution._coerce_chart_result, duplicated here since this code
+# runs in a separate uv-resolved process, not this one ---
 _r = result
+try:
+    from matplotlib.axes import Axes as _Axes
+    from matplotlib.figure import Figure as _Figure
+    if isinstance(_r, _Axes):
+        _r = _r.get_figure()
+    if isinstance(_r, _Figure):
+        import io as _io
+        _buf = _io.BytesIO()
+        _r.savefig(_buf, format="png", bbox_inches="tight")
+        _r = _buf.getvalue()
+except ImportError:
+    pass
+
+# --- serialize `result` back for the parent process ---
 if isinstance(_r, pd.DataFrame):
     _r.to_parquet(r#__DSOS_RESULT_PARQUET__#)
 elif isinstance(_r, bytes):
