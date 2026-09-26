@@ -6,9 +6,9 @@ an agent's analysis, not a notebook or a dashboard. See
 `Design/DS Artifact OS — Design Doc.md` for the full pitch, philosophy, data
 model, and demo plan.
 
-Runs from a local venv against the source tree during development;
-`v0.1.0` is the first tagged, citable checkpoint (see "Installing a
-released version" below).
+Runs from a local venv against the source tree during development; tagged
+releases (currently `v0.2.0`) are citable checkpoints — see "Installing a
+released version" below.
 
 ## Status
 
@@ -55,8 +55,15 @@ No PyPI package yet — install straight from a tagged commit instead of
 tracking `main`:
 
 ```sh
-pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@v0.1.0"
+pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
 ```
+
+`latest` is a git tag we force-move to the newest tagged release on every
+cut (see "Cutting a release" below) — it's not a real git "latest release"
+feature (git/pip have no such concept for `git+https` installs), just a
+floating alias so this command never needs hand-editing. Pin an explicit
+`@vX.Y.Z` instead if you want a reproducible install that won't shift under
+you later (currently `v0.2.0`).
 
 This is a real (non-editable) build, not the editable install above —
 verified against a throwaway venv as part of cutting each release, since an
@@ -80,6 +87,10 @@ tracking main directly.
    dev one), same as above.
 3. `git tag -a vX.Y.Z -m "..."`, `git push origin vX.Y.Z`.
 4. `gh release create vX.Y.Z --notes-file ...` (or the GitHub web UI).
+5. Move the `latest` alias to the same commit and force-push it:
+   `git tag -f latest vX.Y.Z && git push origin latest --force`. Skipping
+   this step is exactly what makes the `@latest` install command above
+   silently stale.
 
 ## Running the server standalone
 
@@ -94,6 +105,10 @@ launched, which silently scatters a fresh empty store into whatever directory
 that is.
 
 ## Wiring into a coding agent
+
+See `AGENTS.md` for the install-and-wire-up recipe written for a coding
+agent to follow directly (e.g. "install dsos and wire it into Claude
+Code"). The summary, for a human doing it manually:
 
 Both agents below use the identical command, so registering once makes it
 available from any repo the agent opens — no per-project setup.
