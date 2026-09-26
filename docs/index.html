@@ -53,17 +53,26 @@
 
   .block { margin: 0 0 1.6rem; }
   .block-head {
-    display: flex; align-items: baseline; justify-content: space-between;
+    display: flex; align-items: center; justify-content: space-between;
     gap: 1rem; margin: 0 0 0.55rem;
   }
   .block-head .label { font-size: 0.78rem; color: var(--muted); }
   .block-head .label::before { content: "# "; color: var(--accent); }
 
+  .tabs { display: flex; gap: 1.1rem; flex-wrap: wrap; }
+  .tab {
+    font: inherit; font-size: 0.78rem; color: var(--muted);
+    background: none; border: none; padding: 0 0 0.2rem; cursor: pointer;
+    border-bottom: 1px solid transparent;
+  }
+  .tab:hover, .tab:focus-visible { color: var(--ink); }
+  .tab.is-active { color: var(--accent); border-bottom-color: var(--accent); }
+
   button.copy {
     font: inherit; font-size: 0.76rem; color: var(--muted);
     background: none; border: none; padding: 0; cursor: pointer;
     text-decoration: underline; text-decoration-color: var(--line);
-    text-underline-offset: 3px;
+    text-underline-offset: 3px; white-space: nowrap;
   }
   button.copy:hover, button.copy:focus-visible { color: var(--accent); text-decoration-color: var(--accent); }
 
@@ -72,6 +81,8 @@
     overflow-x: auto; white-space: pre; line-height: 1.6;
   }
   pre.cmd .p { color: var(--accent); }
+  pre.cmd .c { color: var(--muted); }
+  pre.cmd[hidden] { display: none; }
 
   p.prompt-text {
     font-size: 0.9rem; color: var(--ink); margin: 0; line-height: 1.6;
@@ -99,11 +110,25 @@
 
   <div class="block">
     <div class="block-head">
-      <span class="label">install latest</span>
-      <button class="copy" type="button" data-copy="cmd-install">copy</button>
+      <div class="tabs" role="tablist" aria-label="Coding agent">
+        <button class="tab is-active" type="button" role="tab" aria-selected="true" data-tab="claude">claude code</button>
+        <button class="tab" type="button" role="tab" aria-selected="false" data-tab="pi">pi</button>
+        <button class="tab" type="button" role="tab" aria-selected="false" data-tab="codex">codex</button>
+        <button class="tab" type="button" role="tab" aria-selected="false" data-tab="opencode">opencode</button>
+      </div>
+      <button class="copy" type="button">copy</button>
     </div>
-    <pre class="cmd" id="cmd-install"><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
+    <pre class="cmd" data-panel="claude"><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
 <span class="p">$</span> claude mcp add dsos -s user -- python -m dsos.mcp_server</pre>
+    <pre class="cmd" data-panel="pi" hidden><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
+<span class="p">$</span> pi install npm:pi-mcp-adapter
+<span class="c"># then add to ~/.config/mcp/mcp.json</span>
+{ "mcpServers": { "dsos": { "command": "python", "args": ["-m", "dsos.mcp_server"] } } }</pre>
+    <pre class="cmd" data-panel="codex" hidden><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
+<span class="p">$</span> codex mcp add dsos -- python -m dsos.mcp_server</pre>
+    <pre class="cmd" data-panel="opencode" hidden><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
+<span class="c"># then add to opencode.json</span>
+{ "mcp": { "dsos": { "type": "local", "command": ["python", "-m", "dsos.mcp_server"] } } }</pre>
   </div>
 
   <div class="block">
@@ -128,9 +153,30 @@
 </main>
 
 <script>
+  document.querySelectorAll('.tabs').forEach(function (tabs) {
+    var buttons = tabs.querySelectorAll('.tab');
+    var block = tabs.closest('.block');
+    var panels = block.querySelectorAll('[data-panel]');
+    buttons.forEach(function (tab) {
+      tab.addEventListener('click', function () {
+        buttons.forEach(function (t) {
+          t.classList.remove('is-active');
+          t.setAttribute('aria-selected', 'false');
+        });
+        tab.classList.add('is-active');
+        tab.setAttribute('aria-selected', 'true');
+        panels.forEach(function (p) {
+          p.hidden = p.getAttribute('data-panel') !== tab.getAttribute('data-tab');
+        });
+      });
+    });
+  });
+
   document.querySelectorAll('button.copy').forEach(function (btn) {
     btn.addEventListener('click', function () {
-      var target = document.getElementById(btn.getAttribute('data-copy'));
+      var target = btn.hasAttribute('data-copy')
+        ? document.getElementById(btn.getAttribute('data-copy'))
+        : btn.closest('.block').querySelector('[data-panel]:not([hidden])');
       var text = target.innerText;
       var reset = function () { btn.textContent = 'copy'; };
       var flash = function () {
