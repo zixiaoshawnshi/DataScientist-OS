@@ -78,14 +78,14 @@ A session exists for one reason: to give the reuse demo a boundary that isn't a 
 
 ## Data model
 
-Search is metadata-driven but not keyword-only: `save_artifact` embeds `title + description + tags` and stores the vector alongside the row. `search_artifacts` embeds the query and ranks by cosine similarity (brute-force in Python — no vector DB needed at demo scale), with SQLite FTS5 as a keyword/tag fallback. This means the agent's description quality directly drives reuse quality, so `save_artifact`'s docstring requires a real 1–2 sentence description, not a filename.
+Search is keyword-first, semantic-fallback: `search_artifacts` matches `query` against title/description/tags via SQLite FTS5 first (an exact term reliably wins), then fills any remaining slots via embedding cosine similarity (brute-force in Python — no vector DB needed at demo scale) for queries with no literal term overlap. `save_artifact` embeds `title + description + tags` and stores the vector alongside the row for that fallback path. Either way, the agent's description quality directly drives reuse quality, so `save_artifact`'s docstring requires a real 1–2 sentence description, not a filename.
 
 **`sessions`**
 ```
 id, question, started_at
 ```
 
-**`artifacts`** — one row per *version*, not per logical artifact. `(artifact_id, version)` is unique; `get_artifact(id)` returns latest, `get_artifact(id, version=N)` pins one. `type` ∈ {dataset, query, transform, chart, narrative, **skill**} — skills are just artifacts (`content_format="markdown"`), no separate table or tools. One skill row (dataset-discovery instructions) is seeded at store-init, before the demo starts.
+**`artifacts`** — one row per *version*, not per logical artifact. `(artifact_id, version)` is unique internally, but the MCP surface only ever deals in `row_id` — every tool that returns or accepts an artifact reference uses it, so there's one id to track, not two. `type` ∈ {dataset, query, transform, chart, narrative, **skill**} — skills are just artifacts (`content_format="markdown"`), no separate table or tools. One skill row (dataset-discovery instructions) is seeded at store-init, before the demo starts.
 ```
 row_id (pk), artifact_id, version, type, title, description, tags,
 content_ref, content_format, source,     -- source: provenance for fetched datasets (url, fetched_at)
@@ -93,7 +93,7 @@ embedding,                                -- vector, for semantic search
 created_at, session_id, status
 ```
 
-**`lineage`** — edges between specific versions, not logical artifacts, so `{{artifact:id@v2}}` embeds and staleness checks always resolve to a fixed row.
+**`lineage`** — edges between specific `row_id`s, not logical artifacts, so a `{{artifact:<row_id>}}` embed always resolves to a fixed row (row_id already pins a version — no `@version` suffix needed). A narrative's `{{artifact:...}}` embeds are auto-added to its lineage on save, and surfaced back as `uses` when the narrative is fetched — see `save_artifact`'s docstring.
 ```
 child_row_id, parent_row_id
 ```

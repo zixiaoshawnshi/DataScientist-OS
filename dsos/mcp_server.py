@@ -95,6 +95,12 @@ def _artifact_payload(art: store.Artifact) -> dict:
         "content_format": art.content_format,
         "source": art.source,
     }
+    uses = store.get_lineage(conn, art.row_id, direction="ancestors")
+    if uses:
+        # What this artifact was built from / embeds — a narrative's
+        # {{artifact:row_id}} embeds surface here automatically, so "what
+        # datasets does this narrative use" needs no separate get_lineage call.
+        base["uses"] = [{"row_id": a.row_id, "type": a.type, "title": a.title} for a in uses]
     if isinstance(art.content, pd.DataFrame):
         base["row_count"] = len(art.content)
         base["columns"] = list(art.content.columns)
@@ -119,10 +125,12 @@ def start_session(question: str) -> dict:
 def search_artifacts(
     query: str, session_id: str, top_k: int = 5, type: str | None = None
 ) -> dict:
-    """Semantic search over everything saved so far (datasets, queries,
-    charts, narratives, skills). Call this before fetching new data or
-    rebuilding anything — if a past artifact already covers part of the
-    question, reuse it via get_artifact/run_sql/run_python instead of
+    """Search over everything saved so far (datasets, queries, charts,
+    narratives, skills) — an exact term (a title, a column name) reliably
+    matches even with the fallback embedding model; a vaguer query still
+    finds something via semantic similarity. Call this before fetching new
+    data or rebuilding anything — if a past artifact already covers part of
+    the question, reuse it via get_artifact/run_sql/run_python instead of
     redoing the work."""
     hits = store.search_artifacts(conn, query, top_k=top_k, type=type)
     results = [
@@ -142,7 +150,8 @@ def get_artifact(row_id: str, session_id: str) -> dict:
     is the only id you need; there's no separate "artifact_id" to look up.
     Tabular artifacts (dataset/query/transform) return row_count, columns,
     and a 10-row preview, not the full table — use run_sql/run_python
-    against this row_id to compute over the full data.
+    against this row_id to compute over the full data. `uses` lists what
+    this artifact was built from or embeds (e.g. a narrative's datasets).
 
     Note: run_sql/run_python already return this same preview inline in
     their own response — call get_artifact only to re-fetch something from
@@ -183,6 +192,11 @@ def save_artifact(
     `description` must be a real 1-2 sentences (what this is, why it
     matters) — search_artifacts ranks on it, so a vague description makes
     this artifact unreachable to future questions.
+
+    For a narrative: write `{{artifact:<row_id>}}` in content_text for each
+    dataset/chart/query it discusses. Those row_ids are automatically added
+    to this artifact's lineage — no need to also pass parent_row_ids for
+    them — and show up as `uses` when this narrative is fetched later.
     """
     if content_path:
         try:

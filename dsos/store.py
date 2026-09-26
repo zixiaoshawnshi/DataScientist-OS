@@ -7,6 +7,7 @@ execution runner, GUI) is built on top of.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -20,6 +21,15 @@ from dsos import embeddings
 from dsos.db import blob_dir_for
 
 ARTIFACT_TYPES = {"dataset", "query", "transform", "chart", "narrative", "skill"}
+
+# {{artifact:<row_id>}} — how a narrative (or any text artifact) embeds a
+# reference to another artifact. row_id already pins a specific version (a
+# new version gets a new row_id), so no separate @version suffix is needed.
+_EMBED_RE = re.compile(r"\{\{artifact:([\w-]+)\}\}")
+
+
+def _embedded_row_ids(content: Any) -> set[str]:
+    return set(_EMBED_RE.findall(content)) if isinstance(content, str) else set()
 
 
 def _now() -> str:
@@ -79,6 +89,13 @@ def save_artifact(
     A real 1-2 sentence `description` is required, not a filename — it's
     the only thing search_artifacts has to go on, and reuse quality depends
     on it directly.
+
+    Any `{{artifact:<row_id>}}` reference found in text `content` (e.g. a
+    narrative embedding the datasets/charts it discusses) is automatically
+    added to this artifact's lineage, on top of whatever `parent_row_ids`
+    was explicitly passed — a narrative doesn't need both. References to a
+    row_id that doesn't exist are silently dropped rather than raising, same
+    as get_lineage silently skips missing rows elsewhere.
     """
     if type not in ARTIFACT_TYPES:
         raise ValueError(f"unknown artifact type {type!r}, expected one of {ARTIFACT_TYPES}")
@@ -120,11 +137,20 @@ def save_artifact(
         "INSERT INTO artifacts_fts (row_id, title, description, tags) VALUES (?, ?, ?, ?)",
         (row_id, title, description, " ".join(tags)),
     )
-    for parent_row_id in parent_row_ids or []:
-        conn.execute(
-            "INSERT OR IGNORE INTO lineage (child_row_id, parent_row_id) VALUES (?, ?)",
-            (row_id, parent_row_id),
-        )
+    candidate_parents = set(parent_row_ids or []) | _embedded_row_ids(content)
+    if candidate_parents:
+        placeholders = ",".join("?" * len(candidate_parents))
+        existing_parents = {
+            r["row_id"] for r in conn.execute(
+                f"SELECT row_id FROM artifacts WHERE row_id IN ({placeholders})",
+                tuple(candidate_parents),
+            ).fetchall()
+        }
+        for parent_row_id in existing_parents:
+            conn.execute(
+                "INSERT OR IGNORE INTO lineage (child_row_id, parent_row_id) VALUES (?, ?)",
+                (row_id, parent_row_id),
+            )
     conn.commit()
     return row_id
 
@@ -200,35 +226,87 @@ def get_artifact_by_row_id(
     return _row_to_artifact(row, load_content=load_content) if row else None
 
 
+_LATEST_VERSION_JOIN = """
+    INNER JOIN (
+        SELECT artifact_id, MAX(version) AS v FROM artifacts GROUP BY artifact_id
+    ) latest ON a.artifact_id = latest.artifact_id AND a.version = latest.v
+"""
+
+
+def _fts_query(text: str) -> str:
+    """Free text -> an FTS5 MATCH expression: each word becomes a prefix
+    match, AND'd together, so "hackathon" also matches "hackathons" but a
+    multi-word natural-language query (how an agent actually phrases
+    search_artifacts) still requires every word present. That's deliberate:
+    OR'd terms make a long question match almost anything via common words,
+    drowning the "exact term wins" signal in false positives. AND correctly
+    falls through to semantic search when nothing matches every term, rather
+    than over-matching. "" (skip keyword search) if there are no word-like
+    tokens at all.
+    """
+    return " AND ".join(f"{w}*" for w in re.findall(r"\w+", text))
+
+
 def search_artifacts(
     conn: sqlite3.Connection, query: str, *, top_k: int = 5, type: str | None = None,
 ) -> list[tuple[Artifact, float]]:
-    """Semantic search, ranked by cosine similarity over title+description+tags.
+    """Keyword-first, semantic fallback — so an exact term (a title, a
+    column name) reliably wins, while a query with no literal overlap still
+    finds something via embedding cosine similarity. Only the latest version
+    of each logical artifact is considered either way.
 
-    Brute-force in Python: fine at demo scale (dozens–hundreds of rows), and
-    it means no vector DB dependency. Only compares the latest version of
-    each logical artifact.
+    Keyword hits are given a sentinel score of 1.0 (max confidence) rather
+    than a normalized bm25 score — ranking keyword above semantic matters
+    more here than ranking keyword hits amongst themselves precisely.
     """
-    sql = """
-        SELECT a.* FROM artifacts a
-        INNER JOIN (
-            SELECT artifact_id, MAX(version) AS v FROM artifacts GROUP BY artifact_id
-        ) latest ON a.artifact_id = latest.artifact_id AND a.version = latest.v
-    """
-    params: list[Any] = []
-    if type:
-        sql += " WHERE a.type = ?"
-        params.append(type)
-    rows = conn.execute(sql, params).fetchall()
+    type_clause = " AND a.type = ?" if type else ""
+    type_params = [type] if type else []
 
-    q_vec = embeddings.embed(query)
-    scored = []
-    for row in rows:
-        vec = np.frombuffer(row["embedding"], dtype=np.float32)
-        score = embeddings.cosine_sim(q_vec, vec)
-        scored.append((_row_to_artifact(row, load_content=False), score))
-    scored.sort(key=lambda pair: pair[1], reverse=True)
-    return scored[:top_k]
+    ordered: list[Artifact] = []
+    scores: list[float] = []
+    seen: set[str] = set()
+
+    fts_query = _fts_query(query)
+    if fts_query:
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT a.* FROM artifacts_fts
+                JOIN artifacts a ON a.row_id = artifacts_fts.row_id
+                {_LATEST_VERSION_JOIN}
+                WHERE artifacts_fts MATCH ?{type_clause}
+                ORDER BY bm25(artifacts_fts)
+                LIMIT ?
+                """,
+                [fts_query, *type_params, top_k],
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = []  # malformed FTS syntax from raw query text — semantic search still runs
+        for row in rows:
+            art = _row_to_artifact(row, load_content=False)
+            ordered.append(art)
+            scores.append(1.0)
+            seen.add(art.row_id)
+
+    if len(ordered) < top_k:
+        rows = conn.execute(
+            f"SELECT a.* FROM artifacts a {_LATEST_VERSION_JOIN}"
+            + (" WHERE a.type = ?" if type else ""),
+            type_params,
+        ).fetchall()
+        q_vec = embeddings.embed(query)
+        semantic = []
+        for row in rows:
+            if row["row_id"] in seen:
+                continue
+            vec = np.frombuffer(row["embedding"], dtype=np.float32)
+            semantic.append((_row_to_artifact(row, load_content=False), embeddings.cosine_sim(q_vec, vec)))
+        semantic.sort(key=lambda pair: pair[1], reverse=True)
+        for art, score in semantic[: top_k - len(ordered)]:
+            ordered.append(art)
+            scores.append(score)
+
+    return list(zip(ordered, scores))
 
 
 def get_lineage(

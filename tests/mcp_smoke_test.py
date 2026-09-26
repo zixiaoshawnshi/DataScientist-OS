@@ -90,6 +90,22 @@ async def main() -> None:
         assert "error" not in r.data, r.data
         assert r.data["row_id"] == query_row
         print("[ok] get_artifact(row_id=<what run_sql returned>) resolves (previously: 'no artifact')")
+        assert any(u["row_id"] == dataset_row for u in r.data.get("uses", [])), r.data
+        print("[ok] get_artifact inlines `uses` (its lineage ancestors) with no separate get_lineage call")
+
+        r = await client.call_tool("search_artifacts", {"query": "Toy Scores", "session_id": s1})
+        assert r.data["results"][0]["row_id"] == dataset_row and r.data["results"][0]["score"] == 1.0
+        print("[ok] exact-title search_artifacts query keyword-matches over the wire (score 1.0)")
+
+        r = await client.call_tool("save_artifact", {
+            "type": "narrative", "title": "Report", "session_id": s1,
+            "description": "A short report on team scores.", "content_format": "markdown",
+            "content_text": f"Teams scored well. See {{{{artifact:{dataset_row}}}}} for the raw data.",
+        })
+        narrative_row = r.data["row_id"]
+        r = await client.call_tool("get_artifact", {"row_id": narrative_row, "session_id": s1})
+        assert any(u["row_id"] == dataset_row for u in r.data.get("uses", [])), r.data
+        print("[ok] narrative's {{artifact:...}} embed auto-derived lineage, with no parent_row_ids passed")
 
         r = await client.call_tool("run_sql", {
             "code": "SELECT this_column_does_not_exist FROM toy_scores",

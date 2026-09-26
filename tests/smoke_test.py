@@ -70,6 +70,23 @@ def main() -> None:
     assert hits[0][0].row_id == skill_row_id, "discovery skill should rank first for a discovery query"
     print("[ok] discovery skill ranked first (cold-start retrieval works)")
 
+    exact_hits = search_artifacts(conn, "Toy Scores", top_k=3)
+    assert exact_hits[0][0].row_id == dataset_row and exact_hits[0][1] == 1.0, exact_hits
+    print("[ok] exact-title query keyword-matches (score 1.0), not just semantic ranking")
+
+    # --- narrative embedding a dataset: lineage should be auto-derived,
+    # with no parent_row_ids passed at all ---
+    narrative_row = save_artifact(
+        conn, type="narrative", title="Report", description="A short report on team scores.",
+        content=f"Teams scored well. See {{{{artifact:{dataset_row}}}}} for the raw data.",
+        content_format="markdown", session_id=s1,
+    )
+    narrative_uses = get_lineage(conn, narrative_row, direction="ancestors")
+    assert any(a.row_id == dataset_row for a in narrative_uses), (
+        "a {{artifact:row_id}} embed should auto-link lineage without parent_row_ids"
+    )
+    print("[ok] narrative's {{artifact:...}} embed auto-derived lineage to the dataset")
+
     # --- round 2: reuse round 1's dataset ---
     s2 = start_session(conn, "round 2: deeper synthetic question")
     query2_row = run_sql(
