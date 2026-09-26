@@ -18,7 +18,7 @@ import pandas as pd
 from fastmcp import FastMCP
 from fastmcp.server.middleware import Middleware
 
-from dsos import execution, present, publish, seed, store, templating
+from dsos import execution, present, publish, seed, store, templating, update_check
 from dsos.db import connect
 
 DB_PATH = os.environ.get("DSOS_DB_PATH", "data/store.db")
@@ -31,7 +31,13 @@ conn = connect(DB_PATH)
 # every connection. Whether a given client actually injects it into the
 # model's context (vs. just displaying it) is client-dependent — verify
 # with a live session before trusting it for a demo.
-INSTRUCTIONS = """\
+#
+# _UPDATE_NOTICE (if any) goes first, so it isn't lost if a client truncates
+# a long instructions string — only matters to someone on an installed
+# release (pip install git+...@vX.Y.Z); silently absent for a dev checkout.
+_UPDATE_NOTICE = update_check.check_for_update()
+
+INSTRUCTIONS = (f"{_UPDATE_NOTICE}\n\n" if _UPDATE_NOTICE else "") + """\
 Use this server for any question that needs real data: trends, comparisons, \
 correlations, "what predicts X", "how many/which", etc. Do not answer such \
 questions from general or prior knowledge — every answer must be backed by \
