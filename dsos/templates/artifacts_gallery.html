@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Artifacts — DS Artifact OS{% endblock %}
+{% block content %}
+<p class="crumbs"><a href="/">← Sessions</a></p>
+<h1>Artifacts</h1>
+<form class="filters" method="get" action="/artifacts">
+  <input type="text" name="q" placeholder="search…" value="{{ q }}">
+  <select name="type">
+    <option value="">all types</option>
+    {% for t in types %}
+    <option value="{{ t }}" {% if type == t %}selected{% endif %}>{{ t }}</option>
+    {% endfor %}
+  </select>
+  <button type="submit">Filter</button>
+</form>
+{% if artifacts %}
+<table>
+  <thead><tr><th>Title</th><th>Type</th><th>Description</th><th>Created</th></tr></thead>
+  <tbody>
+  {% for a in artifacts %}
+    <tr>
+      <td><a href="/artifacts/{{ a.row_id }}">{{ a.title }}</a></td>
+      <td><span class="badge badge-type">{{ a.type }}</span></td>
+      <td class="muted">{{ a.description }}</td>
+      <td class="muted">{{ a.created_at }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No artifacts match.</p>
+{% endif %}
+{% endblock %}

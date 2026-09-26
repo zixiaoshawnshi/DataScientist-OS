@@ -110,6 +110,11 @@ def connect(db_path: str | Path = "data/store.db") -> sqlite3.Connection:
     # one call in flight at a time) — not a claim of real concurrency safety.
     conn = sqlite3.connect(path, factory=_Connection, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # WAL: the read-only GUI opens its own connection to this same file while
+    # the MCP server is actively writing to it during a live agent run.
+    # Default (rollback-journal) mode throws "database is locked" under that
+    # read/write overlap; WAL lets readers and a writer coexist.
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
     conn.commit()
     conn._dsos_db_path = str(path)

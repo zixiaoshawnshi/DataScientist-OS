@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}{{ art.title }} — DS Artifact OS{% endblock %}
+{% block content %}
+<p class="crumbs">
+  <a href="/artifacts">← Artifacts</a> ·
+  <a href="/sessions/{{ art.session_id }}">session</a> ·
+  <a href="/artifacts/{{ art.row_id }}/lineage">lineage graph →</a>
+</p>
+<h1>{{ art.title }} <span class="badge badge-type">{{ art.type }}</span></h1>
+<p>{{ art.description }}</p>
+<p class="muted">v{{ art.version }} · created {{ art.created_at }} · status {{ art.status }} · row {{ art.row_id }}</p>
+{% if art.tags %}
+<p>{% for t in art.tags %}<span class="badge badge-type">{{ t }}</span> {% endfor %}</p>
+{% endif %}
+{% if art.source %}
+<p class="muted">source: <a href="{{ art.source.url }}">{{ art.source.url }}</a> (fetched {{ art.source.fetched_at }})</p>
+{% endif %}
+
+{% if payload.content_error %}
+<h2>Content</h2>
+<p class="muted">⚠ {{ payload.content_error }}</p>
+{% elif payload.preview %}
+<h2>Preview ({{ payload.row_count }} rows, {{ payload.columns|length }} columns)</h2>
+<table>
+  <thead><tr>{% for c in payload.columns %}<th>{{ c }}</th>{% endfor %}</tr></thead>
+  <tbody>
+  {% for row in payload.preview %}
+    <tr>{% for c in payload.columns %}<td>{{ row[c] }}</td>{% endfor %}</tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% elif png_b64 %}
+<h2>Chart</h2>
+<img src="data:image/png;base64,{{ png_b64 }}" alt="{{ art.title }}">
+{% else %}
+<h2>Content</h2>
+<pre>{{ payload.content }}</pre>
+{% endif %}
+
+{% if execution %}
+<h2>Execution</h2>
+<p class="muted">{{ execution.kind }} · status {{ execution.status }}</p>
+<pre>{{ execution.stdout }}{% if execution.error %}
+
+ERROR: {{ execution.error }}{% endif %}</pre>
+{% endif %}
+
+{% if uses %}
+<h2>Uses (built from)</h2>
+<ul>
+{% for a in uses %}<li><a href="/artifacts/{{ a.row_id }}">{{ a.title }}</a> <span class="badge badge-type">{{ a.type }}</span></li>{% endfor %}
+</ul>
+{% endif %}
+
+{% if used_by %}
+<h2>Used by</h2>
+<ul>
+{% for a in used_by %}<li><a href="/artifacts/{{ a.row_id }}">{{ a.title }}</a> <span class="badge badge-type">{{ a.type }}</span></li>{% endfor %}
+</ul>
+{% endif %}
+
+{% if versions|length > 1 %}
+<h2>Other versions</h2>
+<ul>
+{% for v in versions %}
+  <li>
+    <a href="/artifacts/{{ v.row_id }}">v{{ v.version }}</a>{% if v.row_id == art.row_id %} (current){% endif %}
+    — {{ v.created_at }}
+  </li>
+{% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

@@ -28,7 +28,13 @@ from dsos.store import (
     start_session,
 )
 
-DB_PATH = "data/smoke_test.db"
+
+# A dedicated subdirectory, not "data/<name>.db" — that used to make
+# Path(DB_PATH).parent resolve to the *shared* data/ root, so the rmtree
+# below wiped the real store.db and data/blobs/ (and every other test's
+# files) instead of just this test's own leftovers. Cost real demo data
+# once already; don't repeat it.
+DB_PATH = "data/test-runs/smoke_test/store.db"
 
 
 def main() -> None:
@@ -99,6 +105,25 @@ def main() -> None:
     reused = reused_artifact_row_ids(conn, s2)
     assert dataset_row in reused, "round 2 should show round 1's dataset as reused"
     print(f"[ok] reuse detected in round 2: {reused}")
+
+    # --- a blob missing from disk (e.g. an accidental cleanup elsewhere)
+    # should degrade gracefully, not crash every caller that fetches it ---
+    from dsos.store import get_artifact_by_row_id
+
+    dataset_ref = get_artifact_by_row_id(conn, dataset_row, load_content=False).content_ref
+    Path(dataset_ref).unlink()
+    art = get_artifact_by_row_id(conn, dataset_row)
+    assert art.content is None and art.content_error, "missing blob should set content_error, not raise"
+    print(f"[ok] get_artifact_by_row_id degrades gracefully on a missing blob: {art.content_error}")
+
+    broken_query_row = run_sql(
+        conn, code="SELECT * FROM toy_scores",
+        session_id=s2, title="Should fail", description="Input's blob is gone.",
+        input_row_ids=[dataset_row],
+    )
+    broken = get_artifact_by_row_id(conn, broken_query_row, load_content=False)
+    assert broken.status == "error", "run_sql against a missing-blob input should fail cleanly, not crash"
+    print("[ok] run_sql against a missing-blob input reports status=error instead of crashing")
 
     print("\nLayer 1 smoke test passed.")
 

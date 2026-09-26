@@ -18,7 +18,7 @@ import pandas as pd
 from fastmcp import FastMCP
 from fastmcp.server.middleware import Middleware
 
-from dsos import execution, seed, store
+from dsos import execution, present, publish, seed, store
 from dsos.db import connect
 
 DB_PATH = os.environ.get("DSOS_DB_PATH", "data/store.db")
@@ -49,6 +49,9 @@ result is returned inline in the same response (a preview, row_count, \
 columns) — do not call get_artifact right after just to see what you \
 produced; it's already there.
 5. Answer using the computed output, citing the row_ids you used.
+6. If asked for a shareable writeup: save_artifact(type="narrative", ...) \
+with {{artifact:row_id}} embeds for what it discusses, then publish_report \
+to render it to one self-contained local .html file.
 
 Every tool that returns an artifact — save_artifact, run_sql, run_python, \
 search_artifacts — gives you a row_id. That row_id is the only id you need \
@@ -85,31 +88,7 @@ mcp.add_middleware(ToolCallLogger())
 
 
 def _artifact_payload(art: store.Artifact) -> dict:
-    base = {
-        "row_id": art.row_id,
-        "artifact_id": art.artifact_id,
-        "version": art.version,
-        "type": art.type,
-        "title": art.title,
-        "description": art.description,
-        "content_format": art.content_format,
-        "source": art.source,
-    }
-    uses = store.get_lineage(conn, art.row_id, direction="ancestors")
-    if uses:
-        # What this artifact was built from / embeds — a narrative's
-        # {{artifact:row_id}} embeds surface here automatically, so "what
-        # datasets does this narrative use" needs no separate get_lineage call.
-        base["uses"] = [{"row_id": a.row_id, "type": a.type, "title": a.title} for a in uses]
-    if isinstance(art.content, pd.DataFrame):
-        base["row_count"] = len(art.content)
-        base["columns"] = list(art.content.columns)
-        base["preview"] = art.content.head(10).to_dict(orient="records")
-    elif isinstance(art.content, bytes):
-        base["content"] = f"<binary, {len(art.content)} bytes>"
-    else:
-        base["content"] = art.content
-    return base
+    return present.artifact_payload(conn, art)
 
 
 @mcp.tool()
@@ -322,6 +301,27 @@ def get_lineage(row_id: str, session_id: str, direction: str = "ancestors") -> d
     arts = store.get_lineage(conn, row_id, direction=direction)
     results = [{"row_id": a.row_id, "type": a.type, "title": a.title} for a in arts]
     return {"results": results, "artifact_row_ids": [row_id, *(a.row_id for a in arts)]}
+
+
+@mcp.tool()
+def publish_report(row_id: str, session_id: str) -> dict:
+    """Render a narrative artifact and everything its {{artifact:...}}
+    embeds reference — datasets/queries/transforms as HTML tables, charts as
+    inlined images — into one self-contained local .html file. This is the
+    seam where a finished report leaves this working layer (see the
+    discovery skill and save_artifact for how things get INTO it).
+
+    row_id must be a narrative artifact (save_artifact it first if you
+    haven't). This does not create a new artifact row itself — a rendered
+    export isn't a versioned analysis artifact.
+
+    Example: publish_report(row_id="<narrative row_id>", session_id="s1")
+    """
+    try:
+        result = publish.publish_report(conn, row_id)
+    except ValueError as exc:
+        return {"error": str(exc), "artifact_row_ids": []}
+    return result
 
 
 def _ensure_seeded() -> None:

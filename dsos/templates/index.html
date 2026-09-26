@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Sessions — DS Artifact OS{% endblock %}
+{% block content %}
+<h1>Sessions</h1>
+{% if sessions %}
+<table>
+  <thead><tr><th>Question</th><th>Started</th><th>Artifacts</th><th>Reused</th></tr></thead>
+  <tbody>
+    {% for s in sessions %}
+    <tr>
+      <td><a href="/sessions/{{ s.id }}">{{ s.question }}</a></td>
+      <td class="muted">{{ s.started_at }}</td>
+      <td>{{ s.artifact_count }}</td>
+      <td>
+        {% if s.reused_count %}
+        <span class="badge badge-reuse">{{ s.reused_count }} reused</span>
+        {% else %}
+        <span class="muted">—</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No sessions yet.</p>
+{% endif %}
+<p><a href="/artifacts">Browse all artifacts →</a></p>
+{% endblock %}

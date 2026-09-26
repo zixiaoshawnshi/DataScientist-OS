@@ -21,7 +21,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import os
 
-os.environ["DSOS_DB_PATH"] = "data/mcp_smoke_test.db"
+# A dedicated subdirectory, not "data/<name>.db" — that used to make
+# Path(DB_PATH).parent resolve to the *shared* data/ root, so the rmtree
+# below wiped the real store.db and data/blobs/ (and every other test's
+# files) instead of just this test's own leftovers. Cost real demo data
+# once already; don't repeat it.
+os.environ["DSOS_DB_PATH"] = "data/test-runs/mcp_smoke_test/store.db"
 shutil.rmtree(Path(os.environ["DSOS_DB_PATH"]).parent, ignore_errors=True)
 
 from fastmcp import Client  # noqa: E402

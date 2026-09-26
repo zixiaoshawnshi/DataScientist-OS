@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}{{ session.question }} — DS Artifact OS{% endblock %}
+{% block content %}
+<p class="crumbs"><a href="/">← Sessions</a></p>
+<h1>{{ session.question }}</h1>
+<p class="muted">started {{ session.started_at }} · session {{ session.id }}</p>
+
+<h2>Artifacts created</h2>
+{% if artifacts %}
+<table>
+  <thead><tr><th>Title</th><th>Type</th><th>Created</th></tr></thead>
+  <tbody>
+  {% for a in artifacts %}
+    <tr>
+      <td><a href="/artifacts/{{ a.row_id }}">{{ a.title }}</a></td>
+      <td><span class="badge badge-type">{{ a.type }}</span></td>
+      <td class="muted">{{ a.created_at }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No artifacts yet.</p>
+{% endif %}
+
+<h2>Tool-call feed</h2>
+<div hx-get="/sessions/{{ session.id }}/tool_calls" hx-trigger="load, every 2s" hx-swap="innerHTML">
+  loading…
+</div>
+{% endblock %}

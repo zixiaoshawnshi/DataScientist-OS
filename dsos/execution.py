@@ -67,11 +67,13 @@ def run_sql(
 
     inputs = [get_artifact_by_row_id(conn, rid) for rid in input_row_ids]
     duck = duckdb.connect(":memory:")
-    for art in inputs:
-        table_name = _safe_table_name(art.title)
-        duck.register(table_name, art.content)  # content: pandas.DataFrame
 
     try:
+        for art in inputs:
+            if art.content_error:
+                raise ValueError(f"input {art.row_id} ({art.title!r}): {art.content_error}")
+            table_name = _safe_table_name(art.title)
+            duck.register(table_name, art.content)  # content: pandas.DataFrame
         with contextlib.redirect_stdout(stdout):
             result = duck.execute(code).fetchdf()
     except Exception as exc:
@@ -111,10 +113,12 @@ def run_python(
 
     inputs = [get_artifact_by_row_id(conn, rid) for rid in input_row_ids]
     namespace: dict[str, Any] = {"pd": pd}
-    for art in inputs:
-        namespace[_safe_table_name(art.title)] = art.content
 
     try:
+        for art in inputs:
+            if art.content_error:
+                raise ValueError(f"input {art.row_id} ({art.title!r}): {art.content_error}")
+            namespace[_safe_table_name(art.title)] = art.content
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             exec(code, namespace)  # noqa: S102 — intentional: this is the product
         if "result" not in namespace:

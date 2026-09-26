@@ -1,0 +1,15 @@
+{% for c in calls %}
+<div class="feed-item">
+  <strong>{{ c.tool_name }}</strong>
+  <span class="muted">{{ c.ts }}</span>
+  <div>{{ c.result_summary }}</div>
+  {% if c.artifact_row_ids %}
+  <div class="muted">
+    touched:
+    {% for rid in c.artifact_row_ids %}<a href="/artifacts/{{ rid }}">{{ rid[:8] }}</a>{% if not loop.last %}, {% endif %}{% endfor %}
+  </div>
+  {% endif %}
+</div>
+{% else %}
+<p class="muted">No tool calls yet.</p>
+{% endfor %}

@@ -56,6 +56,7 @@ class Artifact:
     session_id: str
     status: str
     content: Any = None  # populated by get_artifact/search_artifacts on demand
+    content_error: str | None = None  # set instead of content if the blob is missing on disk
 
 
 def start_session(conn: sqlite3.Connection, question: str) -> str:
@@ -197,7 +198,14 @@ def _row_to_artifact(row: sqlite3.Row, *, load_content: bool) -> Artifact:
         created_at=row["created_at"], session_id=row["session_id"], status=row["status"],
     )
     if load_content:
-        art.content = _load_blob(art.content_ref, art.content_format)
+        try:
+            art.content = _load_blob(art.content_ref, art.content_format)
+        except FileNotFoundError:
+            # The row's metadata (title, description, lineage) is still
+            # real and useful even if the blob itself is gone from disk
+            # (moved store, cleared cache, ...) — surface that distinctly
+            # instead of crashing every caller that fetches this artifact.
+            art.content_error = f"content blob missing on disk: {art.content_ref}"
     return art
 
 
@@ -373,6 +381,78 @@ def log_tool_call(
     )
     conn.commit()
     return call_id
+
+
+def get_session(conn: sqlite3.Connection, session_id: str) -> dict | None:
+    row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+    if row is None:
+        return None
+    return {"id": row["id"], "question": row["question"], "started_at": row["started_at"]}
+
+
+def list_sessions(conn: sqlite3.Connection) -> list[dict]:
+    """All sessions, most recent first, with each one's artifact/reuse counts
+    — the GUI's home page. Reuse count is a summary of
+    `reused_artifact_row_ids`, computed per session at read time (no reuse
+    count is persisted anywhere)."""
+    rows = conn.execute("SELECT * FROM sessions ORDER BY started_at DESC").fetchall()
+    results = []
+    for row in rows:
+        artifact_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM artifacts WHERE session_id = ?", (row["id"],)
+        ).fetchone()["n"]
+        results.append({
+            "id": row["id"], "question": row["question"], "started_at": row["started_at"],
+            "artifact_count": artifact_count,
+            "reused_count": len(reused_artifact_row_ids(conn, row["id"])),
+        })
+    return results
+
+
+def list_tool_calls(conn: sqlite3.Connection, session_id: str) -> list[dict]:
+    """A session's tool-call feed, oldest first — the free agent trace from
+    the design doc, rendered for the GUI's session detail page."""
+    rows = conn.execute(
+        "SELECT * FROM tool_calls WHERE session_id = ? ORDER BY ts", (session_id,)
+    ).fetchall()
+    return [
+        {
+            "id": r["id"], "ts": r["ts"], "tool_name": r["tool_name"],
+            "args": json.loads(r["args_json"]), "result_summary": r["result_summary"],
+            "artifact_row_ids": json.loads(r["artifact_row_ids"]),
+        }
+        for r in rows
+    ]
+
+
+def list_artifacts(
+    conn: sqlite3.Connection, *, type: str | None = None, session_id: str | None = None,
+) -> list[Artifact]:
+    """Latest version of each logical artifact, newest first, optionally
+    filtered by type and/or the session that created that version — the
+    GUI's un-searched gallery view and a session's "artifacts it created"."""
+    clauses, params = [], []
+    if type:
+        clauses.append("a.type = ?")
+        params.append(type)
+    if session_id:
+        clauses.append("a.session_id = ?")
+        params.append(session_id)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = conn.execute(
+        f"SELECT a.* FROM artifacts a {_LATEST_VERSION_JOIN} {where} ORDER BY a.created_at DESC",
+        params,
+    ).fetchall()
+    return [_row_to_artifact(r, load_content=False) for r in rows]
+
+
+def list_versions(conn: sqlite3.Connection, artifact_id: str) -> list[Artifact]:
+    """Every version of one logical artifact, oldest first — the GUI's
+    "other versions" list on the artifact detail page."""
+    rows = conn.execute(
+        "SELECT * FROM artifacts WHERE artifact_id = ? ORDER BY version", (artifact_id,)
+    ).fetchall()
+    return [_row_to_artifact(r, load_content=False) for r in rows]
 
 
 def reused_artifact_row_ids(conn: sqlite3.Connection, session_id: str) -> list[str]:
