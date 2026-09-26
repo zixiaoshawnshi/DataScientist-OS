@@ -1,0 +1,19 @@
+<!doctype html>
+<!-- Bare HTML: title, body, almost no styling — for downstream tools that
+     apply their own CSS, or for diffing rendered content.
+     Tokens (see dsos/templating.py): title, body, published_at,
+     session_question. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{title}}</title>
+<style> img { max-width: 100%; } table { border-collapse: collapse; }
+  th, td { padding: 0.3rem 0.5rem; border: 1px solid #ccc; text-align: left; }
+</style>
+</head>
+<body>
+<h1>{{title}}</h1>
+<p><small>{{session_question}} — {{published_at}}</small></p>
+{{body}}
+</body>
+</html>

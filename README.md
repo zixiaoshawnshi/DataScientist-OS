@@ -120,6 +120,40 @@ working layer; it does not itself create a new artifact row.
 and reports which ones exist and which are broken/stale, without writing a
 file — a cheap check before spending a real publish.
 
+`publish_report(..., template=...)` picks the report layout — the consistency
+layer, see below.
+
+## Skills and templates
+
+Two consistency layers ship with the store, both built on the same artifact
+machinery (versioned, searchable, lineage-tracked) rather than new subsystems:
+
+**The skill library** — common workflow skills (dataset discovery, exploratory
+analysis, charting, statistics, modeling, reporting), seeded at store-init
+and listed via `list_skills`. They teach *workflow* — how to drive the tools
+so work stays addressable and reusable — not prescriptive methodology. Read
+one with `get_artifact`, follow it, and customize the system's behavior with
+`save_skill`: an edit is a new version of the same skill (stable
+`artifact_id`), and re-seeding never overwrites it.
+
+**Templates** — chart styles and report layouts:
+
+- `run_python(..., style=...)`: matplotlib rcParams applied *before* your code
+  runs. Default `"dsos"` is the dark house style; `"report"` is the same look
+  sized for charts embedded in published reports; `"minimal"` is a bare light
+  style; `style=None` gives raw matplotlib defaults (every run resets, so
+  styles never leak between runs).
+- `publish_report(..., template=...)`: the HTML layout around the rendered
+  narrative. Default `"report"` is the dark house layout (matching the chart
+  style); `"default"` is the original plain look; `"minimal"` is bare HTML.
+- `list_templates(kind=...)` shows what exists; `save_template(kind=...,
+  base=...)` creates or re-versions a custom one. `base` copies an existing
+  template so you customize instead of rewriting, and custom templates are
+  referenced by stable `artifact_id` — an edit keeps the id, references keep
+  resolving. Custom chart styles are validated against matplotlib's own
+  parser at save time; custom report templates must declare where the body
+  goes. Both fail in one call, not at first use.
+
 ## Project layout
 
 ```
@@ -131,13 +165,20 @@ dsos/
                  log, reuse detection
   execution.py   run_sql (DuckDB) / run_python — auto-records each run and
                  auto-links its output into lineage
-  seed.py        bootstrap discovery-skill artifact
+  seed.py        seeds the skill library (idempotently — an agent-edited
+                 skill is never re-seeded over)
+  templating.py  the template layer: chart-style + report-template
+                 resolution/validation/rendering (built-ins live in assets/)
   present.py     shared artifact-payload rendering — used by both the MCP
                  server and the GUI so they can't drift apart
   mcp_server.py  FastMCP wrapper exposing the tools + a middleware that
                  auto-logs every tool call
   publish.py     renders a narrative + its embeds into one self-contained
-                 .html file; wrapped as the publish_report MCP tool
+                 .html file via a template; wrapped as the publish_report
+                 MCP tool
+  assets/        built-in chart styles (.mplstyle) and report layouts
+                 (.html) — package files, not artifacts; customs are
+                 `template` artifacts
   gui.py         read-only FastAPI+Jinja2+htmx browser over the store —
                  a separate process, not an MCP tool
   templates/     Jinja2 templates for the GUI
@@ -145,6 +186,8 @@ tests/
   smoke_test.py         layer 1 — direct function calls, no protocol
   mcp_smoke_test.py     layer 2 — real MCP wire protocol via FastMCP's Client
   publish_smoke_test.py layer 2b — publish_report over the real MCP wire
+  skills_templates_smoke_test.py
+                        layer 2c — skill library + templates over the wire
   gui_smoke_test.py     layer 3 — GUI routes via FastAPI's TestClient
 Design/
   DS Artifact OS — Design Doc.md   philosophy, data model, MCP tool list,

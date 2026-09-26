@@ -66,6 +66,8 @@ try:
 except ImportError:
     pass
 
+#__DSOS_CHART_STYLE__#
+
 #__DSOS_INPUT_BINDINGS__#
 
 #__DSOS_USER_CODE__#
@@ -161,14 +163,43 @@ def _timeout_s() -> int:
         return DEFAULT_TIMEOUT_S
 
 
+def _build_wrapper(
+    *, code: str, code_paths: list[str] | None, chart_style: str | None,
+    bindings: list[str], workdir: Path,
+) -> str:
+    """Assemble the wrapper script: token substitution in a fixed order,
+    with the agent's code LAST — replacement values are never re-scanned,
+    so user code containing token-like text can never corrupt the
+    substitutions above it. Split out of run_subprocess so the wiring
+    (chart style lines, input bindings, result paths) is checkable without
+    paying a uv run."""
+    from dsos import templating
+
+    return (_WRAPPER_TEMPLATE
+            .replace("#__DSOS_CODE_PATHS__#", repr(list(code_paths or [])))
+            .replace("#__DSOS_CHART_STYLE__#", templating.sandbox_style_block(chart_style))
+            .replace("#__DSOS_INPUT_BINDINGS__#", "\n".join(bindings))
+            .replace("#__DSOS_RESULT_PARQUET__#", repr(str(workdir / "result.parquet")))
+            .replace("#__DSOS_RESULT_PNG__#", repr(str(workdir / "result.png")))
+            .replace("#__DSOS_RESULT_JSON__#", repr(str(workdir / "result.json")))
+            .replace("#__DSOS_RESULT_TEXT__#", repr(str(workdir / "result.txt")))
+            .replace("#__DSOS_OK_MARKER__#", repr(str(workdir / _OK_MARKER)))
+            .replace("#__DSOS_USER_CODE__#", code))  # user code last
+
+
 def run_subprocess(
     *, code: str, requirements: list[str], code_paths: list[str] | None,
-    inputs: list[Artifact],
+    inputs: list[Artifact], chart_style: str | None = None,
 ) -> dict:
     """Run the agent's code in a uv-resolved ephemeral environment. Returns
     the same run dict shape as the in-process path: status/error/stdout/
     stderr/result — so execution.py's save/record/lineage tail is identical
-    either way."""
+    either way.
+
+    chart_style: an already-resolved style path (see execution.run_python)
+    applied in the wrapper before the user code — same consistent styling
+    as the in-process path. (No reset needed for None here: each subprocess
+    starts from raw matplotlib defaults.)"""
     uv = find_uv()
     if uv is None:
         return _error_run(
@@ -185,15 +216,10 @@ def run_subprocess(
         workdir = Path(tmp)
         bindings = _write_inputs(workdir, inputs)
 
-        wrapper = (_WRAPPER_TEMPLATE
-                   .replace("#__DSOS_CODE_PATHS__#", repr(list(code_paths or [])))
-                   .replace("#__DSOS_INPUT_BINDINGS__#", "\n".join(bindings))
-                   .replace("#__DSOS_RESULT_PARQUET__#", repr(str(workdir / "result.parquet")))
-                   .replace("#__DSOS_RESULT_PNG__#", repr(str(workdir / "result.png")))
-                   .replace("#__DSOS_RESULT_JSON__#", repr(str(workdir / "result.json")))
-                   .replace("#__DSOS_RESULT_TEXT__#", repr(str(workdir / "result.txt")))
-                   .replace("#__DSOS_OK_MARKER__#", repr(str(workdir / _OK_MARKER)))
-                   .replace("#__DSOS_USER_CODE__#", code))  # user code last
+        wrapper = _build_wrapper(
+            code=code, code_paths=code_paths, chart_style=chart_style,
+            bindings=bindings, workdir=workdir,
+        )
         wrapper_path = workdir / "wrapper.py"
         wrapper_path.write_text(wrapper, encoding="utf-8")
 

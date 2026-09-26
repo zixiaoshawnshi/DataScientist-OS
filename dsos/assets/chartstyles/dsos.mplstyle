@@ -1,0 +1,40 @@
+# DSOS house chart style — the dark-mode default for every run_python chart
+# (run_python's style="dsos", the default). Dark canvas, light text, soft
+# grid, no top/right spines, and a pastel-on-dark color cycle so
+# categorical series stay distinguishable without neon.
+
+figure.dpi       : 110
+savefig.dpi      : 150
+figure.facecolor : "#141a22"
+savefig.facecolor: "#141a22"
+axes.facecolor   : "#141a22"
+text.color       : "#dce3ed"
+axes.labelcolor  : "#dce3ed"
+axes.edgecolor   : "#4c5566"
+axes.linewidth   : 0.9
+xtick.color      : "#aab3c2"
+ytick.color      : "#aab3c2"
+font.size        : 11
+axes.titlesize   : 13
+axes.labelsize   : 11
+xtick.labelsize  : 10
+ytick.labelsize  : 10
+legend.fontsize  : 10
+axes.titleweight : bold
+axes.titlepad    : 12
+
+axes.grid        : True
+grid.color       : "#27303d"
+grid.linewidth   : 0.7
+
+axes.spines.top  : False
+axes.spines.right: False
+
+axes.prop_cycle  : cycler('color', ["#89b4f7", "#f5a35c", "#7fd0a5", "#e28fb1", "#a99df2", "#66d4cf", "#d9c468", "#9aa3b2"])
+
+lines.linewidth  : 1.8
+lines.markersize : 5.5
+
+legend.frameon   : False
+xtick.direction  : out
+ytick.direction  : out

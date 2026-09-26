@@ -58,6 +58,7 @@ try:
 except ImportError:
     pass
 
+from dsos import templating
 from dsos.store import Artifact, get_artifact_by_row_id, safe_table_name, save_artifact
 
 _STDOUT_LIMIT = 2_000
@@ -310,9 +311,18 @@ def run_sql(
     )
 
 
-def _run_python_inprocess(*, code: str, inputs: list, code_paths: list[str] | None) -> dict:
+def _run_python_inprocess(
+    *, code: str, inputs: list, code_paths: list[str] | None, chart_style: str | None = None,
+) -> dict:
     """The default fast path: exec in this process. Same run-dict shape as
-    the sandbox path, so everything downstream is identical."""
+    the sandbox path, so everything downstream is identical.
+
+    chart_style: an already-RESOLVED style path (templating.resolve_chart_style
+    runs in run_python so both paths get one resolved value). Applied to
+    rcParams before the user code — a run_python chart cell gets consistent
+    styling without calling plt.style.use itself. Style=None still RESETS
+    rcParams: every run must start from a known state, or the previous run's
+    style leaks into this one (see templating.reset_chart_style)."""
     stdout, stderr = io.StringIO(), io.StringIO()
     namespace: dict[str, Any] = {"pd": pd}
     for art in inputs:
@@ -320,6 +330,12 @@ def _run_python_inprocess(*, code: str, inputs: list, code_paths: list[str] | No
 
     added_paths: list[str] = []
     try:
+        # Before exec, so user code sees (and may override) the style —
+        # style is a default, not a cage.
+        if chart_style:
+            templating.apply_chart_style(chart_style)
+        else:
+            templating.reset_chart_style()
         if code_paths:
             # Temporary sys.path additions, always restored — the server's
             # process must not leak one run's import paths into the next.
@@ -356,7 +372,7 @@ def run_python(
     conn: sqlite3.Connection, *, code: str, session_id: str, title: str, description: str,
     input_row_ids: list[str], output_type: str = "transform", output_format: str = "parquet",
     scratch: bool = False, requirements: list[str] | None = None,
-    code_paths: list[str] | None = None,
+    code_paths: list[str] | None = None, style: str | None = "dsos",
 ) -> str | dict:
     """Runs `code` with each input artifact bound to a variable named after
     its title (lowercased, non-alnum -> `_`), plus `pd`. The code must set a
@@ -366,24 +382,35 @@ def run_python(
 
     With `requirements` (non-empty), the code instead runs in a uv-resolved
     throwaway subprocess environment; the result flows back through the same
-    save/record/lineage path."""
+    save/record/lineage path.
+
+    `style` (the consistency layer — dsos/templating.py): the chart style
+    applied to rcParams before the code runs. "dsos" is the dark house
+    default; "report" the same look sized for published reports; "minimal"
+    a bare light style; a custom chart-style template's row_id/artifact_id
+    works too; None = raw matplotlib defaults. Resolved BEFORE the code
+    runs, so a bad reference is a one-call error, not a matplotlib error
+    mid-chart."""
     started_at = _now()
     inputs = [get_artifact_by_row_id(conn, rid) for rid in input_row_ids]
 
     try:
         _check_inputs(inputs)
+        chart_style = templating.resolve_chart_style(conn, style)
         if requirements:
             from dsos import sandbox
             run = sandbox.run_subprocess(
                 code=code, requirements=list(requirements),
-                code_paths=code_paths, inputs=inputs,
+                code_paths=code_paths, inputs=inputs, chart_style=chart_style,
             )
         else:
-            run = _run_python_inprocess(code=code, inputs=inputs, code_paths=code_paths)
+            run = _run_python_inprocess(
+                code=code, inputs=inputs, code_paths=code_paths, chart_style=chart_style,
+            )
     except Exception as exc:
         # dsos-side failures around the run (missing-blob inputs, bad
-        # code_paths, sandbox plumbing) — user-code failures are already
-        # captured inside the run dicts above.
+        # code_paths, a bad style reference, sandbox plumbing) — user-code
+        # failures are already captured inside the run dicts above.
         run = {"status": "error", "error": f"{type(exc).__name__}: {exc}",
                "stdout": "", "stderr": traceback.format_exc(), "result": pd.DataFrame()}
 

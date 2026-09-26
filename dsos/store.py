@@ -20,7 +20,10 @@ import numpy as np
 from dsos import embeddings
 from dsos.db import blob_dir_for
 
-ARTIFACT_TYPES = {"dataset", "query", "transform", "chart", "narrative", "skill"}
+# "template": chart styles (.mplstyle text) and report layouts (.html with
+# {{title}}/{{body}} tokens) — the customizable styling layer behind
+# run_python(style=...) and publish_report(template=...). See dsos/templating.py.
+ARTIFACT_TYPES = {"dataset", "query", "transform", "chart", "narrative", "skill", "template"}
 
 # {{artifact:<row_id>}} — how a narrative (or any text artifact) embeds a
 # reference to another artifact. row_id already pins a specific version (a
@@ -117,6 +120,22 @@ def save_artifact(
     is_new = artifact_id is None
     artifact_id = artifact_id or _new_id()
 
+    if not is_new:
+        existing = conn.execute(
+            "SELECT type FROM artifacts WHERE artifact_id = ? ORDER BY version DESC LIMIT 1",
+            (artifact_id,),
+        ).fetchone()
+        # A chosen artifact_id that no row uses yet is fine (that's how the
+        # seeded skills register their stable ids). But versioning an
+        # existing logical artifact across a *type change* (e.g. stacking a
+        # narrative version onto a dataset id) is almost always an accident
+        # that would silently corrupt the version chain — refuse it.
+        if existing is not None and existing["type"] != type:
+            raise ValueError(
+                f"artifact_id {artifact_id!r} already holds type {existing['type']!r}; "
+                f"a new version must keep the same type (got {type!r})"
+            )
+
     if is_new:
         version = 1
     else:
@@ -170,7 +189,8 @@ def _write_blob(
     conn: sqlite3.Connection, artifact_id: str, version: int, content: Any, content_format: str
 ) -> str:
     ext = {"parquet": "parquet", "python": "py", "sql": "sql", "markdown": "md",
-           "json": "json", "png": "png", "csv": "csv"}.get(content_format, "bin")
+           "json": "json", "png": "png", "csv": "csv", "html": "html",
+           "mplstyle": "mplstyle"}.get(content_format, "bin")
     d = blob_dir_for(conn) / artifact_id
     d.mkdir(parents=True, exist_ok=True)
     path = d / f"v{version}.{ext}"

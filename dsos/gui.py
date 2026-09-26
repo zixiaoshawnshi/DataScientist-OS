@@ -25,7 +25,10 @@ conn = connect(DB_PATH)
 app = FastAPI(title="DS Artifact OS — GUI (read-only)")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
-ARTIFACT_TYPES = ["dataset", "query", "transform", "chart", "narrative", "skill"]
+# "template": chart styles / report layouts — artifacts like anything else
+# (see dsos/templating.py). Authoring stays agent-only for now; the GUI
+# just doesn't hide them from the gallery.
+ARTIFACT_TYPES = ["dataset", "query", "transform", "chart", "narrative", "skill", "template"]
 
 
 @app.get("/", response_class=HTMLResponse)

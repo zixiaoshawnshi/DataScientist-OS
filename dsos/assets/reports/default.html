@@ -1,0 +1,33 @@
+<!doctype html>
+<!-- The original DSOS publish look, kept as the "default" template.
+     Tokens (see dsos/templating.py): title, body, published_at,
+     session_question. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{title}}</title>
+<style>
+  body {
+    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    max-width: 860px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a;
+  }
+  .dsos-embed {
+    border: 1px solid #eee; border-radius: 8px; padding: 1rem;
+    margin: 1.5rem 0; background: #fafafa;
+  }
+  .dsos-embed h4 {
+    margin: 0 0 0.75rem; color: #555; font-size: 0.8rem;
+    text-transform: uppercase; letter-spacing: 0.03em;
+  }
+  table.dsos-table { border-collapse: collapse; width: 100%; }
+  table.dsos-table th, table.dsos-table td {
+    padding: 0.4rem 0.6rem; border-bottom: 1px solid #ddd; text-align: left;
+  }
+  img { max-width: 100%; border-radius: 6px; }
+  pre { background: #0f172a; color: #e2e8f0; padding: 1rem; border-radius: 8px; overflow-x: auto; }
+</style>
+</head>
+<body>
+{{body}}
+</body>
+</html>

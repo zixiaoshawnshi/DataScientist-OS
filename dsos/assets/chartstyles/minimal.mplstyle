@@ -1,0 +1,13 @@
+# Bare essentials on a light canvas — the closest built-in to raw
+# matplotlib: no grid, thin spines, default sizes. The escape hatch when
+# the dark house style fights the data (dense series, heatmaps) or a
+# caller wants plain output.
+
+axes.grid        : False
+axes.linewidth   : 0.6
+axes.edgecolor   : "#777777"
+axes.titlesize   : 12
+axes.titleweight : normal
+font.size        : 10
+legend.frameon   : False
+lines.linewidth  : 1.5

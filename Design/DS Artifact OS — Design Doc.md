@@ -113,6 +113,55 @@ id, session_id, ts, tool_name, args_json, result_summary, artifact_row_ids
 
 ---
 
+# Part 1.5 — Skills & Templates (the consistency layer)
+
+Built while Part 3 was in flight (skills and templates were Part 2 backlog
+items; the store/execution core was stable enough to pull them forward).
+One design move covers both: **consistency through versioned artifacts, not
+code** — the existing envelope (type, versioning, search, lineage, tool-call
+log) is the whole mechanism. No new tables; one new artifact type.
+
+## Skills
+
+Six seeded `skill` artifacts (stable `artifact_id`s) at store-init:
+dataset discovery (the original bootstrap skill), exploratory analysis,
+charting, statistics, modeling, reporting. **Scope decision: workflow, not
+behavior** — skills teach how to drive the tools so work stays addressable,
+reusable, and styled; prescriptive methodology (which test when, which chart
+for which data) is deliberately NOT encoded yet. Tools: `list_skills`,
+`save_skill` (create / re-version with the same artifact_id — an edit is a
+new version; seeding is idempotent by existence so a customized skill
+survives restarts and re-inits — that's the one seeding rule that can
+silently destroy user work if gotten wrong). Authoring is agent-only for
+now; the GUI stays read-only.
+
+## Templates
+
+`type="template"`, kind in tags: **chart styles** (`.mplstyle` rcParams text,
+run_python's `style=`) and **report layouts** (HTML with literal
+`{{title}} / {{body}} / {{published_at}} / {{session_question}}` tokens,
+publish_report's `template=`). Built-ins are package files
+(`dsos/assets/`), not artifacts — defaults must exist before any store row
+does, and built-in names are reserved so a custom id can't shadow them.
+Customs are created/versioned via `save_template(kind=..., base=...)`:
+`base` copies an existing template (customize, don't rewrite; base kept in
+`source`), validated at save time — rc text must parse under matplotlib's
+own parser AND yield at least one param (mpl warns-and-skips colon-less
+lines, so prose would otherwise "pass"); a report template must declare
+`{{body}}`. Referenced by row_id or stable artifact_id. `list_templates`
+shows both kinds.
+
+**Decisions:** dark-mode house style is the default for both charts
+("dsos" style) and reports ("report" layout), so charts embed natively in
+reports; `style=None` still resets rcParams — every run starts from a known
+state (no leakage across runs in the long-lived server process; the uv
+sandbox path gets the same styling via a wrapper block). Substitution is
+plain replacement, never format()/Jinja — the body's own `{{artifact:...}}
+embeds and literal tokens in narrative text must survive — and `{{body}}`
+substitutes last so the body is never re-scanned. Tested in
+`tests/skills_templates_smoke_test.py` (the re-seed-survives-edit and
+no-style-leak cases are the two that a naive implementation breaks).
+
 # Part 2 — Backlog (not now)
 
 Only if Part 1 is solid.
@@ -121,7 +170,9 @@ Only if Part 1 is solid.
 - Model artifacts beyond metrics (fitted models, versioned)
 - Staleness flagging + `heal_artifact` (re-run against updated parents)
 - Session context store (`get_session_context`, `update_session_context`)
-- Multiple/curated skills (beyond the one seeded discovery skill), skill editing based on what worked
+- Prescriptive methodology in skills (which test when, which chart for which
+  data — deliberately out of Part 1.5's scope); GUI authoring for
+  skills/templates
 - Markdown publish with sibling image files
 - Interactive GUI (htmx, drag-to-reorder, live re-render)
 - Content-hash deduplication

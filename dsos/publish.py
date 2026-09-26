@@ -12,44 +12,20 @@ import base64
 import html
 import re
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 import markdown as md_lib
 import pandas as pd
 
-from dsos.store import _EMBED_RE, Artifact, get_artifact_by_row_id
+from dsos import templating
+from dsos.store import _EMBED_RE, Artifact, get_artifact_by_row_id, get_session
 
-_PAGE_TEMPLATE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>{title}</title>
-<style>
-  body {{
-    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
-    max-width: 860px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a;
-  }}
-  .dsos-embed {{
-    border: 1px solid #eee; border-radius: 8px; padding: 1rem;
-    margin: 1.5rem 0; background: #fafafa;
-  }}
-  .dsos-embed h4 {{
-    margin: 0 0 0.75rem; color: #555; font-size: 0.8rem;
-    text-transform: uppercase; letter-spacing: 0.03em;
-  }}
-  table.dsos-table {{ border-collapse: collapse; width: 100%; }}
-  table.dsos-table th, table.dsos-table td {{
-    padding: 0.4rem 0.6rem; border-bottom: 1px solid #ddd; text-align: left;
-  }}
-  img {{ max-width: 100%; border-radius: 6px; }}
-  pre {{ background: #0f172a; color: #e2e8f0; padding: 1rem; border-radius: 8px; overflow-x: auto; }}
-</style>
-</head>
-<body>
-{body}
-</body>
-</html>
-"""
+# The page layout now comes from templating (dsos/assets/reports/*.html):
+# built-in names map to package assets, custom report templates are
+# `template` artifacts resolved by row_id/artifact_id. "default" there is
+# this module's original inline template, kept as a file — byte-for-byte
+# the look this module used to hardcode.
 
 
 def _render_embed(conn: sqlite3.Connection, row_id: str) -> tuple[str, Artifact | None]:
@@ -119,11 +95,18 @@ def preview_report(conn: sqlite3.Connection, row_id: str) -> dict:
 
 def publish_report(
     conn: sqlite3.Connection, row_id: str, *, output_dir: str = "data/reports",
+    template: str = "report",
 ) -> dict:
     """Render a narrative artifact and every artifact it embeds into one
     self-contained .html file (images inlined as base64 data URIs — no
     sibling image files, per the Part 1 scope cut). Returns
     {"path": ..., "embeds": [...], "artifact_row_ids": [...]}.
+
+    `template`: the HTML layout (the consistency layer — dsos/templating.py).
+    Built-ins: "report" (the dark house layout — the default), "default"
+    (the original plain light look), "minimal" (bare HTML); or a custom
+    report-template artifact's row_id/artifact_id. Resolved before
+    rendering, so a bad reference fails before any file is written.
 
     `embeds` (feedback #3) lists what actually got pulled into this report
     — row_id/type/title for each {{artifact:...}} reference, and whether it
@@ -136,6 +119,7 @@ def publish_report(
     """
     art = _get_narrative(conn, row_id)
     embeds = _resolve_embeds(conn, art.content)
+    template_text = templating.resolve_report_template(conn, template)
 
     def _substitute(m: re.Match) -> str:
         fragment, _resolved = _render_embed(conn, m.group(1))
@@ -149,12 +133,24 @@ def publish_report(
     body_html = md_lib.markdown(art.content, extensions=["tables", "fenced_code"])
     body_html = _EMBED_RE.sub(_substitute, body_html)
 
+    # Layout is the template's job; tokens are substituted literally (never
+    # format()/Jinja — the body's own {{artifact:...}} embeds and any literal
+    # "{{title}}" in the narrative must survive substitution; see
+    # templating.render_report, which puts {{body}} in LAST for exactly that).
+    # title/question are HTML-escaped here; body is already rendered HTML.
+    session = get_session(conn, art.session_id)
+    page = templating.render_report(
+        template_text,
+        title=html.escape(art.title),
+        body=body_html,
+        published_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        session_question=html.escape(session["question"]) if session else "",
+    )
+
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{art.artifact_id}-v{art.version}.html"
-    out_path.write_text(
-        _PAGE_TEMPLATE.format(title=html.escape(art.title), body=body_html), encoding="utf-8"
-    )
+    out_path.write_text(page, encoding="utf-8")
 
     touched = [row_id, *(e["row_id"] for e in embeds if e["resolved"])]
     return {"path": str(out_path), "embeds": embeds, "artifact_row_ids": touched}
