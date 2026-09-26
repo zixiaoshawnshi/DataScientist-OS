@@ -396,13 +396,23 @@
     sel.addRange(range);
   }
 
-  // --- paginated navigation: one wheel notch / key press / swipe = exactly one panel, instantly ---
+  // --- paginated navigation: one wheel notch / key press / swipe = exactly one panel ---
+  //
+  // Previous version guessed how long the browser's smooth-scroll animation
+  // would take (a fixed timeout) and unlocked input on that guess. When the
+  // guess was even slightly off, a stray input mid-animation could retarget
+  // the scroll before it finished, landing between two panels instead of on
+  // one — which read as "the text isn't centered." This version instead
+  // waits for the browser's own `scrollend` event (the actual signal that
+  // scrolling has settled, not an estimate of it) and then force-corrects
+  // the scroll position to the exact top of the nearest panel — so no
+  // matter what caused the scroll, it always finishes precisely aligned.
   (function () {
+    var scroller = document.body;
     var panels = Array.prototype.slice.call(document.querySelectorAll('.panel'));
     var dotButtons = Array.prototype.slice.call(document.querySelectorAll('.dots button'));
     var current = 0;
-    var locked = false;
-    var LOCK_MS = 700;
+    var busy = false;
 
     function updateDots() {
       var id = panels[current].id;
@@ -419,15 +429,45 @@
       inner.classList.add('is-in');
     }
 
+    function nearestIndex() {
+      var vh = scroller.clientHeight || 1;
+      return Math.max(0, Math.min(panels.length - 1, Math.round(scroller.scrollTop / vh)));
+    }
+
+    function settle(behavior) {
+      current = nearestIndex();
+      var vh = scroller.clientHeight;
+      // only force a correction if we're not already essentially on it —
+      // avoids re-triggering scrollend in a loop.
+      if (Math.abs(scroller.scrollTop - current * vh) > 1) {
+        panels[current].scrollIntoView({ behavior: behavior || 'auto', block: 'start' });
+      }
+      updateDots();
+    }
+
     function goTo(index) {
       index = Math.max(0, Math.min(panels.length - 1, index));
       if (index === current) return;
       current = index;
-      locked = true;
+      busy = true;
       panels[current].scrollIntoView({ behavior: 'smooth', block: 'start' });
       updateDots();
       replayContent(panels[current]);
-      setTimeout(function () { locked = false; }, LOCK_MS);
+    }
+
+    var settleTimer = null;
+    function onScrollSettled() {
+      busy = false;
+      settle('auto');
+    }
+    if ('onscrollend' in window) {
+      scroller.addEventListener('scrollend', onScrollSettled);
+    } else {
+      // fallback for browsers without scrollend: debounce plain scroll events
+      scroller.addEventListener('scroll', function () {
+        clearTimeout(settleTimer);
+        settleTimer = setTimeout(onScrollSettled, 120);
+      }, { passive: true });
     }
 
     window.addEventListener('wheel', function (e) {
@@ -435,17 +475,17 @@
       // trackpads emit a near-zero deltaY as a gesture ramps up; treating
       // that as a real tick misfires goTo() the wrong way on the very
       // first scroll of a gesture (looked like "nothing happened").
-      if (locked || Math.abs(e.deltaY) < 4) return;
+      if (busy || Math.abs(e.deltaY) < 4) return;
       goTo(current + (e.deltaY > 0 ? 1 : -1));
     }, { passive: false });
 
     window.addEventListener('keydown', function (e) {
       if (e.key === 'ArrowDown' || e.key === 'PageDown' || e.key === ' ') {
         e.preventDefault();
-        if (!locked) goTo(current + 1);
+        if (!busy) goTo(current + 1);
       } else if (e.key === 'ArrowUp' || e.key === 'PageUp') {
         e.preventDefault();
-        if (!locked) goTo(current - 1);
+        if (!busy) goTo(current - 1);
       }
     });
 
@@ -457,7 +497,7 @@
       e.preventDefault();
     }, { passive: false });
     window.addEventListener('touchend', function (e) {
-      if (touchStartY === null || locked) return;
+      if (touchStartY === null || busy) return;
       var dy = touchStartY - e.changedTouches[0].clientY;
       touchStartY = null;
       if (Math.abs(dy) > 40) goTo(current + (dy > 0 ? 1 : -1));
