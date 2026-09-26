@@ -43,35 +43,41 @@
   }
   .panel-inner { max-width: 36rem; width: 100%; margin: 0 auto; }
 
-  /* --- hero (full-bleed, forced dark regardless of page theme) --- */
-  .hero {
+  /* --- any slide with a video backdrop: full-bleed, forced dark regardless
+     of page theme, so text stays legible over arbitrary footage --- */
+  .video-bg {
     position: relative; overflow: hidden; background: #0b0d0f;
     align-items: stretch; padding: 0;
   }
-  .hero-media {
+  .video-bg .bg-media {
     position: absolute; inset: 0; width: 100%; height: 100%;
     object-fit: cover; opacity: 0.55;
   }
-  .hero-scrim {
+  .video-bg .bg-scrim {
     position: absolute; inset: 0;
     background: linear-gradient(180deg, rgba(11,13,15,0.30) 0%, rgba(11,13,15,0.88) 100%);
   }
-  .hero .panel-inner {
+  .video-bg .panel-inner {
     position: relative; z-index: 1;
     padding: 0 1.25rem;
   }
-  .hero-content .eyebrow { color: #9a9d95; }
-  .hero-content .eyebrow::before { color: #6fcbb2; }
-  .hero-content h1 { color: #f5f4f0; }
-  .hero-content p.pitch { color: #c7c9c2; }
-  .hero-content p.pitch em { color: #f5f4f0; }
-  .hero-content .watch-link {
+  .video-bg .eyebrow { color: #9a9d95; }
+  .video-bg .eyebrow::before { color: #6fcbb2; }
+  .video-bg h1 { color: #f5f4f0; }
+  .video-bg p.pitch { color: #c7c9c2; }
+  .video-bg p.pitch em { color: #f5f4f0; }
+  .video-bg .watch-link {
     display: inline-block; font-size: 0.8rem; color: #9a9d95;
     text-decoration: underline; text-decoration-color: #3a3d38; text-underline-offset: 3px;
   }
-  .hero-content .watch-link:hover, .hero-content .watch-link:focus-visible {
+  .video-bg .watch-link:hover, .video-bg .watch-link:focus-visible {
     color: #6fcbb2; text-decoration-color: #6fcbb2;
   }
+  .video-bg .block-head .label { color: #9a9d95; }
+  .video-bg .block-head .label::before { color: #6fcbb2; }
+  .video-bg ul.features li { color: #c7c9c2; }
+  .video-bg ul.features strong { color: #f5f4f0; }
+  .video-bg ul.features li::before { color: #6fcbb2; }
 
   /* --- phase-in intro on the hero's own text, on page load --- */
   @keyframes phase-in {
@@ -211,11 +217,11 @@
 <div class="swiper" id="site-swiper">
   <div class="swiper-wrapper">
 
-    <section class="swiper-slide panel hero" id="panel-hero">
-      <video class="hero-media" autoplay muted loop playsinline preload="auto" onerror="this.style.display='none'">
+    <section class="swiper-slide panel hero video-bg" id="panel-hero">
+      <video class="bg-media" autoplay muted loop playsinline preload="auto" onerror="this.style.display='none'">
         <source src="media/demo.mp4" type="video/mp4">
       </video>
-      <div class="hero-scrim"></div>
+      <div class="bg-scrim"></div>
       <div class="panel-inner hero-content">
         <p class="eyebrow">for data scientists &amp; analysts</p>
         <h1>dsos</h1>
@@ -229,7 +235,11 @@
       </div>
     </section>
 
-    <section class="swiper-slide panel" id="panel-features">
+    <section class="swiper-slide panel video-bg" id="panel-features">
+      <video class="bg-media" autoplay muted loop playsinline preload="auto" onerror="this.style.display='none'">
+        <source src="media/demo-gui.mp4" type="video/mp4">
+      </video>
+      <div class="bg-scrim"></div>
       <div class="panel-inner">
         <div class="block-head"><span class="label">what it gives you</span></div>
         <ul class="features">
