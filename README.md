@@ -1,0 +1,104 @@
+# DS Artifact OS
+
+An MCP server that makes queries, transforms, datasets, charts, and narratives
+first-class, versioned, searchable artifacts — the working layer underneath
+an agent's analysis, not a notebook or a dashboard. See
+`Design/DS Artifact OS — Design Doc.md` for the full pitch, philosophy, data
+model, and demo plan.
+
+No release is cut — this runs from a local venv against the source tree.
+
+## Status
+
+- **Layer 1 (core library)** — `dsos/db.py`, `dsos/store.py`, `dsos/execution.py`, `dsos/embeddings.py`, `dsos/seed.py`. Built, tested.
+- **Layer 2 (MCP server)** — `dsos/mcp_server.py`. Built, tested, wired into Claude Code and Pi.
+- **Narrative/publish, GUI** — not built yet.
+
+## Quickstart
+
+```sh
+python -m venv .venv
+.venv/Scripts/pip install -e .
+
+# layer 1: exercises store + execution via direct function calls
+.venv/Scripts/python tests/smoke_test.py
+
+# layer 2: exercises the MCP server over the real wire protocol
+.venv/Scripts/python tests/mcp_smoke_test.py
+```
+
+`-e .` is an editable install — no PyPI package, `dsos` just resolves via the
+venv's own site-packages back to this source tree. That's also what lets the
+MCP server run correctly from *any* directory (see below), without needing a
+`PYTHONPATH`.
+
+## Running the server standalone
+
+```sh
+.venv/Scripts/python -m dsos.mcp_server
+```
+
+Set `DSOS_DB_PATH` to an absolute path if you're launching this from outside
+the repo (e.g. a coding agent open in an unrelated project) — otherwise it
+defaults to `data/store.db` relative to wherever the process happens to be
+launched, which silently scatters a fresh empty store into whatever directory
+that is.
+
+## Wiring into a coding agent
+
+Both agents below use the identical command, so registering once makes it
+available from any repo the agent opens — no per-project setup.
+
+**Claude Code** (registered globally, one time):
+
+```sh
+claude mcp add dsos -s user \
+  -e DSOS_DB_PATH="<repo>/data/store.db" \
+  -- "<repo>/.venv/Scripts/python.exe" -m dsos.mcp_server
+```
+
+**Pi coding agent** (needs `pi install npm:pi-mcp-adapter` first; it reads the
+standard tool-agnostic global config directly). Write `~/.config/mcp/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "dsos": {
+      "command": "<repo>/.venv/Scripts/python.exe",
+      "args": ["-m", "dsos.mcp_server"],
+      "env": { "DSOS_DB_PATH": "<repo>/data/store.db" }
+    }
+  }
+}
+```
+
+Both configs point at the same store, shared globally across every repo you
+open the agent in — matching the design doc's "working layer" framing (your
+own working memory, not something scoped per codebase). Point `DSOS_DB_PATH`
+at a different file if you want a repo-scoped store instead.
+
+Before a real demo: point `DSOS_DB_PATH` at a fresh file, or delete the
+existing one — otherwise dev/test traffic is already sitting in the store the
+"round 1 starts from empty" demo beat depends on.
+
+## Project layout
+
+```
+dsos/
+  db.py          schema + connection helper (SQLite)
+  embeddings.py  semantic search — real model optional, dependency-free
+                 hashing fallback by default
+  store.py       artifact save/get/search, lineage, sessions, tool-call
+                 log, reuse detection
+  execution.py   run_sql (DuckDB) / run_python — auto-records each run and
+                 auto-links its output into lineage
+  seed.py        bootstrap discovery-skill artifact
+  mcp_server.py  FastMCP wrapper exposing the tools + a middleware that
+                 auto-logs every tool call
+tests/
+  smoke_test.py      layer 1 — direct function calls, no protocol
+  mcp_smoke_test.py  layer 2 — real MCP wire protocol via FastMCP's Client
+Design/
+  DS Artifact OS — Design Doc.md   philosophy, data model, MCP tool list,
+                                    demo plan
+```
