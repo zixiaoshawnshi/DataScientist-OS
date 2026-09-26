@@ -143,7 +143,50 @@ async def main() -> None:
         assert r.data["status"] == "ok", r.data
         print("[ok] round 2 reused round 1's dataset via run_sql")
 
-        # --- round 3: agent-facing diagnostics (feedback #4, #5, #10) ---
+        # --- round 3: scratch mode + ImportError hint (feedback #7, #8) ---
+        r = await client.call_tool("run_sql", {
+            "code": "SELECT COUNT(*) AS n FROM high_scorers",
+            "session_id": s2, "title": "Scratch count",
+            "description": "Scratch run — must NOT become an artifact.",
+            "input_row_ids": [query_row], "scratch": True,
+        })
+        assert r.data["status"] == "ok", r.data
+        assert r.data.get("scratch") is True, r.data
+        assert r.data["row_count"] == 1, r.data
+        print("[ok] run_sql scratch=True -> inline result, scratch flag set (feedback #8)")
+
+        # Also proves the analysis stack (PR #1) is importable end-to-end
+        # through the running server.
+        r = await client.call_tool("run_python", {
+            "code": "import sklearn; result = sklearn.__version__",
+            "session_id": s2, "title": "Scratch sklearn version",
+            "description": "Scratch run — also proves the analysis stack is importable.",
+            "input_row_ids": [], "scratch": True,
+        })
+        assert r.data["status"] == "ok", r.data
+        import re as _re
+        assert _re.match(r"\d+\.", str(r.data["content"])), r.data
+        print("[ok] run_python scratch imports sklearn — analysis stack live end-to-end")
+
+        # ImportError lists what IS available instead of a bare crash (feedback #7)
+        r = await client.call_tool("run_python", {
+            "code": "import definitely_not_a_real_package_xyz",
+            "session_id": s2, "title": "Scratch bad import",
+            "description": "Scratch run exercising the ImportError hint.",
+            "input_row_ids": [], "scratch": True,
+        })
+        assert r.data["status"] == "error", r.data
+        assert "available" in r.data["error"].lower(), r.data
+        assert "pandas" in r.data["error"].lower(), "hint should list the sandbox's packages"
+        print("[ok] ImportError surfaces an available-packages hint (feedback #7)")
+
+        r = await client.call_tool("search_artifacts", {"query": "Scratch", "session_id": s2})
+        assert not any(h["title"].startswith("Scratch") for h in r.data["results"]), (
+            "scratch runs must not be searchable"
+        )
+        print("[ok] scratch runs are invisible to search_artifacts (feedback #8)")
+
+        # --- round 4: agent-facing diagnostics (feedback #4, #5, #10) ---
         r = await client.call_tool("run_python", {
             "code": "print('computing averages'); "
                     "result = toy_scores.groupby('team')['score'].mean().reset_index()",

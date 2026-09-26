@@ -44,6 +44,35 @@ def _missing_blob_message(art: store.Artifact) -> str:
     )
 
 
+def result_payload(result) -> dict:
+    """Row/column/preview (or content) fields for any result value — the
+    single rendering path shared by saved-artifact payloads and scratch-run
+    responses, so they can't drift apart."""
+    if isinstance(result, pd.DataFrame):
+        records = result.head(10).to_dict(orient="records")
+        return {
+            "row_count": len(result),
+            "columns": list(result.columns),
+            "preview": [{k: _clip_cell(v) for k, v in row.items()} for row in records],
+        }
+    if isinstance(result, bytes):
+        return {"content": f"<binary, {len(result)} bytes>"}
+    text = (
+        result if isinstance(result, str) else json.dumps(result, default=str)
+    )
+    if len(text) > _INLINE_TEXT_LIMIT:
+        return {
+            "content": text[:_INLINE_TEXT_LIMIT],
+            "content_truncated": (
+                f"Inline content clipped to the first {_INLINE_TEXT_LIMIT} of "
+                f"{len(text)} characters. The full content is intact in storage "
+                "— run_sql/run_python against this artifact to work with it, "
+                "or select fewer rows/columns next time."
+            ),
+        }
+    return {"content": result}
+
+
 def artifact_payload(conn: sqlite3.Connection, art: store.Artifact) -> dict:
     base = {
         "row_id": art.row_id,
@@ -65,28 +94,6 @@ def artifact_payload(conn: sqlite3.Connection, art: store.Artifact) -> dict:
         # Named, actionable message (feedback #4): which artifact, which
         # row, what's wrong, and what to do about it — not a bare path.
         base["content_error"] = _missing_blob_message(art)
-    elif isinstance(art.content, pd.DataFrame):
-        base["row_count"] = len(art.content)
-        base["columns"] = list(art.content.columns)
-        records = art.content.head(10).to_dict(orient="records")
-        base["preview"] = [
-            {k: _clip_cell(v) for k, v in row.items()} for row in records
-        ]
-    elif isinstance(art.content, bytes):
-        base["content"] = f"<binary, {len(art.content)} bytes>"
     else:
-        text = (
-            art.content if isinstance(art.content, str)
-            else json.dumps(art.content, default=str)
-        )
-        if len(text) > _INLINE_TEXT_LIMIT:
-            base["content"] = text[:_INLINE_TEXT_LIMIT]
-            base["content_truncated"] = (
-                f"Inline content clipped to the first {_INLINE_TEXT_LIMIT} of "
-                f"{len(text)} characters. The full content is intact in storage "
-                f"— run_sql/run_python against row_id {art.row_id} (or select "
-                "fewer rows/columns next time) to work with it."
-            )
-        else:
-            base["content"] = art.content
+        base.update(result_payload(art.content))
     return base

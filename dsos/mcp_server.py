@@ -248,7 +248,8 @@ def _execution_result_payload(row_id: str, input_row_ids: list[str]) -> dict:
 
 @mcp.tool()
 def run_sql(
-    code: str, session_id: str, title: str, description: str, input_row_ids: list[str]
+    code: str, session_id: str, title: str, description: str, input_row_ids: list[str],
+    scratch: bool = False,
 ) -> dict:
     """Run SQL (DuckDB) against one or more artifacts. Each input row_id is
     available as a table named after that artifact's title (lowercased,
@@ -258,6 +259,12 @@ def run_sql(
     to every input and recorded — no separate save_artifact call needed.
     On failure, status="error" and `error`/`stdout`/`stderr` below show why.
 
+    scratch=True: run and return the result inline but persist nothing —
+    no artifact, no lineage, not searchable. For quick checks (row counts,
+    schema pokes) where an artifact would be noise. The run still appears
+    in the session's tool-call trace. Do NOT use scratch for anything you
+    or a later session might want to build on — then it never happened.
+
     Example:
       run_sql(
         code="SELECT team, score FROM toy_scores WHERE score > 10",
@@ -266,17 +273,17 @@ def run_sql(
         input_row_ids=["<row_id of the toy_scores dataset artifact>"],
       )
     """
-    row_id = execution.run_sql(
+    result = execution.run_sql(
         conn, code=code, session_id=session_id, title=title, description=description,
-        input_row_ids=input_row_ids,
+        input_row_ids=input_row_ids, scratch=scratch,
     )
-    return _execution_result_payload(row_id, input_row_ids)
+    return result if scratch else _execution_result_payload(result, input_row_ids)
 
 
 @mcp.tool()
 def run_python(
     code: str, session_id: str, title: str, description: str, input_row_ids: list[str],
-    output_type: str = "transform",
+    output_type: str = "transform", scratch: bool = False,
 ) -> dict:
     """Run Python against one or more artifacts. Each input row_id is bound
     to a variable named after that artifact's title; `pd` (pandas) is
@@ -288,6 +295,12 @@ def run_python(
     recorded automatically. On failure, status="error" and `error`/`stdout`/
     `stderr` below show the traceback and anything printed before it failed.
 
+    scratch=True: run and return the result inline but persist nothing —
+    no artifact, no lineage, not searchable. For rapid iteration (check a
+    correlation, test an idea, debug a plot) where an artifact would be
+    noise; flip to scratch=False once the idea works. The run still appears
+    in the session's tool-call trace.
+
     Example:
       run_python(
         code="result = toy_scores.groupby('team')['score'].mean().reset_index()",
@@ -296,11 +309,11 @@ def run_python(
         input_row_ids=["<row_id of the toy_scores dataset artifact>"],
       )
     """
-    row_id = execution.run_python(
+    result = execution.run_python(
         conn, code=code, session_id=session_id, title=title, description=description,
-        input_row_ids=input_row_ids, output_type=output_type,
+        input_row_ids=input_row_ids, output_type=output_type, scratch=scratch,
     )
-    return _execution_result_payload(row_id, input_row_ids)
+    return result if scratch else _execution_result_payload(result, input_row_ids)
 
 
 @mcp.tool()
