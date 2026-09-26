@@ -33,6 +33,12 @@ python -m venv .venv
 
 # layer 3: exercises the GUI's routes via FastAPI's TestClient
 .venv/Scripts/python tests/gui_smoke_test.py
+
+# skill library + templates (consistency layer) over the real wire protocol
+.venv/Scripts/python tests/skills_templates_smoke_test.py
+
+# update-check: mocks the network call, doesn't hit the real GitHub API
+.venv/Scripts/python tests/update_check_smoke_test.py
 ```
 
 See `examples/README.md` for question pairs to try against a real agent
@@ -56,6 +62,24 @@ This is a real (non-editable) build, not the editable install above —
 verified against a throwaway venv as part of cutting each release, since an
 editable install hides packaging bugs (a missing file in `package-data`,
 for instance) that only surface on a real build.
+
+If you installed this way, the server checks GitHub's Releases API on
+startup (best-effort, cached for 6 hours, never blocks or fails startup)
+and prepends a short update notice to its MCP `instructions` if a newer
+tagged release exists (`dsos/update_check.py`). It's skipped entirely for
+an editable dev install (`pip install -e .`) — main is routinely ahead of
+the last tagged release, so that comparison would be backwards for anyone
+tracking main directly.
+
+### Cutting a release
+
+1. Bump `version` in `pyproject.toml` to match the new tag — the update
+   check above compares against this value, so a forgotten bump makes every
+   future release invisible to it.
+2. Verify with a real (non-editable) install into a throwaway venv (not the
+   dev one), same as above.
+3. `git tag -a vX.Y.Z -m "..."`, `git push origin vX.Y.Z`.
+4. `gh release create vX.Y.Z --notes-file ...` (or the GitHub web UI).
 
 ## Running the server standalone
 
@@ -198,6 +222,9 @@ dsos/
   gui.py         read-only FastAPI+Jinja2+htmx browser over the store —
                  a separate process, not an MCP tool
   templates/     Jinja2 templates for the GUI
+  update_check.py  best-effort "a newer release exists" notice for people
+                 on an installed release, prepended to the MCP instructions;
+                 a no-op for editable dev installs (see Cutting a release)
 tests/
   smoke_test.py         layer 1 — direct function calls, no protocol
   mcp_smoke_test.py     layer 2 — real MCP wire protocol via FastMCP's Client
@@ -205,6 +232,8 @@ tests/
   skills_templates_smoke_test.py
                         layer 2c — skill library + templates over the wire
   gui_smoke_test.py     layer 3 — GUI routes via FastAPI's TestClient
+  update_check_smoke_test.py
+                        update_check.py, with the network call mocked
 Design/
   DS Artifact OS — Design Doc.md   philosophy, data model, MCP tool list,
                                     demo plan
