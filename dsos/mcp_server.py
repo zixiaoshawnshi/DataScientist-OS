@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -23,6 +24,12 @@ from dsos.db import connect
 
 DB_PATH = os.environ.get("DSOS_DB_PATH", "data/store.db")
 conn = connect(DB_PATH)
+
+# The interpreter run_python targets when a call omits python_path — the
+# user's own analysis Python (pandas/matplotlib/... already installed
+# there), not this server's. Unset -> this server's own interpreter, so an
+# existing/test install with no DSOS_PYTHON_PATH keeps working unchanged.
+DEFAULT_PYTHON_PATH = os.environ.get("DSOS_PYTHON_PATH", sys.executable)
 
 # Surfaced to the client at connect time via the MCP `initialize` response
 # (protocol-level InitializeResult.instructions, not a tool docstring) — this
@@ -402,7 +409,7 @@ def run_python(
     code: str, session_id: str, title: str, description: str, input_row_ids: list[str],
     output_type: str = "transform", scratch: bool = False,
     requirements: list[str] | None = None, code_paths: list[str] | None = None,
-    style: str | None = "dsos",
+    style: str | None = "dsos", python_path: str | None = None,
 ) -> dict:
     """Run Python against one or more artifacts. Each input row_id is bound
     to a variable named after that artifact's title (see `input_tables` in
@@ -429,11 +436,13 @@ def run_python(
     promote_scratch(scratch_id=...) without re-running the code, once the
     idea works and it's worth keeping.
 
-    requirements=["scikit-learn>=1.3", ...]: extra packages for THIS run
-    only — uv resolves them into a throwaway environment, runs the code
-    there, and discards it; this server's environment is never modified.
-    Anything uv accepts works: PyPI specs, local package paths, wheels,
-    git URLs (path-style entries need a filesystem shared with this
+    Your code runs against python_path (below) — usually your own analysis
+    Python, so whatever's already installed there just works. requirements=
+    ["scikit-learn>=1.3", ...] fills gaps in that interpreter for THIS run
+    only: uv resolves them into a throwaway environment layered on top of
+    it, runs the code there, and discards it; python_path itself is never
+    modified. Anything uv accepts works: PyPI specs, local package paths,
+    wheels, git URLs (path-style entries need a filesystem shared with this
     server). First run pays the download, repeat runs ~1s (globally
     cached). Slower than the default path — only pass requirements when
     you actually need them.
@@ -450,6 +459,11 @@ def run_python(
     exists with list_templates(kind="chart-style"); make your own with
     save_template.
 
+    python_path: overrides the server default for THIS call only — e.g.
+    point it at a specific repo's .venv interpreter to run against that
+    project's exact dependencies, instead of whatever DSOS_PYTHON_PATH (or
+    this server's own interpreter, if that's unset) has installed.
+
     Example:
       run_python(
         code="result = toy_scores.groupby('team')['score'].mean().reset_index()",
@@ -462,6 +476,7 @@ def run_python(
         conn, code=code, session_id=session_id, title=title, description=description,
         input_row_ids=input_row_ids, output_type=output_type, scratch=scratch,
         requirements=requirements, code_paths=code_paths, style=style,
+        python_path=python_path or DEFAULT_PYTHON_PATH,
     )
     return result if scratch else _execution_result_payload(result, input_row_ids)
 
@@ -597,7 +612,7 @@ def save_template(
                 "content is required — pass content, or base to copy an existing template"
             )
         if kind == templating.CHART_STYLE_KIND:
-            templating.validate_chart_style_text(content)
+            templating.validate_chart_style_text(content, DEFAULT_PYTHON_PATH)
         else:
             templating.validate_report_template_text(content)
 

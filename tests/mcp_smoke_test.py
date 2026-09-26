@@ -184,7 +184,10 @@ async def main() -> None:
         assert _re.match(r"\d+\.", str(r.data["content"])), r.data
         print("[ok] run_python scratch imports sklearn — analysis stack live end-to-end")
 
-        # ImportError lists what IS available instead of a bare crash (feedback #7)
+        # A missing-module failure points at requirements= instead of a bare
+        # crash (feedback #7) — the target interpreter is arbitrary/external
+        # now, so the hint no longer lists what IS installed there, just the
+        # escape hatch for getting more.
         r = await client.call_tool("run_python", {
             "code": "import definitely_not_a_real_package_xyz",
             "session_id": s2, "title": "Scratch bad import",
@@ -192,9 +195,8 @@ async def main() -> None:
             "input_row_ids": [], "scratch": True,
         })
         assert r.data["status"] == "error", r.data
-        assert "available" in r.data["error"].lower(), r.data
-        assert "pandas" in r.data["error"].lower(), "hint should list the sandbox's packages"
-        print("[ok] ImportError surfaces an available-packages hint (feedback #7)")
+        assert "requirements=" in r.data["error"], r.data
+        print("[ok] ImportError surfaces a requirements= hint (feedback #7)")
 
         r = await client.call_tool("search_artifacts", {"query": "Scratch", "session_id": s2})
         assert not any(h["title"].startswith("Scratch") for h in r.data["results"]), (
@@ -217,7 +219,10 @@ async def main() -> None:
                 "code_paths": [str(helper_dir)],
             })
             assert r.data["status"] == "ok", r.data
-            assert r.data["content"] == 42, r.data
+            # the subprocess wrapper only round-trips DataFrame/bytes/dict/
+            # list/str natively; anything else (like a bare int) comes back
+            # as its str() via result.txt — same as any other sandbox run.
+            assert r.data["content"] == "42", r.data
             # and the injected path must not leak into the server process
             import sys as _sys
             assert str(helper_dir) not in _sys.path, "code_paths must not leak into sys.path"

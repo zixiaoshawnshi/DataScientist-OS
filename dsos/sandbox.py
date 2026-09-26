@@ -1,27 +1,30 @@
-"""Subprocess sandbox for run_python `requirements` (feedback #1, Option B).
+"""Subprocess sandbox: the only place run_python code actually executes.
 
-When an agent asks for packages this sandbox doesn't have, we don't install
-into the server's own environment (that would permanently mutate shared
-state and risk breaking the server). Instead uv resolves the requirements
-into a *throwaway* environment, runs the code there, and discards it:
+The server process itself never execs agent code — every run_python call
+runs against a configured `python_path` (the user's own analysis Python by
+default, or whatever a specific call overrides it to; see mcp_server.py's
+DEFAULT_PYTHON_PATH and execution.run_python). That interpreter usually
+already has whatever the code needs; `requirements=[...]` is only for
+filling gaps in it:
 
     1. serialize input artifacts to temp files (parquet/json/bin/text)
     2. write a wrapper script that re-binds them as variables and execs the
        agent's code at module level
-    3. `uv run --quiet --no-project --python <server's interpreter>
-       --with <req>... wrapper.py` — wheels are cached globally by uv, so
-       repeat runs cost ~a second, first runs pay the download
+    3. run the wrapper — directly via `python_path` if `requirements` is
+       empty, or via `uv run --quiet --no-project --python <python_path>
+       --with <req>... wrapper.py` if not (wheels are cached globally by
+       uv, so repeat runs cost ~a second, first runs pay the download)
     4. the wrapper serializes `result` back (parquet/png/json/text) and
        touches an _ok marker; the parent loads it and hands it to the
-       normal save/record/lineage path — identical to an in-process run.
+       normal save/record/lineage path.
 
 `requirements` entries are a verbatim passthrough to uv's `--with`, so
 anything uv accepts works: PyPI specs ("scikit-learn>=1.3"), local package
 directories, wheels, git URLs. Path-style requirements need the agent and
 the server to share a filesystem — mcp_server's docstring says so.
 
-Everything here runs in the *agent's* per-call environment; the server's
-process and venv are untouched.
+Everything here runs in the *target* interpreter's environment, never the
+server's own — the server's process and venv are untouched.
 """
 
 from __future__ import annotations
@@ -73,8 +76,8 @@ except ImportError:
 #__DSOS_USER_CODE__#
 
 # --- coerce a matplotlib Figure/Axes `result` to png bytes (feedback #2) —
-# mirrors execution._coerce_chart_result, duplicated here since this code
-# runs in a separate uv-resolved process, not this one ---
+# this always runs in a separate process from the server, so the coercion
+# has to happen here rather than wherever `result` gets set ---
 _r = result
 try:
     from matplotlib.axes import Axes as _Axes
@@ -187,30 +190,63 @@ def _build_wrapper(
             .replace("#__DSOS_USER_CODE__#", code))  # user code last
 
 
+def run_interpreter(
+    python_path: str, args: list[str], *, cwd: Path | None = None,
+    timeout: int | None = None,
+) -> subprocess.CompletedProcess:
+    """Run `python_path args...`, capturing output — the plumbing shared by
+    run_subprocess's no-`requirements` path and templating's chart-style
+    validation. Both just need "run something in this interpreter, get
+    stdout/stderr back"; callers own their own error shape (a run dict here,
+    a ValueError there)."""
+    return subprocess.run(
+        [python_path, *args], capture_output=True, cwd=cwd,
+        # encoding explicit: on a GBK-locale Windows machine the default
+        # would mangle/replace the subprocess's Unicode output — same bug
+        # class as the blob-storage fix.
+        encoding="utf-8", errors="replace", timeout=timeout,
+    )
+
+
 def run_subprocess(
     *, code: str, requirements: list[str], code_paths: list[str] | None,
-    inputs: list[Artifact], chart_style: str | None = None,
+    inputs: list[Artifact], python_path: str, chart_style: str | None = None,
 ) -> dict:
-    """Run the agent's code in a uv-resolved ephemeral environment. Returns
-    the same run dict shape as the in-process path: status/error/stdout/
-    stderr/result — so execution.py's save/record/lineage tail is identical
-    either way.
+    """Run the agent's code against `python_path` — directly if
+    `requirements` is empty (the common case: that interpreter already has
+    what the code needs), or via a uv-resolved ephemeral environment built
+    on top of it if not (uv's job is filling gaps, not resolving the whole
+    stack every time). Returns status/error/stdout/stderr/result — the run
+    dict execution.py's save/record/lineage tail expects.
 
     chart_style: an already-resolved style path (see execution.run_python)
-    applied in the wrapper before the user code — same consistent styling
-    as the in-process path. (No reset needed for None here: each subprocess
-    starts from raw matplotlib defaults.)"""
-    uv = find_uv()
-    if uv is None:
+    applied in the wrapper before the user code. (No reset needed for None
+    here: each subprocess starts from raw matplotlib defaults.)"""
+    if not Path(python_path).is_absolute():
         return _error_run(
-            "uv is not installed — install it (e.g. `pip install uv`) to use "
-            f"requirements={requirements!r}. Meanwhile, run the code with your "
-            "own bash tools and register the result via save_artifact."
+            f"python_path {python_path!r} must be an absolute path — a relative "
+            "one resolves against this server's launch cwd, not the caller's"
+        )
+    if not Path(python_path).is_file():
+        return _error_run(
+            f"python_path {python_path!r} is not a file — resolve the "
+            "interpreter's own executable path (not a directory, not "
+            "bare `python`/`python3` off PATH)"
         )
 
     for p in code_paths or []:
         if not Path(p).is_dir():
             return _error_run(f"code_path {p!r} is not a directory")
+
+    uv = None
+    if requirements:
+        uv = find_uv()
+        if uv is None:
+            return _error_run(
+                "uv is not installed — install it (e.g. `pip install uv`) to use "
+                f"requirements={requirements!r}. Meanwhile, run the code with your "
+                "own bash tools and register the result via save_artifact."
+            )
 
     with tempfile.TemporaryDirectory(prefix="dsos_sandbox_") as tmp:
         workdir = Path(tmp)
@@ -223,19 +259,16 @@ def run_subprocess(
         wrapper_path = workdir / "wrapper.py"
         wrapper_path.write_text(wrapper, encoding="utf-8")
 
-        cmd = [uv, "run", "--quiet", "--no-project", "--python", sys.executable]
-        for req in requirements:
-            cmd += ["--with", req]
-        cmd.append(str(wrapper_path))
+        if uv is not None:
+            run_cmd, args = uv, ["run", "--quiet", "--no-project", "--python", python_path]
+            for req in requirements:
+                args += ["--with", req]
+            args.append(str(wrapper_path))
+        else:
+            run_cmd, args = python_path, [str(wrapper_path)]
 
         try:
-            # encoding explicit: on a GBK-locale Windows machine the default
-            # would mangle/replace the subprocess's Unicode output — same bug
-            # class as the blob-storage fix.
-            proc = subprocess.run(
-                cmd, capture_output=True, cwd=workdir,
-                encoding="utf-8", errors="replace", timeout=_timeout_s(),
-            )
+            proc = run_interpreter(run_cmd, args, cwd=workdir, timeout=_timeout_s())
         except subprocess.TimeoutExpired:
             return _error_run(
                 f"sandbox run exceeded {_timeout_s()}s (DSOS_SANDBOX_TIMEOUT) — "
@@ -257,11 +290,24 @@ def run_subprocess(
 
 def _concise_error(proc: subprocess.CompletedProcess) -> str:
     """One agent-facing line from uv/user stderr — uv's resolution failures
-    end with `error: <why>`, user tracebacks end with the exception line."""
+    end with `error: <why>`, user tracebacks end with the exception line. A
+    missing-module failure additionally gets a requirements= hint appended:
+    the target interpreter is arbitrary and external, so (unlike the old
+    in-process sandbox) there's no cheap way to also list what it already
+    has installed — just point at the escape hatch."""
     lines = [l for l in (proc.stderr or "").splitlines() if l.strip()]
     if not lines:
         return f"sandbox run failed with exit code {proc.returncode}"
-    return lines[-1].strip()
+    last = lines[-1].strip()
+    stderr = proc.stderr or ""
+    if "ModuleNotFoundError" in stderr or "ImportError" in stderr:
+        return (
+            f"{last} — pass requirements=[...] to run_python (uv resolves "
+            "missing packages into a throwaway environment on top of "
+            "python_path for this one call), or compute it with your own "
+            "tools (bash) and register the result via save_artifact."
+        )
+    return last
 
 
 def _error_run(error: str) -> dict:
