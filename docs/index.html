@@ -88,6 +88,36 @@
     font-size: 0.9rem; color: var(--ink); margin: 0; line-height: 1.6;
   }
 
+  .tab-row { margin: 0 0 0.9rem; }
+
+  table.artifact-table {
+    width: 100%; border-collapse: collapse; font-size: 0.88rem;
+  }
+  table.artifact-table[hidden] { display: none; }
+  table.artifact-table th {
+    text-align: left; font-weight: 400; color: var(--muted); vertical-align: top;
+    width: 6rem; padding: 0.3rem 1rem 0.3rem 0; white-space: nowrap;
+  }
+  table.artifact-table td {
+    padding: 0.3rem 0; line-height: 1.65;
+  }
+  table.artifact-table code { color: var(--ink); }
+
+  .media-slot {
+    position: relative; border: 1px dashed var(--line); border-radius: 10px;
+    overflow: hidden; display: flex; align-items: center; justify-content: center;
+    background: color-mix(in srgb, var(--line) 30%, transparent);
+  }
+  .media-slot .placeholder {
+    text-align: center; color: var(--muted); font-size: 0.8rem;
+    line-height: 1.7; padding: 1.5rem;
+  }
+  .media-slot .placeholder code { color: var(--ink); }
+  .media-slot img, .media-slot video {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: cover; background: var(--bg);
+  }
+
   nav.links {
     font-size: 0.88rem; color: var(--muted);
     display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 2.4rem;
@@ -137,6 +167,74 @@
       <button class="copy" type="button" data-copy="cmd-prompt">copy</button>
     </div>
     <p class="prompt-text" id="cmd-prompt">Please look at https://github.com/zixiaoshawnshi/DataScientist-OS and set up dsos as an MCP server for me.</p>
+  </div>
+
+  <div class="block">
+    <div class="block-head">
+      <span class="label">everything is an artifact</span>
+    </div>
+    <div class="tabs tab-row" role="tablist" aria-label="Artifact type">
+      <button class="tab is-active" type="button" role="tab" aria-selected="true" data-tab="dataset">dataset</button>
+      <button class="tab" type="button" role="tab" aria-selected="false" data-tab="query">query</button>
+      <button class="tab" type="button" role="tab" aria-selected="false" data-tab="transform">transform</button>
+      <button class="tab" type="button" role="tab" aria-selected="false" data-tab="chart">chart</button>
+      <button class="tab" type="button" role="tab" aria-selected="false" data-tab="narrative">narrative</button>
+      <button class="tab" type="button" role="tab" aria-selected="false" data-tab="skill">skill</button>
+      <button class="tab" type="button" role="tab" aria-selected="false" data-tab="template">template</button>
+    </div>
+    <table class="artifact-table" data-panel="dataset">
+      <tr><th>what</th><td>A registered source of data — <code>source</code> captures url, method, and fetch time, not just the file itself.</td></tr>
+      <tr><th>made via</th><td><code>save_artifact(type="dataset", source=...)</code></td></tr>
+      <tr><th>example</th><td>A CSV pulled from a public API, registered once before anything queries it.</td></tr>
+    </table>
+    <table class="artifact-table" data-panel="query" hidden>
+      <tr><th>what</th><td>A SQL query run against a dataset — the query text and its result both become artifacts, automatically.</td></tr>
+      <tr><th>made via</th><td><code>run_sql(...)</code></td></tr>
+      <tr><th>example</th><td>"group by category, count rows" — reusable the next time the same question comes up.</td></tr>
+    </table>
+    <table class="artifact-table" data-panel="transform" hidden>
+      <tr><th>what</th><td>A Python transformation of one or more prior artifacts, recorded with its code, inputs, and status.</td></tr>
+      <tr><th>made via</th><td><code>run_python(...)</code></td></tr>
+      <tr><th>example</th><td>Joining two datasets, or computing a derived column.</td></tr>
+    </table>
+    <table class="artifact-table" data-panel="chart" hidden>
+      <tr><th>what</th><td>A rendered PNG, styled by whichever chart-style template is active.</td></tr>
+      <tr><th>made via</th><td><code>run_python(output_type="chart", style=...)</code></td></tr>
+      <tr><th>example</th><td>A bar chart that later embeds into a report unchanged.</td></tr>
+    </table>
+    <table class="artifact-table" data-panel="narrative" hidden>
+      <tr><th>what</th><td>Markdown that embeds other artifacts by reference — the composition layer everything else feeds into.</td></tr>
+      <tr><th>made via</th><td><code>save_artifact(type="narrative", content="... {{artifact:42}} ...")</code></td></tr>
+      <tr><th>example</th><td>A write-up that pulls in three prior charts and a table, then <code>publish_report</code> renders it to one self-contained HTML file.</td></tr>
+    </table>
+    <table class="artifact-table" data-panel="skill" hidden>
+      <tr><th>what</th><td>Markdown workflow instructions the agent reads and follows — teaches process, not code.</td></tr>
+      <tr><th>made via</th><td><code>save_skill(...)</code> — an edit is a new version of the same skill</td></tr>
+      <tr><th>example</th><td>"how to discover a new dataset," seeded into every fresh store.</td></tr>
+    </table>
+    <table class="artifact-table" data-panel="template" hidden>
+      <tr><th>what</th><td>A chart style or report layout — versioned like everything else, not a hardcoded default.</td></tr>
+      <tr><th>made via</th><td><code>save_template(kind=..., base=...)</code></td></tr>
+      <tr><th>example</th><td>A custom dark report layout your narratives render into.</td></tr>
+    </table>
+  </div>
+
+  <div class="block">
+    <div class="block-head"><span class="label">see it work</span></div>
+    <div class="media-slot" style="aspect-ratio: 16 / 9">
+      <div class="placeholder">drop <code>media/demo.mp4</code> next to this file<br>— a short recording of an agent driving dsos</div>
+      <video controls preload="metadata" onerror="this.style.display='none'">
+        <source src="media/demo.mp4" type="video/mp4">
+      </video>
+    </div>
+  </div>
+
+  <div class="block">
+    <div class="block-head"><span class="label">browse the store</span></div>
+    <div class="media-slot" style="aspect-ratio: 16 / 10">
+      <div class="placeholder">drop <code>media/gui-screenshot.png</code> next to this file<br>— the read-only artifact browser (gallery, lineage, tool-call feed)</div>
+      <img src="media/gui-screenshot.png" alt="DS Artifact OS GUI: artifact gallery and lineage view" onerror="this.style.display='none'">
+    </div>
   </div>
 
   <nav class="links">
