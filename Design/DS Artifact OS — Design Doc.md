@@ -2,7 +2,7 @@
 
 Sep 25, 2026 · @Shawn Shi
 
-This doc is split in two. **Part 1 is the hackathon MVP** — the only thing being built now. **Part 2 is the backlog**, built only if Part 1 is solid.
+This doc is in three parts. **Part 1 is the hackathon MVP.** **Part 2 is the backlog** — built only if Part 1 is solid. **Part 3 is release/GUI/publish** — Part 1's core (layers 1+2: artifact store, execution runner, MCP server) is built, passing two independent smoke-test suites, and live-tested against a real agent session (Pi); ahead of schedule, so this scopes the next slice deliberately rather than improvising it.
 
 ## Problem
 
@@ -140,3 +140,67 @@ No direct competitor treats the artifact itself, rather than the notebook or das
 | Experiment/artifact tracking | MLflow, Weights & Biases, DVC | Mature ML experiment and dataset versioning | Built for training runs, not lightweight, auto-narrated versioning of everyday analysis artifacts |
 
 All five rows above operate one layer up from this project: they govern, serve, or track things *after* someone has decided they're worth governing. This project is the working layer underneath — individual, no-permissions, disposable-until-published — that feeds into any of them. `publish_report` is the only export seam; nothing about this project competes with what a catalog or governance tool does above that seam.
+
+---
+
+# Part 3 — Release, GUI, Publish
+
+Three independent-ish workstreams, scoped concretely enough to hand to an agent directly. Each answers a fork that was deliberately left open rather than guessed at:
+
+| Fork | Decision |
+| --- | --- |
+| Release mechanism | Git tag + GitHub Release (not PyPI — no external account to set up; not a bare `uvx`-from-git ref — a Release gives a citable, documented checkpoint) |
+| GUI scope | Read-only (browse/search/lineage) — no delete/retag/edit; those need core-library functions that don't exist yet |
+| Publish target | Local self-contained HTML only — no external service (Notion/Google Docs were considered; out of scope for now) |
+
+## Release
+
+**Real gap, not just process:** `pyproject.toml` has no `[build-system]` table. `pip install -e .` only works today via pip's legacy fallback — undocumented behavior that likely breaks under a real build (`pip install git+...`, `uv`/`uvx`). Fix first, regardless of tag:
+
+```toml
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+```
+
+Verify by installing into a **throwaway** venv, not the dev one — editable installs hide "missing file in the sdist" bugs that only surface on a real build.
+
+Steps:
+1. Fix `[build-system]`, verify with a clean-venv install.
+2. Tag `v0.1.0`. This freezes the current MCP tool contract (`start_session`, `search_artifacts`, `get_artifact`, `save_artifact`, `run_sql`, `run_python`, `get_lineage`) as the first versioned checkpoint — worth a short changelog in the Release notes, since these shapes changed several times getting here (row_id unification, inline results, keyword search, auto-lineage).
+3. GitHub Release with those notes.
+4. README: add a "pin a version" install line — `pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@v0.1.0"`.
+
+## GUI (read-only)
+
+Same three-layer architecture already committed: a separate process, reading `dsos.store` directly off the same SQLite file — not through the MCP server. FastAPI + Jinja2 + htmx, no new frontend framework.
+
+**Prerequisite refactor:** `_artifact_payload` currently lives inside `dsos/mcp_server.py`. Move it into the core library (e.g. a new `dsos/present.py`) so the GUI and the MCP server call the same function instead of two views that can silently drift apart.
+
+**Concurrency risk, fix now not on demo day:** the GUI reads the same SQLite file the MCP server is actively writing to during a live agent run. Default SQLite journal mode can throw `database is locked` under exactly that read/write overlap. Fix: `PRAGMA journal_mode=WAL` in `dsos/db.py`'s `connect()`, so readers and a writer coexist without blocking.
+
+Routes:
+
+| Route | Shows |
+| --- | --- |
+| `GET /` | Sessions list — question, artifact count, reuse count (`reused_artifact_row_ids`) |
+| `GET /sessions/{id}` | That session's tool-call feed (htmx-polled partial — no websockets needed) + artifacts it created |
+| `GET /artifacts?type=&session_id=&q=` | Gallery; `q` calls `search_artifacts` directly, so gallery search and agent search share one index |
+| `GET /artifacts/{row_id}` | Detail: metadata, content preview, `uses`/used-by (both lineage directions), execution trace, other versions of the same logical artifact |
+| `GET /artifacts/{row_id}/lineage` | Small neighborhood graph, rendered via Mermaid.js off server-generated graph text — no new Python dependency |
+
+Explicitly not in scope here: the fancier interactive GUI (drag-to-reorder, live re-render) stays in Part 2's backlog. This is browse-and-understand, not edit.
+
+## Publish (local HTML only)
+
+New MCP tool: `publish_report(row_id, session_id) -> {"path": ..., "artifact_row_ids": [...]}`.
+
+Reuses the `{{artifact:row_id}}` regex already built for auto-lineage (`dsos/store.py`'s `_EMBED_RE`) — but now to *substitute*, not just detect:
+
+| Referenced artifact's type | Rendered as |
+| --- | --- |
+| dataset / query / transform | an HTML table (`pandas.DataFrame.to_html()`) |
+| chart | `<img>` with the PNG bytes inlined as a base64 data URI — required for the file to stay self-contained |
+| narrative markdown body | converted to HTML via a small markdown library (`markdown`, the more common of the two candidates over `mistune`) — the one new dependency this adds |
+
+Output is a single `.html` file with everything inlined (images included) — no sibling image files, per the Part 1 scope cut. It returns a file path and does **not** create its own artifact row: a rendered export isn't itself a versioned analysis artifact, it's an exit from this layer (see Philosophy #5). Easy to revisit if published reports should themselves be searchable/reusable later.
