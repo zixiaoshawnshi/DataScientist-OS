@@ -10,6 +10,7 @@
 <style>
   :root {
     --bg: #fbfbfa; --ink: #14161a; --muted: #6b7078; --accent: #2f6f5e; --line: #e4e3df;
+    --footer-h: 2.75rem;
     color-scheme: light;
   }
   @media (prefers-color-scheme: dark) {
@@ -24,16 +25,28 @@
   }
 
   * { box-sizing: border-box; }
-  html, body { min-height: 100%; }
+  html { height: 100%; }
   body {
     margin: 0; background: var(--bg); color: var(--ink);
     font-family: "JetBrains Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
+    height: 100vh; height: 100dvh;
+    overflow-y: auto; overscroll-behavior-y: contain;
+    scroll-snap-type: y mandatory;
   }
+
+  /* --- each top-level section is one full-viewport snap panel --- */
+  .panel {
+    height: 100vh; height: 100dvh;
+    scroll-snap-align: start; scroll-snap-stop: always;
+    display: flex; flex-direction: column; justify-content: center;
+    padding: 2.75rem 1.25rem calc(2.75rem + var(--footer-h));
+  }
+  .panel-inner { max-width: 36rem; width: 100%; margin: 0 auto; }
 
   /* --- hero (full-bleed, forced dark regardless of page theme) --- */
   .hero {
-    position: relative; min-height: 60vh; display: flex; align-items: flex-end;
-    overflow: hidden; background: #0b0d0f; padding: 4rem 1.25rem 3rem;
+    position: relative; overflow: hidden; background: #0b0d0f;
+    align-items: stretch; padding: 0;
   }
   .hero-media {
     position: absolute; inset: 0; width: 100%; height: 100%;
@@ -43,7 +56,10 @@
     position: absolute; inset: 0;
     background: linear-gradient(180deg, rgba(11,13,15,0.30) 0%, rgba(11,13,15,0.88) 100%);
   }
-  .hero-content { position: relative; z-index: 1; max-width: 36rem; width: 100%; margin: 0 auto; }
+  .hero .panel-inner {
+    position: relative; z-index: 1; margin-top: auto;
+    padding: 0 1.25rem calc(2.75rem + var(--footer-h));
+  }
   .hero-content .eyebrow { color: #9a9d95; }
   .hero-content .eyebrow::before { color: #6fcbb2; }
   .hero-content h1 { color: #f5f4f0; }
@@ -56,8 +72,6 @@
   .hero-content .watch-link:hover, .hero-content .watch-link:focus-visible {
     color: #6fcbb2; text-decoration-color: #6fcbb2;
   }
-
-  main { max-width: 36rem; width: 100%; margin: 0 auto; padding: 3rem 1.25rem; }
 
   .eyebrow {
     font-size: 0.78rem; color: var(--muted); margin: 0 0 1.1rem;
@@ -77,7 +91,6 @@
   }
   p.pitch em { color: var(--ink); font-style: normal; }
 
-  .block { margin: 0 0 2.4rem; }
   .block-head {
     display: flex; align-items: center; justify-content: space-between;
     gap: 1rem; margin: 0 0 0.55rem;
@@ -136,23 +149,45 @@
   }
   table.artifact-table code { color: var(--ink); }
 
+  /* --- persistent footer, fixed over every panel --- */
+  .site-footer {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+    height: var(--footer-h);
+    display: flex; align-items: center; justify-content: center;
+    background: color-mix(in srgb, var(--bg) 92%, transparent);
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    border-top: 1px solid var(--line);
+  }
   nav.links {
-    font-size: 0.88rem; color: var(--muted);
-    display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.4rem;
+    font-size: 0.86rem; color: var(--muted);
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 0.5rem;
+    padding: 0 1.25rem;
   }
   nav.links a { color: var(--ink); text-decoration: none; border-bottom: 1px solid var(--line); }
   nav.links a:hover, nav.links a:focus-visible { border-color: var(--accent); color: var(--accent); }
   nav.links .sep { color: var(--line); }
+
+  /* --- scroll-position dots --- */
+  .dots {
+    position: fixed; right: 1.1rem; top: 50%; transform: translateY(-50%);
+    z-index: 20; display: flex; flex-direction: column; gap: 0.6rem;
+  }
+  .dots button {
+    width: 0.5rem; height: 0.5rem; padding: 0; border-radius: 50%;
+    border: 1px solid var(--muted); background: transparent; cursor: pointer;
+  }
+  .dots button.is-active { background: var(--accent); border-color: var(--accent); }
+  @media (max-width: 640px) { .dots { display: none; } }
 </style>
 </head>
 <body>
 
-<section class="hero">
+<section class="panel hero" id="panel-hero">
   <video class="hero-media" autoplay muted loop playsinline preload="auto" onerror="this.style.display='none'">
     <source src="media/demo.mp4" type="video/mp4">
   </video>
   <div class="hero-scrim"></div>
-  <div class="hero-content">
+  <div class="panel-inner hero-content">
     <p class="eyebrow">for data scientists &amp; analysts</p>
     <h1>dsos</h1>
     <p class="pitch">
@@ -165,8 +200,8 @@
   </div>
 </section>
 
-<main>
-  <div class="block">
+<section class="panel" id="panel-features">
+  <div class="panel-inner">
     <div class="block-head"><span class="label">what it gives you</span></div>
     <ul class="features">
       <li><strong>artifact management</strong> — every query, dataset, transform, chart, and narrative saved, versioned, and searchable through one schema.</li>
@@ -175,8 +210,10 @@
       <li><strong>GUI</strong> — a read-only browser over the same store: sessions, tool-call feed, artifact gallery, lineage graph.</li>
     </ul>
   </div>
+</section>
 
-  <div class="block">
+<section class="panel" id="panel-install">
+  <div class="panel-inner">
     <div class="block-head">
       <div class="tabs" role="tablist" aria-label="Coding agent">
         <button class="tab is-active" type="button" role="tab" aria-selected="true" data-tab="claude">claude code</button>
@@ -198,16 +235,20 @@
 <span class="c"># then add to opencode.json</span>
 { "mcp": { "dsos": { "type": "local", "command": ["python", "-m", "dsos.mcp_server"] } } }</pre>
   </div>
+</section>
 
-  <div class="block">
+<section class="panel" id="panel-agent">
+  <div class="panel-inner">
     <div class="block-head">
       <span class="label">or, hand this to your agent</span>
       <button class="copy" type="button" data-copy="cmd-prompt">copy</button>
     </div>
     <p class="prompt-text" id="cmd-prompt">Please look at https://github.com/zixiaoshawnshi/DataScientist-OS and set up dsos as an MCP server for me.</p>
   </div>
+</section>
 
-  <div class="block">
+<section class="panel" id="panel-artifacts">
+  <div class="panel-inner">
     <div class="block-head">
       <span class="label">everything is an artifact</span>
     </div>
@@ -256,7 +297,17 @@
       <tr><th>example</th><td>A custom dark report layout your narratives render into.</td></tr>
     </table>
   </div>
+</section>
 
+<div class="dots" aria-hidden="true">
+  <button data-goto="panel-hero" class="is-active" aria-label="Intro"></button>
+  <button data-goto="panel-features" aria-label="Features"></button>
+  <button data-goto="panel-install" aria-label="Install"></button>
+  <button data-goto="panel-agent" aria-label="Hand to agent"></button>
+  <button data-goto="panel-artifacts" aria-label="Artifact types"></button>
+</div>
+
+<footer class="site-footer">
   <nav class="links">
     <a href="https://github.com/zixiaoshawnshi/DataScientist-OS">github</a>
     <span class="sep">·</span>
@@ -268,13 +319,13 @@
     <span class="sep">·</span>
     <span>mit</span>
   </nav>
-</main>
+</footer>
 
 <script>
   document.querySelectorAll('.tabs').forEach(function (tabs) {
     var buttons = tabs.querySelectorAll('.tab');
-    var block = tabs.closest('.block');
-    var panels = block.querySelectorAll('[data-panel]');
+    var scope = tabs.closest('.panel-inner');
+    var panels = scope.querySelectorAll('[data-panel]');
     buttons.forEach(function (tab) {
       tab.addEventListener('click', function () {
         buttons.forEach(function (t) {
@@ -294,7 +345,7 @@
     btn.addEventListener('click', function () {
       var target = btn.hasAttribute('data-copy')
         ? document.getElementById(btn.getAttribute('data-copy'))
-        : btn.closest('.block').querySelector('[data-panel]:not([hidden])');
+        : btn.closest('.panel-inner').querySelector('[data-panel]:not([hidden])');
       var text = target.innerText;
       var reset = function () { btn.textContent = 'copy'; };
       var flash = function () {
@@ -318,6 +369,28 @@
     var sel = window.getSelection();
     sel.removeAllRanges();
     sel.addRange(range);
+  }
+
+  // scroll-position dots: click to jump, highlight whichever panel is in view
+  var dotButtons = Array.prototype.slice.call(document.querySelectorAll('.dots button'));
+  dotButtons.forEach(function (dot) {
+    dot.addEventListener('click', function () {
+      var target = document.getElementById(dot.getAttribute('data-goto'));
+      if (target) target.scrollIntoView({ behavior: 'smooth' });
+    });
+  });
+  if ('IntersectionObserver' in window) {
+    var panelEls = Array.prototype.slice.call(document.querySelectorAll('.panel'));
+    var observer = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting && entry.intersectionRatio > 0.6) {
+          dotButtons.forEach(function (dot) {
+            dot.classList.toggle('is-active', dot.getAttribute('data-goto') === entry.target.id);
+          });
+        }
+      });
+    }, { threshold: [0.6] });
+    panelEls.forEach(function (p) { observer.observe(p); });
   }
 </script>
 </body>
