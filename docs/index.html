@@ -34,11 +34,12 @@
     scroll-snap-type: y mandatory;
   }
 
-  /* --- each top-level section is one full-viewport snap panel --- */
+  /* --- each top-level section is exactly one viewport, no internal scroll --- */
   .panel {
     height: 100vh; height: 100dvh;
     scroll-snap-align: start; scroll-snap-stop: always;
     display: flex; flex-direction: column; justify-content: center;
+    overflow: hidden;
     padding: 2.75rem 1.25rem calc(2.75rem + var(--footer-h));
   }
   .panel-inner { max-width: 36rem; width: 100%; margin: 0 auto; }
@@ -72,6 +73,20 @@
   .hero-content .watch-link:hover, .hero-content .watch-link:focus-visible {
     color: #6fcbb2; text-decoration-color: #6fcbb2;
   }
+
+  /* --- phase-in intro on the hero's own text --- */
+  @keyframes phase-in {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .hero-content > * {
+    opacity: 0;
+    animation: phase-in 0.8s ease-out forwards;
+  }
+  .hero-content .eyebrow { animation-delay: 0.1s; }
+  .hero-content h1 { animation-delay: 0.28s; }
+  .hero-content p.pitch { animation-delay: 0.5s; }
+  .hero-content .watch-link { animation-delay: 0.72s; }
 
   .eyebrow {
     font-size: 0.78rem; color: var(--muted); margin: 0 0 1.1rem;
@@ -131,6 +146,8 @@
   pre.cmd .p { color: var(--accent); }
   pre.cmd .c { color: var(--muted); }
   pre.cmd[hidden] { display: none; }
+
+  .sub-block { margin-top: 1.5rem; }
 
   p.prompt-text {
     font-size: 0.9rem; color: var(--ink); margin: 0; line-height: 1.6;
@@ -234,16 +251,14 @@
     <pre class="cmd" data-panel="opencode" hidden><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
 <span class="c"># then add to opencode.json</span>
 { "mcp": { "dsos": { "type": "local", "command": ["python", "-m", "dsos.mcp_server"] } } }</pre>
-  </div>
-</section>
 
-<section class="panel" id="panel-agent">
-  <div class="panel-inner">
-    <div class="block-head">
-      <span class="label">or, hand this to your agent</span>
-      <button class="copy" type="button" data-copy="cmd-prompt">copy</button>
+    <div class="sub-block">
+      <div class="block-head">
+        <span class="label">or, hand this to your agent</span>
+        <button class="copy" type="button" data-copy="cmd-prompt">copy</button>
+      </div>
+      <p class="prompt-text" id="cmd-prompt">Please look at https://github.com/zixiaoshawnshi/DataScientist-OS and set up dsos as an MCP server for me.</p>
     </div>
-    <p class="prompt-text" id="cmd-prompt">Please look at https://github.com/zixiaoshawnshi/DataScientist-OS and set up dsos as an MCP server for me.</p>
   </div>
 </section>
 
@@ -303,7 +318,6 @@
   <button data-goto="panel-hero" class="is-active" aria-label="Intro"></button>
   <button data-goto="panel-features" aria-label="Features"></button>
   <button data-goto="panel-install" aria-label="Install"></button>
-  <button data-goto="panel-agent" aria-label="Hand to agent"></button>
   <button data-goto="panel-artifacts" aria-label="Artifact types"></button>
 </div>
 
@@ -371,27 +385,69 @@
     sel.addRange(range);
   }
 
-  // scroll-position dots: click to jump, highlight whichever panel is in view
-  var dotButtons = Array.prototype.slice.call(document.querySelectorAll('.dots button'));
-  dotButtons.forEach(function (dot) {
-    dot.addEventListener('click', function () {
-      var target = document.getElementById(dot.getAttribute('data-goto'));
-      if (target) target.scrollIntoView({ behavior: 'smooth' });
-    });
-  });
-  if ('IntersectionObserver' in window) {
-    var panelEls = Array.prototype.slice.call(document.querySelectorAll('.panel'));
-    var observer = new IntersectionObserver(function (entries) {
-      entries.forEach(function (entry) {
-        if (entry.isIntersecting && entry.intersectionRatio > 0.6) {
-          dotButtons.forEach(function (dot) {
-            dot.classList.toggle('is-active', dot.getAttribute('data-goto') === entry.target.id);
-          });
-        }
+  // --- paginated navigation: one wheel notch / key press / swipe = exactly one panel, instantly ---
+  (function () {
+    var panels = Array.prototype.slice.call(document.querySelectorAll('.panel'));
+    var dotButtons = Array.prototype.slice.call(document.querySelectorAll('.dots button'));
+    var current = 0;
+    var locked = false;
+    var LOCK_MS = 550;
+
+    function updateDots() {
+      var id = panels[current].id;
+      dotButtons.forEach(function (dot) {
+        dot.classList.toggle('is-active', dot.getAttribute('data-goto') === id);
       });
-    }, { threshold: [0.6] });
-    panelEls.forEach(function (p) { observer.observe(p); });
-  }
+    }
+
+    function goTo(index) {
+      index = Math.max(0, Math.min(panels.length - 1, index));
+      if (index === current) return;
+      current = index;
+      locked = true;
+      panels[current].scrollIntoView({ behavior: 'auto', block: 'start' });
+      updateDots();
+      setTimeout(function () { locked = false; }, LOCK_MS);
+    }
+
+    window.addEventListener('wheel', function (e) {
+      e.preventDefault();
+      if (locked) return;
+      goTo(current + (e.deltaY > 0 ? 1 : -1));
+    }, { passive: false });
+
+    window.addEventListener('keydown', function (e) {
+      if (e.key === 'ArrowDown' || e.key === 'PageDown' || e.key === ' ') {
+        e.preventDefault();
+        if (!locked) goTo(current + 1);
+      } else if (e.key === 'ArrowUp' || e.key === 'PageUp') {
+        e.preventDefault();
+        if (!locked) goTo(current - 1);
+      }
+    });
+
+    var touchStartY = null;
+    window.addEventListener('touchstart', function (e) {
+      touchStartY = e.touches[0].clientY;
+    }, { passive: true });
+    window.addEventListener('touchmove', function (e) {
+      e.preventDefault();
+    }, { passive: false });
+    window.addEventListener('touchend', function (e) {
+      if (touchStartY === null || locked) return;
+      var dy = touchStartY - e.changedTouches[0].clientY;
+      touchStartY = null;
+      if (Math.abs(dy) > 40) goTo(current + (dy > 0 ? 1 : -1));
+    }, { passive: true });
+
+    dotButtons.forEach(function (dot) {
+      dot.addEventListener('click', function () {
+        goTo(panels.findIndex(function (p) { return p.id === dot.getAttribute('data-goto'); }));
+      });
+    });
+
+    updateDots();
+  })();
 </script>
 </body>
 </html>
