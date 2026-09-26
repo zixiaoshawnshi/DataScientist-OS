@@ -445,6 +445,15 @@
       updateDots();
     }
 
+    var settleTimer = null;
+    var backstopTimer = null;
+
+    function onScrollSettled() {
+      clearTimeout(backstopTimer);
+      busy = false;
+      settle('auto');
+    }
+
     function goTo(index) {
       index = Math.max(0, Math.min(panels.length - 1, index));
       if (index === current) return;
@@ -453,22 +462,25 @@
       panels[current].scrollIntoView({ behavior: 'smooth', block: 'start' });
       updateDots();
       replayContent(panels[current]);
+      // guaranteed unlock even if scrollend never fires for this scroller/
+      // browser/trigger (seen in practice: input stayed locked forever
+      // after the first transition once scrollend silently never arrived).
+      // Harmless to double-call onScrollSettled if the real event does
+      // also fire — settle()/updateDots() are idempotent.
+      clearTimeout(backstopTimer);
+      backstopTimer = setTimeout(onScrollSettled, 900);
     }
 
-    var settleTimer = null;
-    function onScrollSettled() {
-      busy = false;
-      settle('auto');
-    }
     if ('onscrollend' in window) {
       scroller.addEventListener('scrollend', onScrollSettled);
-    } else {
-      // fallback for browsers without scrollend: debounce plain scroll events
-      scroller.addEventListener('scroll', function () {
-        clearTimeout(settleTimer);
-        settleTimer = setTimeout(onScrollSettled, 120);
-      }, { passive: true });
     }
+    // always keep the debounced scroll fallback too, not just when
+    // scrollend is unsupported — cheap, and another way to recover early
+    // if scrollend turns out not to fire for this element in practice.
+    scroller.addEventListener('scroll', function () {
+      clearTimeout(settleTimer);
+      settleTimer = setTimeout(onScrollSettled, 120);
+    }, { passive: true });
 
     window.addEventListener('wheel', function (e) {
       e.preventDefault();
