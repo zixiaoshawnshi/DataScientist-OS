@@ -7,9 +7,11 @@
 <meta name="description" content="An MCP server for data scientists and analysts that keeps queries, datasets, charts, and narratives organized as versioned, searchable artifacts.">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swiper@11/swiper-bundle.min.css">
 <style>
   :root {
     --bg: #fbfbfa; --ink: #14161a; --muted: #6b7078; --accent: #2f6f5e; --line: #e4e3df;
+    --footer-h: 2.75rem;
     color-scheme: light;
   }
   @media (prefers-color-scheme: dark) {
@@ -28,10 +30,78 @@
   body {
     margin: 0; background: var(--bg); color: var(--ink);
     font-family: "JetBrains Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
-    display: flex; align-items: center; justify-content: center;
-    padding-inline: 1.25rem; padding-block: 3rem;
+    overflow: hidden; /* Swiper owns all scrolling/paging via its own transforms */
   }
-  main { max-width: 36rem; width: 100%; }
+
+  .swiper { width: 100%; height: 100vh; height: 100dvh; }
+
+  /* --- each slide is exactly one viewport, no internal scroll --- */
+  .panel {
+    display: flex; flex-direction: column; justify-content: center;
+    overflow: hidden;
+    padding: 2.75rem 1.25rem calc(2.75rem + var(--footer-h));
+  }
+  .panel-inner { max-width: 36rem; width: 100%; margin: 0 auto; }
+
+  /* --- any slide with a video backdrop: full-bleed, forced dark regardless
+     of page theme, so text stays legible over arbitrary footage --- */
+  .video-bg {
+    position: relative; overflow: hidden; background: #0b0d0f;
+    align-items: stretch; padding: 0;
+  }
+  .video-bg .bg-media {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: cover; opacity: 0.55;
+  }
+  .video-bg .bg-scrim {
+    position: absolute; inset: 0;
+    background: linear-gradient(180deg, rgba(11,13,15,0.30) 0%, rgba(11,13,15,0.88) 100%);
+  }
+  .video-bg .panel-inner {
+    position: relative; z-index: 1;
+    padding: 0 1.25rem;
+  }
+  .video-bg .eyebrow { color: #9a9d95; }
+  .video-bg .eyebrow::before { color: #6fcbb2; }
+  .video-bg h1 { color: #f5f4f0; }
+  .video-bg p.pitch { color: #c7c9c2; }
+  .video-bg p.pitch em { color: #f5f4f0; }
+  .video-bg .watch-link {
+    display: inline-block; font-size: 0.8rem; color: #9a9d95;
+    text-decoration: underline; text-decoration-color: #3a3d38; text-underline-offset: 3px;
+  }
+  .video-bg .watch-link:hover, .video-bg .watch-link:focus-visible {
+    color: #6fcbb2; text-decoration-color: #6fcbb2;
+  }
+  .video-bg .block-head .label { color: #9a9d95; }
+  .video-bg .block-head .label::before { color: #6fcbb2; }
+  .video-bg ul.features li { color: #c7c9c2; }
+  .video-bg ul.features strong { color: #f5f4f0; }
+  .video-bg ul.features li::before { color: #6fcbb2; }
+
+  /* --- phase-in intro on the hero's own text, on page load --- */
+  @keyframes phase-in {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .hero-content > * {
+    opacity: 0;
+    animation: phase-in 0.8s ease-out forwards;
+  }
+  .hero-content .eyebrow { animation-delay: 0.1s; }
+  .hero-content h1 { animation-delay: 0.28s; }
+  .hero-content p.pitch { animation-delay: 0.5s; }
+  .hero-content .watch-link { animation-delay: 0.72s; }
+
+  /* --- replayable enter transition for every other slide's content --- */
+  @keyframes panel-in {
+    from { opacity: 0; transform: translateY(18px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .panel:not(.hero) .panel-inner { opacity: 0; }
+  .panel:not(.hero) .panel-inner.is-in {
+    animation: panel-in 0.5s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  }
 
   .eyebrow {
     font-size: 0.78rem; color: var(--muted); margin: 0 0 1.1rem;
@@ -47,23 +117,40 @@
 
   p.pitch {
     font-size: 1rem; line-height: 1.7; color: var(--muted);
-    margin: 0 0 2.6rem; max-width: 48ch;
+    margin: 0 0 1.4rem; max-width: 48ch;
   }
   p.pitch em { color: var(--ink); font-style: normal; }
 
-  .block { margin: 0 0 1.6rem; }
   .block-head {
-    display: flex; align-items: baseline; justify-content: space-between;
+    display: flex; align-items: center; justify-content: space-between;
     gap: 1rem; margin: 0 0 0.55rem;
   }
   .block-head .label { font-size: 0.78rem; color: var(--muted); }
   .block-head .label::before { content: "# "; color: var(--accent); }
 
+  ul.features { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.9rem; }
+  ul.features li {
+    font-size: 0.92rem; line-height: 1.6; color: var(--muted);
+    padding-left: 1.2rem; position: relative;
+  }
+  ul.features li::before { content: "\203A"; position: absolute; left: 0; color: var(--accent); }
+  ul.features strong { color: var(--ink); font-weight: 600; }
+
+  .tabs { display: flex; gap: 1.1rem; flex-wrap: wrap; }
+  .tab {
+    font: inherit; font-size: 0.78rem; color: var(--muted);
+    background: none; border: none; padding: 0 0 0.2rem; cursor: pointer;
+    border-bottom: 1px solid transparent;
+  }
+  .tab:hover, .tab:focus-visible { color: var(--ink); }
+  .tab.is-active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-row { margin: 0 0 0.9rem; }
+
   button.copy {
     font: inherit; font-size: 0.76rem; color: var(--muted);
     background: none; border: none; padding: 0; cursor: pointer;
     text-decoration: underline; text-decoration-color: var(--line);
-    text-underline-offset: 3px;
+    text-underline-offset: 3px; white-space: nowrap;
   }
   button.copy:hover, button.copy:focus-visible { color: var(--accent); text-decoration-color: var(--accent); }
 
@@ -72,48 +159,189 @@
     overflow-x: auto; white-space: pre; line-height: 1.6;
   }
   pre.cmd .p { color: var(--accent); }
+  pre.cmd .c { color: var(--muted); }
+  pre.cmd[hidden] { display: none; }
+
+  .sub-block { margin-top: 1.5rem; }
 
   p.prompt-text {
     font-size: 0.9rem; color: var(--ink); margin: 0; line-height: 1.6;
   }
 
+  table.artifact-table {
+    width: 100%; border-collapse: collapse; font-size: 0.88rem;
+  }
+  table.artifact-table[hidden] { display: none; }
+  table.artifact-table th {
+    text-align: left; font-weight: 400; color: var(--muted); vertical-align: top;
+    width: 6rem; padding: 0.3rem 1rem 0.3rem 0; white-space: nowrap;
+  }
+  table.artifact-table td {
+    padding: 0.3rem 0; line-height: 1.65;
+  }
+  table.artifact-table code { color: var(--ink); }
+
+  /* --- persistent footer, fixed over every slide --- */
+  .site-footer {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+    height: var(--footer-h);
+    display: flex; align-items: center; justify-content: center;
+    background: color-mix(in srgb, var(--bg) 92%, transparent);
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    border-top: 1px solid var(--line);
+  }
   nav.links {
-    font-size: 0.88rem; color: var(--muted);
-    display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 2.4rem;
+    font-size: 0.86rem; color: var(--muted);
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 0.5rem;
+    padding: 0 1.25rem;
   }
   nav.links a { color: var(--ink); text-decoration: none; border-bottom: 1px solid var(--line); }
   nav.links a:hover, nav.links a:focus-visible { border-color: var(--accent); color: var(--accent); }
   nav.links .sep { color: var(--line); }
+
+  /* --- Swiper's own pagination dots, restyled to match the site --- */
+  .swiper-pagination-vertical.swiper-pagination-bullets {
+    right: 1.1rem; z-index: 20;
+  }
+  .swiper-pagination-bullet {
+    width: 0.5rem; height: 0.5rem; margin: 0.4rem 0 !important;
+    background: transparent; opacity: 1;
+    border: 1px solid var(--muted);
+  }
+  .swiper-pagination-bullet-active { background: var(--accent); border-color: var(--accent); }
+  @media (max-width: 640px) { .swiper-pagination { display: none; } }
 </style>
 </head>
 <body>
-<main>
-  <p class="eyebrow">for data scientists &amp; analysts</p>
-  <h1>dsos</h1>
-  <p class="pitch">
-    An MCP server that keeps your coding agent's queries, datasets,
-    charts, and narratives organized as <em>versioned, searchable
-    artifacts</em> — so your analysis stops scattering across
-    notebooks, chat scrollback, and one-off scripts.
-  </p>
 
-  <div class="block">
-    <div class="block-head">
-      <span class="label">install latest</span>
-      <button class="copy" type="button" data-copy="cmd-install">copy</button>
-    </div>
-    <pre class="cmd" id="cmd-install"><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
+<div class="swiper" id="site-swiper">
+  <div class="swiper-wrapper">
+
+    <section class="swiper-slide panel hero video-bg" id="panel-hero">
+      <video class="bg-media" autoplay muted loop playsinline preload="auto" onerror="this.style.display='none'">
+        <source src="media/demo.mp4" type="video/mp4">
+      </video>
+      <div class="bg-scrim"></div>
+      <div class="panel-inner hero-content">
+        <p class="eyebrow">for data scientists &amp; analysts</p>
+        <h1>dsos</h1>
+        <p class="pitch">
+          An MCP server that keeps your coding agent's queries, datasets,
+          charts, and narratives organized as <em>versioned, searchable
+          artifacts</em> — so your analysis stops scattering across
+          notebooks, chat scrollback, and one-off scripts.
+        </p>
+        <a class="watch-link" href="media/demo.mp4">watch the full recording &#8599;</a>
+      </div>
+    </section>
+
+    <section class="swiper-slide panel video-bg" id="panel-features">
+      <video class="bg-media" autoplay muted loop playsinline preload="auto" onerror="this.style.display='none'">
+        <source src="media/demo-gui.mp4" type="video/mp4">
+      </video>
+      <div class="bg-scrim"></div>
+      <div class="panel-inner">
+        <div class="block-head"><span class="label">what it gives you</span></div>
+        <ul class="features">
+          <li><strong>artifact management</strong> — every query, dataset, transform, chart, and narrative saved, versioned, and searchable through one schema.</li>
+          <li><strong>lineage</strong> — parents and children tracked automatically on every run — no manual bookkeeping.</li>
+          <li><strong>skills &amp; templates</strong> — workflow instructions and chart/report styling, both customizable and versioned like everything else.</li>
+          <li><strong>GUI</strong> — a read-only browser over the same store: sessions, tool-call feed, artifact gallery, lineage graph.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="swiper-slide panel" id="panel-install">
+      <div class="panel-inner">
+        <div class="block-head">
+          <div class="tabs" role="tablist" aria-label="Coding agent">
+            <button class="tab is-active" type="button" role="tab" aria-selected="true" data-tab="claude">claude code</button>
+            <button class="tab" type="button" role="tab" aria-selected="false" data-tab="pi">pi</button>
+            <button class="tab" type="button" role="tab" aria-selected="false" data-tab="codex">codex</button>
+            <button class="tab" type="button" role="tab" aria-selected="false" data-tab="opencode">opencode</button>
+          </div>
+          <button class="copy" type="button">copy</button>
+        </div>
+        <pre class="cmd" data-panel="claude"><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
 <span class="p">$</span> claude mcp add dsos -s user -- python -m dsos.mcp_server</pre>
+        <pre class="cmd" data-panel="pi" hidden><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
+<span class="p">$</span> pi install npm:pi-mcp-adapter
+<span class="c"># then add to ~/.config/mcp/mcp.json</span>
+{ "mcpServers": { "dsos": { "command": "python", "args": ["-m", "dsos.mcp_server"] } } }</pre>
+        <pre class="cmd" data-panel="codex" hidden><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
+<span class="p">$</span> codex mcp add dsos -- python -m dsos.mcp_server</pre>
+        <pre class="cmd" data-panel="opencode" hidden><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
+<span class="c"># then add to opencode.json</span>
+{ "mcp": { "dsos": { "type": "local", "command": ["python", "-m", "dsos.mcp_server"] } } }</pre>
+
+        <div class="sub-block">
+          <div class="block-head">
+            <span class="label">or, hand this to your agent</span>
+            <button class="copy" type="button" data-copy="cmd-prompt">copy</button>
+          </div>
+          <p class="prompt-text" id="cmd-prompt">Please look at https://github.com/zixiaoshawnshi/DataScientist-OS and set up dsos as an MCP server for me.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="swiper-slide panel" id="panel-artifacts">
+      <div class="panel-inner">
+        <div class="block-head">
+          <span class="label">everything is an artifact</span>
+        </div>
+        <div class="tabs tab-row" role="tablist" aria-label="Artifact type">
+          <button class="tab is-active" type="button" role="tab" aria-selected="true" data-tab="dataset">dataset</button>
+          <button class="tab" type="button" role="tab" aria-selected="false" data-tab="query">query</button>
+          <button class="tab" type="button" role="tab" aria-selected="false" data-tab="transform">transform</button>
+          <button class="tab" type="button" role="tab" aria-selected="false" data-tab="chart">chart</button>
+          <button class="tab" type="button" role="tab" aria-selected="false" data-tab="narrative">narrative</button>
+          <button class="tab" type="button" role="tab" aria-selected="false" data-tab="skill">skill</button>
+          <button class="tab" type="button" role="tab" aria-selected="false" data-tab="template">template</button>
+        </div>
+        <table class="artifact-table" data-panel="dataset">
+          <tr><th>what</th><td>A registered source of data — <code>source</code> captures url, method, and fetch time, not just the file itself.</td></tr>
+          <tr><th>made via</th><td><code>save_artifact(type="dataset", source=...)</code></td></tr>
+          <tr><th>example</th><td>A CSV pulled from a public API, registered once before anything queries it.</td></tr>
+        </table>
+        <table class="artifact-table" data-panel="query" hidden>
+          <tr><th>what</th><td>A SQL query run against a dataset — the query text and its result both become artifacts, automatically.</td></tr>
+          <tr><th>made via</th><td><code>run_sql(...)</code></td></tr>
+          <tr><th>example</th><td>"group by category, count rows" — reusable the next time the same question comes up.</td></tr>
+        </table>
+        <table class="artifact-table" data-panel="transform" hidden>
+          <tr><th>what</th><td>A Python transformation of one or more prior artifacts, recorded with its code, inputs, and status.</td></tr>
+          <tr><th>made via</th><td><code>run_python(...)</code></td></tr>
+          <tr><th>example</th><td>Joining two datasets, or computing a derived column.</td></tr>
+        </table>
+        <table class="artifact-table" data-panel="chart" hidden>
+          <tr><th>what</th><td>A rendered PNG, styled by whichever chart-style template is active.</td></tr>
+          <tr><th>made via</th><td><code>run_python(output_type="chart", style=...)</code></td></tr>
+          <tr><th>example</th><td>A bar chart that later embeds into a report unchanged.</td></tr>
+        </table>
+        <table class="artifact-table" data-panel="narrative" hidden>
+          <tr><th>what</th><td>Markdown that embeds other artifacts by reference — the composition layer everything else feeds into.</td></tr>
+          <tr><th>made via</th><td><code>save_artifact(type="narrative", content="... {{artifact:42}} ...")</code></td></tr>
+          <tr><th>example</th><td>A write-up that pulls in three prior charts and a table, then <code>publish_report</code> renders it to one self-contained HTML file.</td></tr>
+        </table>
+        <table class="artifact-table" data-panel="skill" hidden>
+          <tr><th>what</th><td>Markdown workflow instructions the agent reads and follows — teaches process, not code.</td></tr>
+          <tr><th>made via</th><td><code>save_skill(...)</code> — an edit is a new version of the same skill</td></tr>
+          <tr><th>example</th><td>"how to discover a new dataset," seeded into every fresh store.</td></tr>
+        </table>
+        <table class="artifact-table" data-panel="template" hidden>
+          <tr><th>what</th><td>A chart style or report layout — versioned like everything else, not a hardcoded default.</td></tr>
+          <tr><th>made via</th><td><code>save_template(kind=..., base=...)</code></td></tr>
+          <tr><th>example</th><td>A custom dark report layout your narratives render into.</td></tr>
+        </table>
+      </div>
+    </section>
+
   </div>
 
-  <div class="block">
-    <div class="block-head">
-      <span class="label">or, hand this to your agent</span>
-      <button class="copy" type="button" data-copy="cmd-prompt">copy</button>
-    </div>
-    <p class="prompt-text" id="cmd-prompt">Please look at https://github.com/zixiaoshawnshi/DataScientist-OS and set up dsos as an MCP server for me.</p>
-  </div>
+  <div class="swiper-pagination"></div>
+</div>
 
+<footer class="site-footer">
   <nav class="links">
     <a href="https://github.com/zixiaoshawnshi/DataScientist-OS">github</a>
     <span class="sep">·</span>
@@ -125,12 +353,34 @@
     <span class="sep">·</span>
     <span>mit</span>
   </nav>
-</main>
+</footer>
 
+<script src="https://cdn.jsdelivr.net/npm/swiper@11/swiper-bundle.min.js"></script>
 <script>
+  document.querySelectorAll('.tabs').forEach(function (tabs) {
+    var buttons = tabs.querySelectorAll('.tab');
+    var scope = tabs.closest('.panel-inner');
+    var panels = scope.querySelectorAll('[data-panel]');
+    buttons.forEach(function (tab) {
+      tab.addEventListener('click', function () {
+        buttons.forEach(function (t) {
+          t.classList.remove('is-active');
+          t.setAttribute('aria-selected', 'false');
+        });
+        tab.classList.add('is-active');
+        tab.setAttribute('aria-selected', 'true');
+        panels.forEach(function (p) {
+          p.hidden = p.getAttribute('data-panel') !== tab.getAttribute('data-tab');
+        });
+      });
+    });
+  });
+
   document.querySelectorAll('button.copy').forEach(function (btn) {
     btn.addEventListener('click', function () {
-      var target = document.getElementById(btn.getAttribute('data-copy'));
+      var target = btn.hasAttribute('data-copy')
+        ? document.getElementById(btn.getAttribute('data-copy'))
+        : btn.closest('.panel-inner').querySelector('[data-panel]:not([hidden])');
       var text = target.innerText;
       var reset = function () { btn.textContent = 'copy'; };
       var flash = function () {
@@ -155,6 +405,36 @@
     sel.removeAllRanges();
     sel.addRange(range);
   }
+
+  function replayContent(slideEl) {
+    var inner = slideEl && slideEl.querySelector('.panel-inner');
+    if (!inner || slideEl.classList.contains('hero')) return;
+    inner.classList.remove('is-in');
+    void inner.offsetWidth; // force reflow so the animation restarts
+    inner.classList.add('is-in');
+  }
+
+  var swiper = new Swiper('#site-swiper', {
+    direction: 'vertical',
+    slidesPerView: 1,
+    speed: 500,
+    mousewheel: {
+      // trackpads/high-res wheels fire many events per physical gesture;
+      // without a time threshold each one can trigger its own slide
+      // change, so one scroll jumps several slides at once. Ignoring
+      // further wheel input for a bit after each change limits it to one
+      // slide per gesture, matching the transition speed below.
+      thresholdTime: 700,
+      thresholdDelta: 6,
+    },
+    keyboard: { enabled: true, pageUpDown: true },
+    pagination: { el: '.swiper-pagination', clickable: true },
+    on: {
+      slideChangeTransitionEnd: function (sw) {
+        replayContent(sw.slides[sw.activeIndex]);
+      },
+    },
+  });
 </script>
 </body>
 </html>
