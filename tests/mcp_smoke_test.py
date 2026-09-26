@@ -78,7 +78,32 @@ async def main() -> None:
         })
         assert r.data["status"] == "ok", r.data
         query_row = r.data["row_id"]
-        print(f"[ok] run_sql (over the wire) -> query row {query_row}")
+        # Regression: run_sql used to return only {row_id, status,
+        # artifact_row_ids} — the agent had no way to see what it computed
+        # without a second call, and that second call (get_artifact by the
+        # id run_sql actually returns) was itself broken. Both fixed now.
+        assert r.data["row_count"] == 2, r.data
+        assert r.data["preview"], "run_sql should inline a preview, not just a row_id"
+        print(f"[ok] run_sql (over the wire) -> query row {query_row}, preview inlined")
+
+        r = await client.call_tool("get_artifact", {"row_id": query_row, "session_id": s1})
+        assert "error" not in r.data, r.data
+        assert r.data["row_id"] == query_row
+        print("[ok] get_artifact(row_id=<what run_sql returned>) resolves (previously: 'no artifact')")
+
+        r = await client.call_tool("run_sql", {
+            "code": "SELECT this_column_does_not_exist FROM toy_scores",
+            "session_id": s1, "title": "Deliberately broken query",
+            "description": "Exercises the error path.", "input_row_ids": [dataset_row],
+        })
+        assert r.data["status"] == "error", r.data
+        assert r.data.get("error"), "a failed run_sql should surface why, not just status=error"
+        assert "this_column_does_not_exist" in r.data["error"], (
+            "error should be a concise agent-facing message, not just the exception class"
+        )
+        assert "Traceback" not in r.data["error"], "error should exclude internal frame noise"
+        assert "Traceback" in r.data.get("stderr", ""), "full traceback should still be in stderr"
+        print(f"[ok] failed run_sql surfaces a concise error: {r.data['error']}")
 
         r = await client.call_tool(
             "get_lineage", {"row_id": query_row, "session_id": s1, "direction": "ancestors"}

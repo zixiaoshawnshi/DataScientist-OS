@@ -63,7 +63,7 @@ def run_sql(
     """
     started_at = _now()
     stdout = io.StringIO()
-    status, error, result = "ok", None, None
+    status, error, stderr_text, result = "ok", None, "", None
 
     inputs = [get_artifact_by_row_id(conn, rid) for rid in input_row_ids]
     duck = duckdb.connect(":memory:")
@@ -74,8 +74,12 @@ def run_sql(
     try:
         with contextlib.redirect_stdout(stdout):
             result = duck.execute(code).fetchdf()
-    except Exception:
-        status, error = "error", traceback.format_exc()
+    except Exception as exc:
+        # `error` is the concise, agent-facing message (no internal file/line
+        # noise from dsos's own frames); the full traceback goes in stderr,
+        # which is where a real unhandled exception would print it anyway.
+        status, error = "error", f"{type(exc).__name__}: {exc}"
+        stderr_text = traceback.format_exc()
         result = pd.DataFrame()
     finally:
         duck.close()
@@ -87,7 +91,7 @@ def run_sql(
     )
     _record_execution(
         conn, output_row_id=output_row_id, kind="sql", code=code, started_at=started_at,
-        status=status, stdout=stdout.getvalue(), stderr="", error=error,
+        status=status, stdout=stdout.getvalue(), stderr=stderr_text, error=error,
         output_summary=_output_summary(result),
     )
     return output_row_id
@@ -116,8 +120,11 @@ def run_python(
         if "result" not in namespace:
             raise ValueError("run_python code must assign a `result` variable")
         result = namespace["result"]
-    except Exception:
-        status, error = "error", traceback.format_exc()
+    except Exception as exc:
+        # `error` is the concise, agent-facing message; the full traceback is
+        # appended to stderr, same as a real unhandled exception would do.
+        status, error = "error", f"{type(exc).__name__}: {exc}"
+        stderr.write(traceback.format_exc())
         result = pd.DataFrame()
         output_format = "parquet"
 

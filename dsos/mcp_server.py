@@ -44,8 +44,16 @@ Workflow, in order:
 tools, then save_artifact to register it (type="dataset", with source). An \
 unregistered dataset is invisible to search, lineage, and every future question.
 4. run_sql / run_python against the registered artifacts to compute the \
-actual answer — never eyeball or summarize the raw data yourself.
+actual answer — never eyeball or summarize the raw data yourself. Their \
+result is returned inline in the same response (a preview, row_count, \
+columns) — do not call get_artifact right after just to see what you \
+produced; it's already there.
 5. Answer using the computed output, citing the row_ids you used.
+
+Every tool that returns an artifact — save_artifact, run_sql, run_python, \
+search_artifacts — gives you a row_id. That row_id is the only id you need \
+for get_artifact/run_sql/run_python's input_row_ids; there is no separate \
+"artifact_id" to track.
 """
 
 mcp = FastMCP("DS Artifact OS", instructions=INSTRUCTIONS)
@@ -119,9 +127,8 @@ def search_artifacts(
     hits = store.search_artifacts(conn, query, top_k=top_k, type=type)
     results = [
         {
-            "row_id": a.row_id, "artifact_id": a.artifact_id, "version": a.version,
-            "type": a.type, "title": a.title, "description": a.description,
-            "score": round(score, 3),
+            "row_id": a.row_id, "type": a.type, "title": a.title,
+            "description": a.description, "score": round(score, 3),
         }
         for a, score in hits
     ]
@@ -129,13 +136,24 @@ def search_artifacts(
 
 
 @mcp.tool()
-def get_artifact(artifact_id: str, session_id: str, version: int | None = None) -> dict:
-    """Fetch an artifact's metadata and content. Tabular artifacts (dataset/
-    query/transform) return a preview (first 10 rows) plus row_count, not the
-    full table — use run_sql/run_python against the row_id to work with it."""
-    art = store.get_artifact(conn, artifact_id, version=version)
+def get_artifact(row_id: str, session_id: str) -> dict:
+    """Fetch an artifact's full metadata and content, by the row_id that
+    save_artifact/run_sql/run_python/search_artifacts gave you — that row_id
+    is the only id you need; there's no separate "artifact_id" to look up.
+    Tabular artifacts (dataset/query/transform) return row_count, columns,
+    and a 10-row preview, not the full table — use run_sql/run_python
+    against this row_id to compute over the full data.
+
+    Note: run_sql/run_python already return this same preview inline in
+    their own response — call get_artifact only to re-fetch something from
+    an earlier tool call (e.g. a search_artifacts hit), not right after
+    running it yourself.
+
+    Example: get_artifact(row_id="a1b2c3...", session_id="s1")
+    """
+    art = store.get_artifact_by_row_id(conn, row_id)
     if art is None:
-        return {"error": f"no artifact {artifact_id!r}", "artifact_row_ids": []}
+        return {"error": f"no artifact with row_id {row_id!r}", "artifact_row_ids": []}
     return {**_artifact_payload(art), "artifact_row_ids": [art.row_id]}
 
 
@@ -208,24 +226,49 @@ def _ingest_path(path: str, type: str, content_format: str) -> tuple:
     return df, "parquet"
 
 
+def _execution_result_payload(row_id: str, input_row_ids: list[str]) -> dict:
+    """Shared by run_sql/run_python: always inline the result (or, on
+    failure, the diagnostics) — never make the agent make a second call
+    just to see what its own run produced."""
+    art = store.get_artifact_by_row_id(conn, row_id, load_content=True)
+    payload = {
+        **_artifact_payload(art),
+        "status": art.status,
+        "artifact_row_ids": [row_id, *input_row_ids],
+    }
+    if art.status != "ok":
+        info = store.get_execution(conn, row_id) or {}
+        payload["error"] = info.get("error")
+        payload["stdout"] = info.get("stdout", "")
+        payload["stderr"] = info.get("stderr", "")
+    return payload
+
+
 @mcp.tool()
 def run_sql(
     code: str, session_id: str, title: str, description: str, input_row_ids: list[str]
 ) -> dict:
     """Run SQL (DuckDB) against one or more artifacts. Each input row_id is
     available as a table named after that artifact's title (lowercased,
-    non-alphanumeric -> _). The result becomes a new `query` artifact,
-    automatically lineage-linked to every input and recorded — no separate
-    save_artifact call needed."""
+    non-alphanumeric -> _). The result is returned inline below (row_count,
+    columns, a 10-row preview) — you do NOT need a second call to see it.
+    It's also saved as a new `query` artifact, automatically lineage-linked
+    to every input and recorded — no separate save_artifact call needed.
+    On failure, status="error" and `error`/`stdout`/`stderr` below show why.
+
+    Example:
+      run_sql(
+        code="SELECT team, score FROM toy_scores WHERE score > 10",
+        session_id="s1", title="High scorers",
+        description="Teams scoring above 10.",
+        input_row_ids=["<row_id of the toy_scores dataset artifact>"],
+      )
+    """
     row_id = execution.run_sql(
         conn, code=code, session_id=session_id, title=title, description=description,
         input_row_ids=input_row_ids,
     )
-    art = store.get_artifact_by_row_id(conn, row_id, load_content=False)
-    return {
-        "row_id": row_id, "status": art.status,
-        "artifact_row_ids": [row_id, *input_row_ids],
-    }
+    return _execution_result_payload(row_id, input_row_ids)
 
 
 @mcp.tool()
@@ -236,18 +279,26 @@ def run_python(
     """Run Python against one or more artifacts. Each input row_id is bound
     to a variable named after that artifact's title; `pd` (pandas) is
     available. Your code MUST assign a `result` variable — a DataFrame, a
-    dict/list (saved as JSON), raw png bytes (a chart), or a string. That
-    becomes a new artifact (default type="transform"; pass output_type="chart"
-    for a plot), lineage-linked to every input and recorded automatically."""
+    dict/list (saved as JSON), raw png bytes (a chart), or a string. The
+    result is returned inline below — you do NOT need a second call to see
+    it. It's also saved as a new artifact (default type="transform"; pass
+    output_type="chart" for a plot), lineage-linked to every input and
+    recorded automatically. On failure, status="error" and `error`/`stdout`/
+    `stderr` below show the traceback and anything printed before it failed.
+
+    Example:
+      run_python(
+        code="result = toy_scores.groupby('team')['score'].mean().reset_index()",
+        session_id="s1", title="Average score by team",
+        description="Mean score per team.",
+        input_row_ids=["<row_id of the toy_scores dataset artifact>"],
+      )
+    """
     row_id = execution.run_python(
         conn, code=code, session_id=session_id, title=title, description=description,
         input_row_ids=input_row_ids, output_type=output_type,
     )
-    art = store.get_artifact_by_row_id(conn, row_id, load_content=False)
-    return {
-        "row_id": row_id, "status": art.status,
-        "artifact_row_ids": [row_id, *input_row_ids],
-    }
+    return _execution_result_payload(row_id, input_row_ids)
 
 
 @mcp.tool()

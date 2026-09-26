@@ -260,6 +260,23 @@ def get_lineage(
     return result
 
 
+def get_execution(conn: sqlite3.Connection, output_row_id: str) -> dict | None:
+    """The execution record (stdout/stderr/error/output_summary) that
+    produced `output_row_id`, if it was produced by run_sql/run_python.
+    Used to surface diagnostics inline when a run fails."""
+    row = conn.execute(
+        "SELECT * FROM executions WHERE output_row_id = ? ORDER BY started_at DESC LIMIT 1",
+        (output_row_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "kind": row["kind"], "status": row["status"],
+        "stdout": row["stdout"], "stderr": row["stderr"], "error": row["error"],
+        "output_summary": json.loads(row["output_summary"]),
+    }
+
+
 def log_tool_call(
     conn: sqlite3.Connection, session_id: str, tool_name: str, args: dict,
     result_summary: str, artifact_row_ids: list[str],
