@@ -163,10 +163,13 @@ def save_artifact(
     future question — until you call this.
 
     Pass exactly one of:
-    - content_text: inline text, for markdown/python/sql/json content
+    - content_text: inline text, for markdown/python/sql/json content.
+      `content_format` must describe it (markdown, python, sql, json, ...).
     - content_path: a local file you already produced with your own tools.
-      For type="dataset", csv/tsv/json/parquet files are read and normalized
-      to parquet automatically — pass content_format="parquet" either way.
+      For type="dataset" the format is read from the file extension —
+      .csv/.tsv/.json/.parquet are all accepted and normalized to parquet
+      internally; whatever you pass as content_format is ignored. For other
+      types the file is read as text and content_format describes it.
 
     `description` must be a real 1-2 sentences (what this is, why it
     matters) — search_artifacts ranks on it, so a vague description makes
@@ -226,16 +229,20 @@ def _execution_result_payload(row_id: str, input_row_ids: list[str]) -> dict:
     failure, the diagnostics) — never make the agent make a second call
     just to see what its own run produced."""
     art = store.get_artifact_by_row_id(conn, row_id, load_content=True)
+    info = store.get_execution(conn, row_id) or {}
     payload = {
         **_artifact_payload(art),
         "status": art.status,
         "artifact_row_ids": [row_id, *input_row_ids],
     }
+    # stdout is top-level on success AND failure (feedback #10): it's where
+    # progress prints and anything printed before a crash live, and it used
+    # to be invisible on success and buried on failure.
+    payload["stdout"] = (info.get("stdout") or "")[:2_000]
     if art.status != "ok":
-        info = store.get_execution(conn, row_id) or {}
         payload["error"] = info.get("error")
-        payload["stdout"] = info.get("stdout", "")
-        payload["stderr"] = info.get("stderr", "")
+        # stderr's tail carries the traceback's final (most useful) frames.
+        payload["stderr"] = (info.get("stderr") or "")[-4_000:]
     return payload
 
 

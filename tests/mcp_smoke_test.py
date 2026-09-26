@@ -143,6 +143,61 @@ async def main() -> None:
         assert r.data["status"] == "ok", r.data
         print("[ok] round 2 reused round 1's dataset via run_sql")
 
+        # --- round 3: agent-facing diagnostics (feedback #4, #5, #10) ---
+        r = await client.call_tool("run_python", {
+            "code": "print('computing averages'); "
+                    "result = toy_scores.groupby('team')['score'].mean().reset_index()",
+            "session_id": s2, "title": "Mean by team",
+            "description": "Mean score per team; also exercises stdout passthrough.",
+            "input_row_ids": [dataset_row],
+        })
+        assert r.data["status"] == "ok", r.data
+        assert "computing averages" in r.data.get("stdout", ""), (
+            "successful runs must surface stdout top-level (feedback #10)"
+        )
+        print("[ok] run_python over the wire -> stdout surfaced on success (feedback #10)")
+
+        r = await client.call_tool("save_artifact", {
+            "type": "narrative", "title": "Huge Report", "session_id": s2,
+            "description": "Deliberately oversized narrative to exercise the inline content cap.",
+            "content_format": "markdown", "content_text": "x" * 20_000,
+        })
+        huge_row = r.data["row_id"]
+        r = await client.call_tool("get_artifact", {"row_id": huge_row, "session_id": s2})
+        assert len(r.data["content"]) <= 4_000, "oversized content must be clipped in the payload"
+        assert r.data.get("content_truncated"), (
+            "clipped content must say so, and how to see the rest (feedback #5)"
+        )
+        print("[ok] oversized narrative arrives clipped with a content_truncated note (feedback #5)")
+
+        # A blob deleted out from under the store (the exact scenario behind
+        # feedback #4's cryptic '[Errno 2] No such file or directory').
+        from dsos import store as store_mod
+        from dsos.db import connect as db_connect
+        diag_conn = db_connect(os.environ["DSOS_DB_PATH"])
+        blob_ref = store_mod.get_artifact_by_row_id(
+            diag_conn, dataset_row, load_content=False
+        ).content_ref
+        Path(blob_ref).unlink()
+
+        r = await client.call_tool("get_artifact", {"row_id": dataset_row, "session_id": s2})
+        assert r.data.get("content_error"), "missing blob must surface content_error, not crash"
+        assert "Toy Scores" in r.data["content_error"], "message must name the artifact"
+        assert "re-upload" in r.data["content_error"].lower(), "message must say how to fix it"
+        print("[ok] get_artifact on a missing blob returns a named, actionable error (feedback #4)")
+
+        r = await client.call_tool("run_sql", {
+            "code": "SELECT * FROM toy_scores",
+            "session_id": s2, "title": "Should fail",
+            "description": "Input blob was deleted above.",
+            "input_row_ids": [dataset_row],
+        })
+        assert r.data["status"] == "error", r.data
+        assert "Toy Scores" in (r.data.get("error") or ""), (
+            "run_sql against a missing-blob input must name the broken input"
+        )
+        print("[ok] run_sql against a missing-blob input names the broken input in its error")
+
     # --- verify the tool-call log middleware actually wrote rows, with no
     # explicit logging call anywhere in the test above ---
     from dsos.db import connect
