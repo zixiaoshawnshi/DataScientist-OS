@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pandas as pd
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware
 
 from dsos import execution, present, publish, seed, store, templating, update_check
@@ -96,10 +97,26 @@ class ToolCallLogger(Middleware):
     logging tool itself; this is the only place that writes to it."""
 
     async def on_call_tool(self, context, call_next):
-        result = await call_next(context)
         args = context.message.arguments or {}
+        # Reject an unknown session_id instead of logging the call against it.
+        # These ids are 32 chars of hex; a model that mistypes one previously
+        # got a silent success and the call landed in tool_calls under an id no
+        # session owns — invisible in the GUI's per-session trace and silently
+        # dropped by the reuse metric, which matches on session_id.
+        session_id = args.get("session_id")
+        if session_id and not store.session_exists(conn, session_id):
+            # ToolError, not ValueError: FastMCP surfaces this text to the
+            # caller, whereas an uncaught ValueError reaches the agent as a
+            # bare "Internal server error" and it learns nothing.
+            raise ToolError(
+                f"unknown session_id {session_id!r}. Use the exact id returned by "
+                f"start_session for this round; a call with an unrecognized id is "
+                f"rejected so it is not logged outside the session. If you lost the "
+                f"id, call start_session again with this question."
+            )
+        result = await call_next(context)
         payload = result.structured_content or {}
-        session_id = args.get("session_id") or payload.get("session_id")
+        session_id = session_id or payload.get("session_id")
         if session_id:
             store.log_tool_call(
                 conn,
@@ -123,9 +140,16 @@ def _artifact_payload(art: store.Artifact) -> dict:
 def start_session(question: str) -> dict:
     """Start a new round of work. Call this once, first, for every new
     top-level question — before searching, fetching, or running anything.
-    Reuse the returned session_id in every other tool call for this round."""
+    Reuse the returned session_id in every other tool call for this round.
+
+    The response also reports `prior_work`: what this store already holds
+    from earlier sessions, plus a few candidates that may already cover
+    this question. Read it before you fetch anything. If a candidate fits,
+    run_sql/run_python against its row_id instead of downloading and
+    cleaning the same data again — that is the whole point of the store,
+    and an agent that never looks will redo work that is already done."""
     session_id = store.start_session(conn, question)
-    return {"session_id": session_id}
+    return {"session_id": session_id, **store.prior_work_signal(conn, question)}
 
 
 @mcp.tool()
@@ -186,6 +210,7 @@ def save_artifact(
     tags: list[str] | None = None,
     source: dict | None = None,
     parent_row_ids: list[str] | None = None,
+    dedupe: bool = True,
 ) -> dict:
     """Register something as a real artifact. A dataset you fetched isn't
     real to this system — invisible to search, lineage, and reuse for every
@@ -225,6 +250,13 @@ def save_artifact(
     non-alphanumeric -> `_`) — use it directly as the table/variable name
     in your next run_sql/run_python call instead of guessing or waiting
     for a "table does not exist" error.
+
+    Registering the same content twice is collapsed: if this exact content
+    is already in the store, you get that artifact's existing row_id back
+    (with deduplicated=true) instead of a near-duplicate that would then
+    show up twice in every future search. Pass dedupe=False only when you
+    genuinely want a second copy — same data deliberately re-registered
+    under a new name or source.
     """
     if content_path:
         try:
@@ -235,6 +267,21 @@ def save_artifact(
         content = content_text
     else:
         return {"error": "must pass content_text or content_path", "artifact_row_ids": []}
+
+    if dedupe:
+        existing = store.find_by_content_hash(
+            conn, type, store._content_hash(content, content_format)
+        )
+        if existing is not None:
+            art = store.get_artifact_by_row_id(conn, existing)
+            return {
+                "row_id": existing, "table_name": store.safe_table_name(art.title),
+                "artifact_row_ids": [existing], "deduplicated": True,
+                "note": f"identical {type} already in the store as {art.title!r} "
+                        f"(row {existing}); reused it instead of registering a duplicate. "
+                        f"Search or run_sql against it directly. Pass dedupe=False to "
+                        f"register a separate copy anyway.",
+            }
 
     try:
         row_id = store.save_artifact(

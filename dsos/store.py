@@ -7,6 +7,7 @@ execution runner, GUI) is built on top of.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 import uuid
@@ -45,12 +46,20 @@ def _new_id() -> str:
 
 def safe_table_name(title: str) -> str:
     """The rule for turning an artifact title into a variable/table name:
-    lowercase, non-alphanumeric -> `_`, never empty. Lives here (not in
-    execution.py) because both run paths — in-process namespace binding and
-    the sandbox's input re-binding — must produce identical names."""
-    import re
-    name = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
-    return name or "t"
+    lowercase, non-alphanumeric -> `_`, never empty, never digit-leading.
+    Lives here (not in execution.py) because both run paths — in-process
+    namespace binding and the sandbox's input re-binding — must produce
+    identical names.
+
+    A title like "2025 headcount" would otherwise derive "2025_headcount"
+    — not a valid Python identifier (run_python's binding line is a hard
+    SyntaxError, no workaround) and an unquoted SQL identifier DuckDB
+    rejects too. Prefixing "t_" keeps the name valid in both without
+    changing anything for the common (letter-leading) case."""
+    name = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_") or "t"
+    if name[0].isdigit():
+        name = f"t_{name}"
+    return name
 
 
 @dataclass
@@ -81,6 +90,119 @@ def start_session(conn: sqlite3.Connection, question: str) -> str:
     )
     conn.commit()
     return session_id
+
+
+def session_exists(conn: sqlite3.Connection, session_id: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone() is not None
+
+
+def _content_hash(content: Any, content_format: str) -> str | None:
+    """Fingerprint of the stored content, for identifying an identical
+    re-registration. Returns None when the content can't be hashed
+    deterministically (the caller then just stores NULL).
+
+    Tabular content hashes the DataFrame's values, not its serialized
+    bytes: parquet encoding and float repr are not stable across pyarrow /
+    pandas versions, and a hash that changes on upgrade would only cause
+    missed dedupes, never a wrong merge.
+    """
+    if content is None:
+        return None
+    try:
+        if content_format == "parquet" and hasattr(content, "columns"):
+            import pandas as pd
+
+            values = pd.util.hash_pandas_object(content, index=True).values.tobytes()
+            header = repr([(str(c), str(t)) for c, t in zip(content.columns, content.dtypes)]).encode()
+            payload = header + b"\x00" + values
+        else:
+            payload = str(content).encode("utf-8", errors="replace")
+        return hashlib.sha256(payload).hexdigest()
+    except Exception:
+        return None
+
+
+def find_by_content_hash(
+    conn: sqlite3.Connection, type: str, content_hash: str | None
+) -> str | None:
+    """row_id of the earliest artifact of `type` with this exact content, or
+    None. Used by save_artifact's MCP wrapper to collapse a re-registration
+    of data already in the store into the existing row."""
+    if not content_hash:
+        return None
+    row = conn.execute(
+        """SELECT row_id FROM artifacts
+           WHERE type = ? AND content_hash = ?
+           ORDER BY created_at ASC, rowid ASC LIMIT 1""",
+        (type, content_hash),
+    ).fetchone()
+    return row["row_id"] if row else None
+
+
+# Types that don't count as "prior work" for the session-start signal.
+# Seeded skills are present in every store from first use, so counting them
+# would make a brand-new store look like it already has a history.
+_NOT_PRIOR_WORK = ("skill",)
+
+
+def prior_work_signal(conn: sqlite3.Connection, question: str, top_k: int = 3) -> dict:
+    """What this store already holds, relevant to `question`.
+
+    Returned from start_session so a fresh session knows the store is not
+    empty and that prior work may already cover the question. Without it
+    the store is invisible until the agent goes looking: in the benchmark
+    pilot it called search_artifacts zero times across ten reuse rounds
+    and re-fetched data it had already registered.
+
+    Candidate scores come from the same keyword-first/semantic-fallback
+    ranking as search_artifacts, and the fallback embedder is weak —
+    measured separation between a clearly relevant and a clearly
+    irrelevant question was 0.39 vs 0.30. So no score threshold is applied
+    and `match` is reported honestly (keyword = literal term hit,
+    semantic = embedding similarity only): a candidate is a thing to
+    check, not a claim that it fits.
+    """
+    placeholders = ",".join("?" * len(_NOT_PRIOR_WORK))
+    counts = {
+        r["type"]: r["n"]
+        for r in conn.execute(
+            f"SELECT type, COUNT(*) AS n FROM artifacts WHERE type NOT IN ({placeholders}) "
+            f"GROUP BY type",
+            _NOT_PRIOR_WORK,
+        )
+    }
+    total = sum(counts.values())
+    if not total:
+        return {
+            "prior_work": {"artifact_count": 0, "by_type": {}},
+            "candidates": [],
+            "note": "This store is empty — first session, so there is no prior work to reuse.",
+        }
+
+    candidates = []
+    for art, score in search_artifacts(conn, question, top_k=top_k * 2):
+        if art.type in _NOT_PRIOR_WORK:
+            continue
+        candidates.append({
+            "row_id": art.row_id, "type": art.type, "title": art.title,
+            "score": round(score, 3),
+            "match": "keyword" if score >= 0.999 else "semantic",
+        })
+        if len(candidates) >= top_k:
+            break
+
+    by_type = ", ".join(f"{n} {t}" for t, n in sorted(counts.items(), key=lambda kv: -kv[1]))
+    note = (
+        f"This store already holds {total} artifact(s) from earlier work ({by_type}). "
+        f"Check the candidates below before fetching or rebuilding anything — if one covers "
+        f"this question, reuse it via run_sql/run_python instead of redoing the work. "
+        f"'semantic' candidates are embedding-similarity only and may well be irrelevant; "
+        f"verify before relying on one. call search_artifacts for a fuller search."
+    )
+    return {"prior_work": {"artifact_count": total, "by_type": counts},
+            "candidates": candidates, "note": note}
 
 
 def save_artifact(
@@ -146,19 +268,20 @@ def save_artifact(
 
     row_id = _new_id()
     content_ref = _write_blob(conn, artifact_id, version, content, content_format)
+    content_hash = _content_hash(content, content_format)
     vector = embeddings.embed(f"{title}\n{description}\n{' '.join(tags)}")
 
     conn.execute(
         """
         INSERT INTO artifacts (
             row_id, artifact_id, version, type, title, description, tags,
-            content_ref, content_format, source, embedding,
+            content_ref, content_format, content_hash, source, embedding,
             created_at, session_id, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             row_id, artifact_id, version, type, title, description, json.dumps(tags),
-            content_ref, content_format, json.dumps(source) if source else None,
+            content_ref, content_format, content_hash, json.dumps(source) if source else None,
             vector.astype(np.float32).tobytes(),
             _now(), session_id, status,
         ),
@@ -183,6 +306,34 @@ def save_artifact(
             )
     conn.commit()
     return row_id
+
+
+def reembed_all(conn: sqlite3.Connection) -> int:
+    """Recompute and overwrite every artifact's embedding with whatever
+    backend dsos/embeddings.py currently resolves to. Returns the number of
+    rows updated.
+
+    Embeddings are computed once, at save_artifact time, and never touched
+    again. Installing the sentence-transformers extra on a store that
+    already has artifacts saved under the dependency-free hashing fallback
+    doesn't error — the vectors are the same DIM either way — but a
+    same-space cosine comparison between a new-model query vector and an
+    old hash-fallback artifact vector is meaningless, silently degrading
+    that artifact's semantic (not keyword — FTS never touches embeddings)
+    discoverability with no visible symptom. Run this once, right after
+    switching backends, so every existing artifact is embedded in the same
+    space the new queries will be.
+    """
+    rows = conn.execute("SELECT row_id, title, description, tags FROM artifacts").fetchall()
+    for row in rows:
+        tags = json.loads(row["tags"])
+        vector = embeddings.embed(f"{row['title']}\n{row['description']}\n{' '.join(tags)}")
+        conn.execute(
+            "UPDATE artifacts SET embedding = ? WHERE row_id = ?",
+            (vector.astype(np.float32).tobytes(), row["row_id"]),
+        )
+    conn.commit()
+    return len(rows)
 
 
 def _write_blob(
@@ -305,9 +456,24 @@ def search_artifacts(
 
     Keyword hits are given a sentinel score of 1.0 (max confidence) rather
     than a normalized bm25 score — ranking keyword above semantic matters
-    more here than ranking keyword hits amongst themselves precisely.
+    more here than ranking keyword hits amongst themselves precisely. That
+    sentinel means every keyword hit ties, so a stale "v2"/"FINAL"/archived
+    near-duplicate could tie with (or, ordered arbitrarily by bm25, even
+    rank above) the current artifact — no way for the caller to tell which
+    to trust. Newest created_at now breaks that tie, both here and among
+    genuinely-tied semantic scores below: it's not a freshness guarantee
+    (an explicitly superseded artifact could still be newer than nothing),
+    but it's a real, cheap signal that recency and "current" correlate
+    far more often than not, with no schema change required.
+
+    A run_sql/run_python call that failed still gets a real row (so its
+    row_id can carry the error/stdout/stderr back to the caller — see
+    mcp_server._execution_result_payload), but that dead, content-less
+    node has no business surfacing as a search result. Excluded here by
+    status, not filtered out at the tool layer, so every caller of
+    search_artifacts gets this for free.
     """
-    type_clause = " AND a.type = ?" if type else ""
+    type_clause = " AND a.type = ? AND a.status != 'error'" if type else " AND a.status != 'error'"
     type_params = [type] if type else []
 
     ordered: list[Artifact] = []
@@ -323,7 +489,7 @@ def search_artifacts(
                 JOIN artifacts a ON a.row_id = artifacts_fts.row_id
                 {_LATEST_VERSION_JOIN}
                 WHERE artifacts_fts MATCH ?{type_clause}
-                ORDER BY bm25(artifacts_fts)
+                ORDER BY a.created_at DESC, bm25(artifacts_fts)
                 LIMIT ?
                 """,
                 [fts_query, *type_params, top_k],
@@ -338,8 +504,8 @@ def search_artifacts(
 
     if len(ordered) < top_k:
         rows = conn.execute(
-            f"SELECT a.* FROM artifacts a {_LATEST_VERSION_JOIN}"
-            + (" WHERE a.type = ?" if type else ""),
+            f"SELECT a.* FROM artifacts a {_LATEST_VERSION_JOIN} "
+            + ("WHERE a.type = ? AND a.status != 'error'" if type else "WHERE a.status != 'error'"),
             type_params,
         ).fetchall()
         q_vec = embeddings.embed(query)
@@ -349,7 +515,7 @@ def search_artifacts(
                 continue
             vec = np.frombuffer(row["embedding"], dtype=np.float32)
             semantic.append((_row_to_artifact(row, load_content=False), embeddings.cosine_sim(q_vec, vec)))
-        semantic.sort(key=lambda pair: pair[1], reverse=True)
+        semantic.sort(key=lambda pair: (pair[1], pair[0].created_at), reverse=True)
         for art, score in semantic[: top_k - len(ordered)]:
             ordered.append(art)
             scores.append(score)
@@ -361,7 +527,13 @@ def get_lineage(
     conn: sqlite3.Connection, row_id: str, *, direction: str = "ancestors",
 ) -> list[Artifact]:
     """`direction="ancestors"` walks parents (what this was built from);
-    `direction="descendants"` walks children (what was built from this)."""
+    `direction="descendants"` walks children (what was built from this).
+
+    A failed run_sql/run_python call still gets a real, lineage-linked row
+    (see search_artifacts's docstring for why), but a dead, content-less
+    node is not a real step in anyone's lineage — excluded from the
+    returned list, though traversal still passes through it so a real
+    node chained beyond it (if any) is still reachable."""
     col_from, col_to = (
         ("child_row_id", "parent_row_id") if direction == "ancestors"
         else ("parent_row_id", "child_row_id")
@@ -380,7 +552,7 @@ def get_lineage(
                     seen.add(other)
                     next_frontier.append(other)
                     art = get_artifact_by_row_id(conn, other, load_content=False)
-                    if art:
+                    if art and art.status != "error":
                         result.append(art)
         frontier = next_frontier
     return result
