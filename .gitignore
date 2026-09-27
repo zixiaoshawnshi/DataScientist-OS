@@ -12,3 +12,6 @@ benchmark/blobs/
 benchmark/store.db
 benchmark/store.db-shm
 benchmark/store.db-wal
+
+# pi runtime state: subagent worktree handoff manifests and patches.
+.pi/
