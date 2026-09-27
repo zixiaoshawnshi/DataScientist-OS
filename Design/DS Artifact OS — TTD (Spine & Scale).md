@@ -181,6 +181,7 @@ The wave table below is a **schedule, not a claim that every cell is safe to par
 - **Remove these MCP tools:** `promote_scratch`, `list_skills`, `save_skill`, `list_templates`, `save_template`, `publish_report`. **Keep** `seed.py`, `templating.py`, `publish.py`, and the GUI report route; they are deferred, not dead.
 - **`execution.py`:**
   - Delete `_SCRATCH_CACHE` and `promote_scratch`.
+  - **One line here is load-bearing (found by B1):** `promote_scratch` rebuilds `input_row_ids` from `get_lineage`, whose order need not match the `input_row_ids` the run actually used. Left alone, the `input_tables` it reports after a promotion can attribute `in_1`/`in_2` in a different order than the code saw. The correct order is already in the scratch cache entry. Fixing it matters less than the fact that deleting `promote_scratch` removes the hazard entirely.
   - The scratch payload loses `scratch_id`.
   - `_persist_run` stays, because promotion no longer shares it.
 - **Stop seeding:** remove the `_ensure_seeded()` call.
