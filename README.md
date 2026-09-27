@@ -22,24 +22,18 @@ released version" below.
 python -m venv .venv
 .venv/Scripts/pip install -e ".[analysis]"
 
-# layer 1: exercises store + execution via direct function calls
-.venv/Scripts/python tests/smoke_test.py
+# the whole suite: every tests/*_test.py, each in its own subprocess
+.venv/Scripts/python tests/run_all.py
 
-# layer 2: exercises the MCP server over the real wire protocol
-.venv/Scripts/python tests/mcp_smoke_test.py
-
-# layer 2b: exercises publish_report over the real wire protocol
-.venv/Scripts/python tests/publish_smoke_test.py
-
-# layer 3: exercises the GUI's routes via FastAPI's TestClient
-.venv/Scripts/python tests/gui_smoke_test.py
-
-# skill library + templates (consistency layer) over the real wire protocol
-.venv/Scripts/python tests/skills_templates_smoke_test.py
-
-# update-check: mocks the network call, doesn't hit the real GitHub API
-.venv/Scripts/python tests/update_check_smoke_test.py
+# just the ones whose filename contains a substring
+.venv/Scripts/python tests/run_all.py --only lifecycle
 ```
+
+`run_all.py` prints one pass/fail line per script with its duration, then the
+full output of anything that failed, and exits 1 if any script failed — that
+is the command to run, rather than the individual scripts. Use
+`--only <substring>` to narrow it to one area while iterating; run the whole
+thing before you call a change done.
 
 See `examples/README.md` for question pairs to try against a real agent
 session once the server is wired in.
