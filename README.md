@@ -20,7 +20,7 @@ released version" below.
 
 ```sh
 python -m venv .venv
-.venv/Scripts/pip install -e .
+.venv/Scripts/pip install -e ".[analysis]"
 
 # layer 1: exercises store + execution via direct function calls
 .venv/Scripts/python tests/smoke_test.py

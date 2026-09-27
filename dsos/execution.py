@@ -11,11 +11,15 @@ The run still shows up in the session's tool-call trace (the MCP middleware
 logs every call), and the executions ledger is skipped because its
 output_row_id column is NOT NULL — there's no artifact to point at.
 
-requirements=[...] (feedback #1, Option B) runs the code in a subprocess
-sandbox instead: uv resolves the packages into a throwaway environment, and
-the result flows back through the same save/record/lineage path — see
-dsos/sandbox.py. code_paths=[...] (unpackaged local modules) works on both
-paths: sys.path injection in-process, --sys.path wiring in the wrapper.
+run_python always runs the code in a subprocess, against a configured
+`python_path` (the caller's own analysis Python by default — see
+mcp_server.py's DEFAULT_PYTHON_PATH) — never in this server's own process,
+so the server never needs the analysis stack (matplotlib/scipy/sklearn/...)
+installed at all. requirements=[...] additionally resolves packages that
+interpreter is missing via uv into a throwaway environment layered on top
+of it. Either way the result flows back through the same save/record/
+lineage path — see dsos/sandbox.py. code_paths=[...] (unpackaged local
+modules) is wired into the subprocess wrapper's sys.path.
 
 A scratch run's result is cached in-process under a scratch_id
 (_SCRATCH_CACHE); promote_scratch() persists it later through the exact
@@ -24,8 +28,8 @@ used, without re-executing anything (feedback #4, this round).
 
 A run_python `result` that's a matplotlib Figure/Axes (the natural shape of
 a chart cell) is rendered to PNG bytes automatically (feedback #2, this
-round) — see _coerce_chart_result and sandbox.py's wrapper-template
-equivalent for the subprocess path.
+round) — see sandbox.py's wrapper template, which is the only place this
+runs now.
 """
 
 from __future__ import annotations
@@ -33,30 +37,14 @@ from __future__ import annotations
 import contextlib
 import io
 import sqlite3
-import sys
 import traceback
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 import duckdb
 import pandas as pd
-
-try:
-    # Force the non-interactive Agg backend before any run_python code gets
-    # a chance to `import matplotlib.pyplot` and pick the platform default
-    # (e.g. TkAgg) instead. That default assumes a single GUI main-loop
-    # thread; FastMCP runs tools in a thread pool, so a Tk-backed Figure
-    # created off the main thread throws on GC ("main thread is not in main
-    # loop") — a real failure mode this round's chart auto-render surfaced,
-    # not just cosmetic noise. Agg is also what feedback #2's coercion needs
-    # anyway: headless PNG rendering, no display.
-    import matplotlib
-    matplotlib.use("Agg", force=True)
-except ImportError:
-    pass
 
 from dsos import templating
 from dsos.store import Artifact, get_artifact_by_row_id, safe_table_name, save_artifact
@@ -84,53 +72,6 @@ def _output_summary(result: Any) -> dict:
     if isinstance(result, (list, dict)):
         return {"len": len(result)}
     return {}
-
-
-def _installed_packages() -> list[str]:
-    """Names of every distribution in this sandbox — the ImportError hint's
-    payload (feedback #7), so the agent stops guessing and re-probing."""
-    from importlib.metadata import distributions
-
-    names = sorted({
-        (d.metadata["Name"] or "").lower() for d in distributions() if d.metadata["Name"]
-    })
-    return names
-
-
-def _missing_package_hint() -> str:
-    packages = _installed_packages()
-    shown = ", ".join(packages[:80]) + (", ..." if len(packages) > 80 else "")
-    return (
-        f"Package not installed in this sandbox. Available here: {shown}. "
-        "For anything missing, pass requirements=[...] to run_python (uv "
-        "resolves it in a throwaway environment), or compute it with your "
-        "own tools (bash) and register the result via save_artifact."
-    )
-
-
-def _coerce_chart_result(result: Any) -> Any:
-    """A run_python chart cell naturally ends with `plt.gcf()` or the Figure/
-    Axes that `plt.subplots()` returns, assigned as `result` — but only raw
-    png bytes were ever treated as chart content, so that object landed in
-    storage stringified as "Figure(1400x800)" instead of rendering (feedback
-    #2). Render it to PNG bytes here instead, so a natural chart cell just
-    works without the agent having to know to call fig.savefig() itself."""
-    try:
-        from matplotlib.axes import Axes
-        from matplotlib.figure import Figure
-    except ImportError:
-        return result
-    if isinstance(result, Axes):
-        fig = result.get_figure()
-    elif isinstance(result, Figure):
-        fig = result
-    else:
-        return result
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight")
-    import matplotlib.pyplot as plt
-    plt.close(fig)
-    return buf.getvalue()
 
 
 def _schema_hint(inputs: list) -> str:
@@ -311,78 +252,27 @@ def run_sql(
     )
 
 
-def _run_python_inprocess(
-    *, code: str, inputs: list, code_paths: list[str] | None, chart_style: str | None = None,
-) -> dict:
-    """The default fast path: exec in this process. Same run-dict shape as
-    the sandbox path, so everything downstream is identical.
-
-    chart_style: an already-RESOLVED style path (templating.resolve_chart_style
-    runs in run_python so both paths get one resolved value). Applied to
-    rcParams before the user code — a run_python chart cell gets consistent
-    styling without calling plt.style.use itself. Style=None still RESETS
-    rcParams: every run must start from a known state, or the previous run's
-    style leaks into this one (see templating.reset_chart_style)."""
-    stdout, stderr = io.StringIO(), io.StringIO()
-    namespace: dict[str, Any] = {"pd": pd}
-    for art in inputs:
-        namespace[safe_table_name(art.title)] = art.content
-
-    added_paths: list[str] = []
-    try:
-        # Before exec, so user code sees (and may override) the style —
-        # style is a default, not a cage.
-        if chart_style:
-            templating.apply_chart_style(chart_style)
-        else:
-            templating.reset_chart_style()
-        if code_paths:
-            # Temporary sys.path additions, always restored — the server's
-            # process must not leak one run's import paths into the next.
-            for p in code_paths:
-                if not Path(p).is_dir():
-                    raise ValueError(f"code_path {p!r} is not a directory")
-                sys.path.insert(0, p)
-                added_paths.append(p)
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            exec(code, namespace)  # noqa: S102 — intentional: this is the product
-        if "result" not in namespace:
-            raise ValueError("run_python code must assign a `result` variable")
-        status, error, result = "ok", None, namespace["result"]
-    except ImportError as exc:
-        # Feedback #7: a missing package used to cost a full guess-and-fail
-        # cycle. Name what *is* available instead — and how to get more.
-        status, error = "error", f"{type(exc).__name__}: {exc}. {_missing_package_hint()}"
-        stderr.write(traceback.format_exc())
-        result = pd.DataFrame()
-    except Exception as exc:
-        # `error` is the concise, agent-facing message; the full traceback is
-        # appended to stderr, same as a real unhandled exception would do.
-        status, error = "error", f"{type(exc).__name__}: {exc}"
-        stderr.write(traceback.format_exc())
-        result = pd.DataFrame()
-    finally:
-        for p in added_paths:
-            sys.path.remove(p)
-    return {"status": status, "error": error, "stdout": stdout.getvalue(),
-            "stderr": stderr.getvalue(), "result": result}
-
-
 def run_python(
     conn: sqlite3.Connection, *, code: str, session_id: str, title: str, description: str,
-    input_row_ids: list[str], output_type: str = "transform", output_format: str = "parquet",
-    scratch: bool = False, requirements: list[str] | None = None,
-    code_paths: list[str] | None = None, style: str | None = "dsos",
+    input_row_ids: list[str], python_path: str, output_type: str = "transform",
+    output_format: str = "parquet", scratch: bool = False,
+    requirements: list[str] | None = None, code_paths: list[str] | None = None,
+    style: str | None = "dsos",
 ) -> str | dict:
-    """Runs `code` with each input artifact bound to a variable named after
-    its title (lowercased, non-alnum -> `_`), plus `pd`. The code must set a
-    variable named `result`; that becomes the new artifact's content — unless
-    scratch=True, in which case the payload comes back inline and nothing is
-    persisted.
+    """Runs `code` in a subprocess against `python_path`, with each input
+    artifact bound to a variable named after its title (lowercased,
+    non-alnum -> `_`), plus `pd`. The code must set a variable named
+    `result`; that becomes the new artifact's content — unless scratch=True,
+    in which case the payload comes back inline and nothing is persisted.
 
-    With `requirements` (non-empty), the code instead runs in a uv-resolved
-    throwaway subprocess environment; the result flows back through the same
-    save/record/lineage path.
+    `python_path`: the already-resolved interpreter for this call (the
+    caller — mcp_server.py — applies the `python_path or
+    DEFAULT_PYTHON_PATH` fallback; this function never reads env vars).
+
+    With `requirements` (non-empty), uv additionally resolves those packages
+    on top of `python_path` into a throwaway environment for this run.
+    Either way the result flows back through the same save/record/lineage
+    path — see dsos/sandbox.py.
 
     `style` (the consistency layer — dsos/templating.py): the chart style
     applied to rcParams before the code runs. "dsos" is the dark house
@@ -397,25 +287,18 @@ def run_python(
     try:
         _check_inputs(inputs)
         chart_style = templating.resolve_chart_style(conn, style)
-        if requirements:
-            from dsos import sandbox
-            run = sandbox.run_subprocess(
-                code=code, requirements=list(requirements),
-                code_paths=code_paths, inputs=inputs, chart_style=chart_style,
-            )
-        else:
-            run = _run_python_inprocess(
-                code=code, inputs=inputs, code_paths=code_paths, chart_style=chart_style,
-            )
+        from dsos import sandbox
+        run = sandbox.run_subprocess(
+            code=code, requirements=list(requirements or []),
+            code_paths=code_paths, inputs=inputs, chart_style=chart_style,
+            python_path=python_path,
+        )
     except Exception as exc:
         # dsos-side failures around the run (missing-blob inputs, bad
         # code_paths, a bad style reference, sandbox plumbing) — user-code
         # failures are already captured inside the run dicts above.
         run = {"status": "error", "error": f"{type(exc).__name__}: {exc}",
                "stdout": "", "stderr": traceback.format_exc(), "result": pd.DataFrame()}
-
-    if run["status"] == "ok":
-        run["result"] = _coerce_chart_result(run["result"])
 
     if scratch:
         return _scratch_payload(run, inputs, kind="python", code=code, title=title,

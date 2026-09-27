@@ -116,7 +116,8 @@ async def main() -> None:
             "description": "Scratch run probing the default chart style.", "input_row_ids": [],
             "scratch": True,
         })
-        assert r.data["content"] is False, r.data  # house style: top spine off
+        # the sandbox round-trips a bare bool through result.txt as str
+        assert r.data["content"] == "False", r.data  # house style: top spine off
         r = await client.call_tool("run_python", {
             "code": "import matplotlib.pyplot as plt; result = plt.rcParams['figure.facecolor']",
             "session_id": s1, "title": "Scratch dark bg probe",
@@ -132,7 +133,7 @@ async def main() -> None:
             "description": "Scratch run proving style=None resets rcParams.", "input_row_ids": [],
             "scratch": True, "style": None,
         })
-        assert r.data["content"] is True, r.data  # raw matplotlib: top spine back
+        assert r.data["content"] == "True", r.data  # raw matplotlib: top spine back
         print("[ok] style=None resets to raw defaults — no leakage from the previous styled run")
 
         r = await client.call_tool("run_python", {
@@ -169,7 +170,7 @@ async def main() -> None:
                 "description": "Scratch run applying the custom chart style.",
                 "input_row_ids": [], "scratch": True, "style": ref,
             })
-            assert r.data["content"] == 9.0, (ref, r.data)
+            assert r.data["content"] == "9.0", (ref, r.data)
         print("[ok] custom chart style applies by artifact_id AND by row_id")
 
         r = await client.call_tool("save_template", {

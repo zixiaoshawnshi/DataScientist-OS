@@ -127,10 +127,11 @@ How to run statistics so every number is an addressable artifact.
 1. **State the comparison before computing** — which groups or values,
    answering what question. It goes in the artifact title so a later
    session knows what the numbers are about without re-deriving it.
-2. **Compute with run_python.** scipy and statsmodels are installed; the
-   result is returned inline. Never assert a statistic from memory or
-   from a preview — if it isn't computed against a row_id, it isn't a
-   number.
+2. **Compute with run_python.** Your code runs in your own local Python —
+   whatever's already installed there (scipy, statsmodels, ...) is
+   available; use requirements=[...] for anything missing. The result is
+   returned inline. Never assert a statistic from memory or from a
+   preview — if it isn't computed against a row_id, it isn't a number.
 3. **Persist the test output as a table artifact**: statistic, p-value,
    effect size, n per group — with the test named in the title, so a later
    session can tell which test produced which numbers.

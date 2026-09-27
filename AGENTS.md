@@ -48,16 +48,44 @@ to `data/store.db` relative to whatever directory the process happens to
 launch from, which silently creates a fresh empty store in the wrong place
 the moment the agent is invoked from a different cwd.
 
-## 3. Register the MCP server
+## 3. Pick a default analysis Python
+
+`run_python` never execs code inside the MCP server itself — every call
+runs in a subprocess against a configured interpreter, `DSOS_PYTHON_PATH`.
+This is a *default only*: an individual `run_python` call can still
+override it per-call via `python_path=` (e.g. to target a specific repo's
+own venv), so don't over-think getting this exactly right.
+
+Resolve or ask the user for the Python they already do analysis in — the
+one with pandas/matplotlib/etc. already installed: `which python` /
+`where python`, their usual conda env, or whatever they name. Unlike the
+server's own interpreter above (must be the venv's, never a bare
+`python`/`python3` off `PATH`), `DSOS_PYTHON_PATH` is deliberately whatever
+full-featured Python the user already has — reusing it is the point, so
+most `run_python` calls need no extra setup at all. It needs at least
+pandas and pyarrow; if it's missing something a particular call needs, the
+agent can pass `requirements=[...]` on that call to fill the gap via `uv`
+rather than reinstalling globally.
+
+If the user has no such interpreter to point at (or wants full isolation
+instead of reusing one), fall back to today's approach: install the
+analysis stack into the dedicated venv from step 1 —
+`.dsos-venv/Scripts/pip install "dsos[analysis] @ git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"`
+(or `.venv/Scripts/pip install -e ".[analysis]"` for the editable-install
+case) — and point `DSOS_PYTHON_PATH` at that same venv's interpreter.
+
+## 4. Register the MCP server
 
 Find the python executable from step 1 first (the venv's, not a system
-one) — call it `<python>` below, and the chosen path from step 2 `<db>`.
+one) — call it `<python>` below, the chosen path from step 2 `<db>`, and
+the interpreter from step 3 `<analysis-python>`.
 
 **Claude Code:**
 
 ```sh
 claude mcp add dsos -s user \
   -e DSOS_DB_PATH="<db>" \
+  -e DSOS_PYTHON_PATH="<analysis-python>" \
   -- "<python>" -m dsos.mcp_server
 ```
 
@@ -70,7 +98,7 @@ claude mcp add dsos -s user \
     "dsos": {
       "command": "<python>",
       "args": ["-m", "dsos.mcp_server"],
-      "env": { "DSOS_DB_PATH": "<db>" }
+      "env": { "DSOS_DB_PATH": "<db>", "DSOS_PYTHON_PATH": "<analysis-python>" }
     }
   }
 }
@@ -80,7 +108,7 @@ claude mcp add dsos -s user \
 same `command` / `args` / `env` shape applies — adapt to that client's own
 config file location and schema.
 
-## 4. Verify
+## 5. Verify
 
 Restart/reconnect the agent, then confirm the server is live by calling
 one read-only tool, e.g. `list_skills` or `list_templates`. Both should
@@ -98,3 +126,10 @@ first use).
 - This project has no CLI and no HTTP API beyond the read-only GUI
   (`python -m dsos.gui`, see README) — MCP tool calls are the only way to
   read or write artifacts.
+- Use an **absolute path** for `DSOS_PYTHON_PATH` too, same reasoning as
+  `DSOS_DB_PATH` — relative resolves against the server's launch cwd, not
+  the caller's.
+- `run_python` code executes with whatever ambient permissions the
+  `DSOS_PYTHON_PATH` environment has (e.g. cloud credentials configured in
+  one venv but not another) — worth a beat of thought when picking it,
+  same as any other "run arbitrary code" tool.

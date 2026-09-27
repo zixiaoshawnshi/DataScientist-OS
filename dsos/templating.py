@@ -109,7 +109,11 @@ def resolve_chart_style(conn: sqlite3.Connection, style: str | None) -> str | No
                 f"style {style!r} is a {template_kind(art) or 'template'} template, "
                 f"not a chart-style one"
             )
-        return art.content_ref
+        # Absolute: this path gets handed to a subprocess whose cwd is a
+        # throwaway tempdir, not wherever the server started from — a
+        # relative content_ref (DSOS_DB_PATH unset/relative) would silently
+        # resolve against the wrong directory there.
+        return str(Path(art.content_ref).resolve())
 
     raise ValueError(
         f"unknown chart style {style!r}. Built-ins: "
@@ -156,39 +160,6 @@ def resolve_report_template(conn: sqlite3.Connection, template: str) -> str:
 # ------------------------------------------------------------------ applying
 
 
-def apply_chart_style(style_path: str) -> None:
-    """Make this style THE rcParams for the rest of this process — rcdefaults
-    first so a previous run's style can't leak params a new partial style
-    doesn't set, then re-force Agg after (rcdefaults resets the backend
-    rcParam, and every backend but Agg assumes a GUI main-loop thread this
-    server doesn't have). Silently a no-op when matplotlib isn't installed —
-    style is a chart concern, and non-chart runs must not crash on it."""
-    try:
-        import matplotlib
-        import matplotlib.pyplot as plt
-    except ImportError:
-        return
-    plt.rcdefaults()
-    plt.style.use(style_path)
-    matplotlib.use("Agg", force=True)
-
-
-def reset_chart_style() -> None:
-    """Back to raw matplotlib defaults — the style=None path. Runs even when
-    the previous run also had no style, because determinism requires every
-    run to start from a known rcParams state: without this, a previous styled
-    run's rcParams would leak into the next unstyled one in this long-lived
-    server process (rcdefaults also resets the backend rcParam, so re-force
-    Agg after)."""
-    try:
-        import matplotlib
-        import matplotlib.pyplot as plt
-    except ImportError:
-        return
-    plt.rcdefaults()
-    matplotlib.use("Agg", force=True)
-
-
 def base_template_content(conn: sqlite3.Connection, kind: str, base: str) -> str:
     """The text of an existing template — a built-in name or a custom
     template's row_id/artifact_id — for save_template's base= parameter:
@@ -201,10 +172,11 @@ def base_template_content(conn: sqlite3.Connection, kind: str, base: str) -> str
 
 
 def sandbox_style_block(style_path: str | None) -> str:
-    """The wrapper lines that apply a chart style inside a sandboxed
-    run_python subprocess — same order as apply_chart_style (rcdefaults,
-    style, re-force Agg), written to run where matplotlib gets imported
-    fresh. Empty when the run asked for no style."""
+    """The wrapper lines that apply a chart style inside the run_python
+    subprocess: rcdefaults (so a previous style can't leak in), style, then
+    re-force Agg (rcdefaults resets the backend rcParam too, and every
+    other backend assumes a GUI main-loop thread this subprocess doesn't
+    have). Empty when the run asked for no style."""
     if not style_path:
         return ""
     return (
@@ -222,13 +194,48 @@ def sandbox_style_block(style_path: str | None) -> str:
 # ---------------------------------------------------------------- validation
 
 
-def validate_chart_style_text(content: str) -> None:
+# Run inside `python_path` (never this server process — the server no
+# longer requires matplotlib at all). Mirrors the old in-process check:
+# mpl's rc parser WARN-and-skips lines with no colon and silently drops
+# unknown keys, so arbitrary prose "parses" to an empty config instead of
+# raising — an empty config means this wasn't a style at all, which is
+# exactly the save-time failure to catch.
+_VALIDATE_STYLE_SCRIPT = """\
+import sys
+try:
+    import matplotlib
+except ImportError:
+    print("DSOS_NO_MATPLOTLIB", file=sys.stderr)
+    sys.exit(1)
+try:
+    rc = matplotlib.rc_params_from_file(sys.argv[1], fail_on_error=True, use_default_template=False)
+except Exception as exc:
+    print(f"DSOS_PARSE_ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+    sys.exit(1)
+if not rc:
+    print("DSOS_EMPTY_RCPARAMS", file=sys.stderr)
+    sys.exit(1)
+"""
+
+
+def validate_chart_style_text(content: str, python_path: str) -> None:
     """A custom chart-style template must parse as matplotlib rcParams —
     checked at save_template time (fail fast, one call), not first use
     (which would surface as a confusing mid-chart error two rounds later).
-    Uses matplotlib's own parser via a temp file so the accepted syntax is
-    exactly what plt.style.use will later accept."""
-    import matplotlib
+    Runs matplotlib's own parser inside `python_path` (validated against
+    DEFAULT_PYTHON_PATH by mcp_server.py — save_template has no run_python-
+    style per-call override) so the accepted syntax is exactly what
+    plt.style.use will later accept for a run_python call against that same
+    interpreter."""
+    from dsos.sandbox import run_interpreter
+
+    if not Path(python_path).is_absolute():
+        raise ValueError(
+            f"python_path {python_path!r} must be an absolute path — a relative "
+            "one resolves against this server's launch cwd, not the caller's"
+        )
+    if not Path(python_path).is_file():
+        raise ValueError(f"python_path {python_path!r} is not a file")
 
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".mplstyle", delete=False, encoding="utf-8"
@@ -236,32 +243,29 @@ def validate_chart_style_text(content: str) -> None:
         f.write(content)
         path = f.name
     try:
-        _validate_rc_file(path)
+        proc = run_interpreter(python_path, ["-c", _VALIDATE_STYLE_SCRIPT, path], timeout=30)
     finally:
         Path(path).unlink(missing_ok=True)  # delete=False keeps it alive while open
 
-
-def _validate_rc_file(path: str) -> None:
-    import matplotlib
-
-    try:
-        rc = matplotlib.rc_params_from_file(path, fail_on_error=True, use_default_template=False)
-        # mpl's rc parser WARN-and-skips lines with no colon and silently
-        # drops unknown keys — so arbitrary prose "parses" to an empty
-        # config instead of raising. An empty config means this wasn't a
-        # style at all, which is exactly the save-time failure to catch.
-        if not rc:
-            raise ValueError(
-                "chart-style template contains no valid rcParams lines — expected "
-                "'key: value' lines like 'axes.grid: True' (see the built-ins via "
-                "save_template(base='dsos'))"
-            )
-    except ValueError:
-        raise
-    except Exception as exc:  # mpl raises a wide variety here; any failure = invalid style
+    if proc.returncode == 0:
+        return
+    stderr = proc.stderr or ""
+    if "DSOS_NO_MATPLOTLIB" in stderr:
         raise ValueError(
-            f"chart-style template does not parse as matplotlib rcParams: {exc}"
-        ) from exc
+            f"chart-style validation needs matplotlib installed in {python_path!r} "
+            "(the default run_python interpreter) — install it there, or point "
+            "DSOS_PYTHON_PATH at an interpreter that has it"
+        )
+    if "DSOS_EMPTY_RCPARAMS" in stderr:
+        raise ValueError(
+            "chart-style template contains no valid rcParams lines — expected "
+            "'key: value' lines like 'axes.grid: True' (see the built-ins via "
+            "save_template(base='dsos'))"
+        )
+    raise ValueError(
+        f"chart-style template does not parse as matplotlib rcParams: "
+        f"{stderr.strip() or f'exit code {proc.returncode}'}"
+    )
 
 
 def validate_report_template_text(content: str) -> None:
