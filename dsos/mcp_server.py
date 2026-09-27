@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _installed_version
 from pathlib import Path
 
 import pandas as pd
@@ -78,7 +80,14 @@ for get_artifact/run_sql/run_python's input_row_ids; there is no separate \
 "artifact_id" to track.
 """
 
-mcp = FastMCP("DS Artifact OS", instructions=INSTRUCTIONS)
+# Reported to the client in the MCP initialize handshake's serverInfo
+# (protocol-standard field; clients read it via getServerVersion()).
+try:
+    _VERSION = _installed_version("dsos")
+except PackageNotFoundError:
+    _VERSION = "0.0.0"  # dev/local fallback
+
+mcp = FastMCP("DS Artifact OS", instructions=INSTRUCTIONS, version=_VERSION)
 
 
 class ToolCallLogger(Middleware):

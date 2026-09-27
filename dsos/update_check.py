@@ -20,7 +20,8 @@ import json
 import tempfile
 import time
 import urllib.request
-from importlib.metadata import Distribution, PackageNotFoundError
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import distributions
 from importlib.metadata import version as _installed_version
 from pathlib import Path
 
@@ -69,11 +70,27 @@ def _cached_latest_tag() -> str | None:
 
 
 def _is_editable_install() -> bool:
+    """True if any *visible* dsos distribution is an editable install.
+
+    More than one can be visible at once: launched with cwd = a source
+    checkout, the checkout's in-tree .egg-info (which has no
+    direct_url.json) shadows the venv's dist-info (which has it), so
+    Distribution.from_name's first match can miss the real answer.
+    Check every dsos distribution instead.
+    """
     try:
-        text = Distribution.from_name("dsos").read_text("direct_url.json")
-        return bool(text and json.loads(text).get("dir_info", {}).get("editable"))
+        for dist in distributions():
+            if (dist.metadata.get("Name") or "").lower() != "dsos":
+                continue
+            try:
+                text = dist.read_text("direct_url.json")
+                if text and json.loads(text).get("dir_info", {}).get("editable"):
+                    return True
+            except Exception:
+                continue  # corrupt direct_url.json on one dist — keep looking
     except Exception:
-        return False
+        pass
+    return False
 
 
 def check_for_update() -> str | None:
