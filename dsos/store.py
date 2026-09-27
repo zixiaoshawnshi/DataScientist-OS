@@ -308,6 +308,34 @@ def save_artifact(
     return row_id
 
 
+def reembed_all(conn: sqlite3.Connection) -> int:
+    """Recompute and overwrite every artifact's embedding with whatever
+    backend dsos/embeddings.py currently resolves to. Returns the number of
+    rows updated.
+
+    Embeddings are computed once, at save_artifact time, and never touched
+    again. Installing the sentence-transformers extra on a store that
+    already has artifacts saved under the dependency-free hashing fallback
+    doesn't error — the vectors are the same DIM either way — but a
+    same-space cosine comparison between a new-model query vector and an
+    old hash-fallback artifact vector is meaningless, silently degrading
+    that artifact's semantic (not keyword — FTS never touches embeddings)
+    discoverability with no visible symptom. Run this once, right after
+    switching backends, so every existing artifact is embedded in the same
+    space the new queries will be.
+    """
+    rows = conn.execute("SELECT row_id, title, description, tags FROM artifacts").fetchall()
+    for row in rows:
+        tags = json.loads(row["tags"])
+        vector = embeddings.embed(f"{row['title']}\n{row['description']}\n{' '.join(tags)}")
+        conn.execute(
+            "UPDATE artifacts SET embedding = ? WHERE row_id = ?",
+            (vector.astype(np.float32).tobytes(), row["row_id"]),
+        )
+    conn.commit()
+    return len(rows)
+
+
 def _write_blob(
     conn: sqlite3.Connection, artifact_id: str, version: int, content: Any, content_format: str
 ) -> str:
@@ -428,7 +456,15 @@ def search_artifacts(
 
     Keyword hits are given a sentinel score of 1.0 (max confidence) rather
     than a normalized bm25 score — ranking keyword above semantic matters
-    more here than ranking keyword hits amongst themselves precisely.
+    more here than ranking keyword hits amongst themselves precisely. That
+    sentinel means every keyword hit ties, so a stale "v2"/"FINAL"/archived
+    near-duplicate could tie with (or, ordered arbitrarily by bm25, even
+    rank above) the current artifact — no way for the caller to tell which
+    to trust. Newest created_at now breaks that tie, both here and among
+    genuinely-tied semantic scores below: it's not a freshness guarantee
+    (an explicitly superseded artifact could still be newer than nothing),
+    but it's a real, cheap signal that recency and "current" correlate
+    far more often than not, with no schema change required.
 
     A run_sql/run_python call that failed still gets a real row (so its
     row_id can carry the error/stdout/stderr back to the caller — see
@@ -453,7 +489,7 @@ def search_artifacts(
                 JOIN artifacts a ON a.row_id = artifacts_fts.row_id
                 {_LATEST_VERSION_JOIN}
                 WHERE artifacts_fts MATCH ?{type_clause}
-                ORDER BY bm25(artifacts_fts)
+                ORDER BY a.created_at DESC, bm25(artifacts_fts)
                 LIMIT ?
                 """,
                 [fts_query, *type_params, top_k],
@@ -479,7 +515,7 @@ def search_artifacts(
                 continue
             vec = np.frombuffer(row["embedding"], dtype=np.float32)
             semantic.append((_row_to_artifact(row, load_content=False), embeddings.cosine_sim(q_vec, vec)))
-        semantic.sort(key=lambda pair: pair[1], reverse=True)
+        semantic.sort(key=lambda pair: (pair[1], pair[0].created_at), reverse=True)
         for art, score in semantic[: top_k - len(ordered)]:
             ordered.append(art)
             scores.append(score)
