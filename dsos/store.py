@@ -46,12 +46,20 @@ def _new_id() -> str:
 
 def safe_table_name(title: str) -> str:
     """The rule for turning an artifact title into a variable/table name:
-    lowercase, non-alphanumeric -> `_`, never empty. Lives here (not in
-    execution.py) because both run paths — in-process namespace binding and
-    the sandbox's input re-binding — must produce identical names."""
-    import re
-    name = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
-    return name or "t"
+    lowercase, non-alphanumeric -> `_`, never empty, never digit-leading.
+    Lives here (not in execution.py) because both run paths — in-process
+    namespace binding and the sandbox's input re-binding — must produce
+    identical names.
+
+    A title like "2025 headcount" would otherwise derive "2025_headcount"
+    — not a valid Python identifier (run_python's binding line is a hard
+    SyntaxError, no workaround) and an unquoted SQL identifier DuckDB
+    rejects too. Prefixing "t_" keeps the name valid in both without
+    changing anything for the common (letter-leading) case."""
+    name = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_") or "t"
+    if name[0].isdigit():
+        name = f"t_{name}"
+    return name
 
 
 @dataclass
@@ -421,8 +429,15 @@ def search_artifacts(
     Keyword hits are given a sentinel score of 1.0 (max confidence) rather
     than a normalized bm25 score — ranking keyword above semantic matters
     more here than ranking keyword hits amongst themselves precisely.
+
+    A run_sql/run_python call that failed still gets a real row (so its
+    row_id can carry the error/stdout/stderr back to the caller — see
+    mcp_server._execution_result_payload), but that dead, content-less
+    node has no business surfacing as a search result. Excluded here by
+    status, not filtered out at the tool layer, so every caller of
+    search_artifacts gets this for free.
     """
-    type_clause = " AND a.type = ?" if type else ""
+    type_clause = " AND a.type = ? AND a.status != 'error'" if type else " AND a.status != 'error'"
     type_params = [type] if type else []
 
     ordered: list[Artifact] = []
@@ -453,8 +468,8 @@ def search_artifacts(
 
     if len(ordered) < top_k:
         rows = conn.execute(
-            f"SELECT a.* FROM artifacts a {_LATEST_VERSION_JOIN}"
-            + (" WHERE a.type = ?" if type else ""),
+            f"SELECT a.* FROM artifacts a {_LATEST_VERSION_JOIN} "
+            + ("WHERE a.type = ? AND a.status != 'error'" if type else "WHERE a.status != 'error'"),
             type_params,
         ).fetchall()
         q_vec = embeddings.embed(query)
@@ -476,7 +491,13 @@ def get_lineage(
     conn: sqlite3.Connection, row_id: str, *, direction: str = "ancestors",
 ) -> list[Artifact]:
     """`direction="ancestors"` walks parents (what this was built from);
-    `direction="descendants"` walks children (what was built from this)."""
+    `direction="descendants"` walks children (what was built from this).
+
+    A failed run_sql/run_python call still gets a real, lineage-linked row
+    (see search_artifacts's docstring for why), but a dead, content-less
+    node is not a real step in anyone's lineage — excluded from the
+    returned list, though traversal still passes through it so a real
+    node chained beyond it (if any) is still reachable."""
     col_from, col_to = (
         ("child_row_id", "parent_row_id") if direction == "ancestors"
         else ("parent_row_id", "child_row_id")
@@ -495,7 +516,7 @@ def get_lineage(
                     seen.add(other)
                     next_frontier.append(other)
                     art = get_artifact_by_row_id(conn, other, load_content=False)
-                    if art:
+                    if art and art.status != "error":
                         result.append(art)
         frontier = next_frontier
     return result
