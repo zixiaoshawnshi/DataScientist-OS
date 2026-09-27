@@ -1,0 +1,29 @@
+{
+  "_comment": "Arm registry shared by runner.mjs (which conditions exist, what the workspace holds) and metrics.py/report.py (how an arm is scored). Add an arm here rather than hardcoding a condition name in either side; `order` fixes its column in the three-way table.",
+  "arms": {
+    "file": {
+      "label": "files",
+      "order": 1,
+      "scored_from": "transcript",
+      "raw_csv_policy": "keep",
+      "manifest": false,
+      "tools": "builtin"
+    },
+    "file_manifest": {
+      "label": "files + MANIFEST.md",
+      "order": 2,
+      "scored_from": "transcript",
+      "raw_csv_policy": "remove_after_r1",
+      "manifest": true,
+      "tools": "builtin"
+    },
+    "dsos": {
+      "label": "dsos store",
+      "order": 3,
+      "scored_from": "store",
+      "raw_csv_policy": "remove_after_r1",
+      "manifest": false,
+      "tools": "builtin+dsos"
+    }
+  }
+}

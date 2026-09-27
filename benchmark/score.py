@@ -10,6 +10,7 @@ Answers file format (JSON, one entry per round run):
     {
       "<table>::R<round>": {
         "answer_text": "The mean fare was @mean_fare[34.66].",
+        "answer_text_tagged": "...same, when the turn ended with a summary...",
         "tokens_in": 52310,        # optional
         "tokens_out": 3120,        # optional
         "duration_s": 184,        # optional
@@ -100,7 +101,14 @@ def match(got: str, expected: str, abs_tol: float, rel_tol: float) -> bool:
 
 
 def score_round(rec: dict, gold: dict, abs_tol: float, rel_tol: float) -> dict:
-    tags = extract_tags(rec.get("answer_text", ""))
+    # answer_text is whatever the agent said last; answer_text_tagged is the
+    # last thing it said that carried the tags (the runner records both). A
+    # turn that ends with a closing summary after already stating its answer
+    # would otherwise be scored as "missing" — a property of the harness's
+    # choice of message, not of the arm. Older answer files have only the
+    # former, so they score exactly as before.
+    text = rec.get("answer_text_tagged") or rec.get("answer_text", "")
+    tags = extract_tags(text)
     gk = gold_keys(gold)
     details = {}
     for key, expected in gk.items():
@@ -144,7 +152,9 @@ def score_condition(answers_path: pathlib.Path, index: dict,
         results[key] = details
 
     by_round = {}
-    for r in (1, 2, 3):
+    # Rounds come from the answers, not a fixed 1..3: the depth chains run to
+    # R6, and a summary that stops at R3 hides the reuse-heavy tail of a chain.
+    for r in sorted({int(k.rsplit("R", 1)[1]) for k in results}):
         rows = [d for k, d in results.items() if k.endswith(f"R{r}")]
         if rows:
             by_round[f"R{r}"] = {

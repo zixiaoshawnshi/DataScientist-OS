@@ -1,14 +1,21 @@
-"""Aggregate the pilot results into one comparison report.
+"""Aggregate the benchmark results into one comparison report.
 
 Reads:
   results/answers_<cond>.json   (per-round answer + efficiency fields)
   results/scores.json           (from score.py, per-question pass/fail)
-  results/transcripts/<cond>/   (tool-call JSONL for the file condition)
-  store.db                      (dsos condition, via metrics.py's queries)
+  results/runs_<cond>.json      (the runner's per-round index: pairs a round
+                                 with its store session for the dsos arm)
+  results/transcripts/<cond>/   (tool-call JSONL, file arms)
+  results/manifests/<cond>/     (MANIFEST.md as each manifest-arm round left it)
+  store.db                      (dsos arm, via metrics.py's queries)
 
-Writes results/report.md + results/report.json: per-round and per-table
-comparisons of accuracy, tokens, tool calls, duration, and the reuse
-metrics (findability, raw-data touches, cross-session reuse).
+Writes results/report.json + results/report.md: per-round, per-table and
+three-way comparisons of accuracy, tokens, tool calls, duration, and the
+reuse metrics (findability, re-fetch, cross-round reuse, manifest use).
+
+Arms come from benchmark/arms.json, so a new condition is one registry
+entry and a run label like `chain_file_manifest` resolves to its arm
+rather than to whichever arm its name happens to contain.
 
 Usage: python report.py
 """
@@ -18,15 +25,27 @@ import pathlib
 import re
 import sqlite3
 import statistics
+import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 RESULTS = HERE / "results"
-# Arms are discovered from results/answers_*.json so a new experiment (e.g.
-# the depth chains under a --label) needs no code change here. The example
-# template ships as answers.example.json (dot, not underscore) and must not
-# be mistaken for an arm.
-CONDITIONS = sorted(p.stem[len("answers_"):] for p in RESULTS.glob("answers_*.json")
-                    if "example" not in p.stem)
+sys.path.insert(0, str(HERE))
+from metrics import (MANIFEST_NAME, REMOTE_FETCH_RE, arm_of, arm_spec,  # noqa: E402
+                     is_file_arm, load_arms, manifest_metrics, uses_manifest)
+
+
+def discover_conditions():
+    """Every run label with answers, in registry order.
+
+    Discovered rather than hardcoded so a new experiment (a --label, or a
+    new arm) needs no code change here. The example template ships as
+    answers.example.json (dot, not underscore) and must not be mistaken
+    for an arm.
+    """
+    found = {p.stem[len("answers_"):] for p in RESULTS.glob("answers_*.json")
+             if "example" not in p.stem}
+    return sorted(found, key=lambda c: (arm_spec(c).get("order", 99), c))
+
 
 FINDABILITY_TOOLS = {"search_artifacts", "list_skills", "list_templates",
                      "find", "ls", "grep", "tree"}
@@ -77,10 +96,10 @@ def file_transcript_metrics(label, table, rnd):
     """Replay a file-arm transcript: findability + raw-data touches +
     derived-artifact reuse.
 
-    The reuse term is what makes the two arms comparable. dsos earns
-    reuse_calls for touching an artifact owned by an earlier session; the
+    The reuse term is what makes the arms comparable. dsos earns
+    reuse_calls for touching an artifact owned by an earlier session; a
     file arm's equivalent is reading back a file an earlier round wrote
-    (a cleaned CSV, a saved result). Without crediting that, the file arm
+    (a cleaned CSV, a saved result). Without crediting that, the file arms
     could only ever be debited — reusing a derived file and redoing the
     work from scratch would score identically.
     """
@@ -89,8 +108,10 @@ def file_transcript_metrics(label, table, rnd):
         return None
     raw_name = table  # the CSV is copied into the workspace under its own name
     carry = carry_for(label, table, rnd)
-    carried = {pathlib.Path(p).name for p in carry.get("carried", [])}
+    carried = {pathlib.Path(p).name for p in carry.get("carried", [])
+               if pathlib.Path(p).name != MANIFEST_NAME}
     find = raw_touch = derived_touch = reuse_touch = calls = 0
+    manifest_touch = remote = 0
     for line in tpath.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -98,10 +119,20 @@ def file_transcript_metrics(label, table, rnd):
         calls += 1
         tool = norm_tool((ev.get("tool") or "").lower())
         summary = ev.get("summary", "")
+        if REMOTE_FETCH_RE.search(summary):
+            # Several chain tables have public copies, so a workspace with no
+            # raw CSV in it can still pull one down and bypass its own history.
+            remote += 1
         if tool in FINDABILITY_TOOLS or tool in {"find", "ls", "grep", "tree"} \
                 or summary.strip().lower().startswith(FINDABILITY_PATTERNS):
             find += 1
         names = {pathlib.Path(p).name for p in (ev.get("paths") or [])}
+        if MANIFEST_NAME in names:
+            # The manifest is an index of derived work, not derived work.
+            # Reading it is findability, so it earns no reuse credit — the
+            # credit belongs to whichever file it points at.
+            manifest_touch += 1
+            names.discard(MANIFEST_NAME)
         if raw_name in names:
             raw_touch += 1
         elif names & carried:
@@ -112,10 +143,17 @@ def file_transcript_metrics(label, table, rnd):
             # a folder) is navigation, already counted as findability — not
             # a touch on derived work.
             derived_touch += 1
-    return {"findability_calls": find, "raw_data_touches": raw_touch,
-            "derived_touches": derived_touch, "reuse_calls": reuse_touch,
-            "tool_calls_logged": calls, "carried_files": sorted(carried),
-            "carry_recorded": bool(carry)}
+    out = {"findability_calls": find, "raw_data_touches": raw_touch,
+           "derived_touches": derived_touch, "reuse_calls": reuse_touch,
+           "tool_calls_logged": calls, "carried_files": sorted(carried),
+           "carry_recorded": bool(carry), "manifest_touches": manifest_touch,
+           "remote_fetches": remote}
+    if uses_manifest(label):
+        # Whether the manifest was read, and whether it then led the agent to
+        # a file an earlier round advertised. A prompt nobody follows and a
+        # manifest nobody reads have to look different in the report.
+        out.update(manifest_metrics(label, table, rnd, RESULTS))
+    return out
 
 
 def dsos_store_metrics():
@@ -161,11 +199,141 @@ def dsos_metrics(sessions, arts):
     return out
 
 
+def build_three_way(answers, scores, report, conditions):
+    """One row per arm: the four headline axes, N arms wide.
+
+    Accuracy and tokens cover every round; findability, re-fetch and reuse
+    cover R2+ only, because R1 is the seed round — there is nothing to find
+    or reuse before an arm has produced anything. Reuse is summed only over
+    the rounds where it was actually measured, with the unmeasured count kept
+    beside it, so a missing carry record can never read as a measured zero.
+    """
+    out = {}
+    for cond in conditions:
+        rounds_seen = sorted({r for recs in answers[cond].values() for r in recs})
+        scored = [scores[cond]["results"][f"{t}::R{r}"]["passed"]
+                  for t, recs in answers[cond].items() for r in recs
+                  if f"{t}::R{r}" in scores.get(cond, {}).get("results", {})]
+        toks = [sum((recs[r].get("tokens_in") or 0) + (recs[r].get("tokens_out") or 0)
+                    for recs in answers[cond].values() for r in recs)]
+        row = {
+            "arm": cond,
+            "arm_label": arm_spec(cond).get("label") or cond,
+            "registry_arm": arm_of(cond),
+            "tables": sorted(answers[cond]),
+            "rounds": rounds_seen,
+            "n_runs": sum(len(recs) for recs in answers[cond].values()),
+            "scored_rounds": len(scored),
+            "accuracy": (sum(scored) / len(scored)) if scored else None,
+            "tokens_mean": round(statistics.mean(toks), 1) if toks else None,
+            "tokens_total": sum(toks),
+            "tool_calls": sum(r.get("tool_calls") or 0
+                              for recs in answers[cond].values() for r in recs.values()),
+            "duration_s": sum(r.get("duration_s") or 0
+                              for recs in answers[cond].values() for r in recs.values()),
+            "refetch": 0, "findability": 0, "reuse": 0,
+            "reuse_rounds_measured": 0, "reuse_rounds_unmeasured": 0,
+            "remote_fetches": 0, "manifest": None,
+        }
+        manifest = {"rounds_with_a_manifest": 0, "manifest_reads": 0,
+                    "manifest_writes": 0, "advertised_reuse": 0}
+        for table in row["tables"]:
+            for rnd, m in sorted(report["per_table"].get(table, {})
+                                 .get("reuse", {}).get(cond, {}).items()):
+                row["refetch"] += m.get("raw_data_touches",
+                                        m.get("new_dataset_registrations", 0)) or 0
+                row["findability"] += m.get("findability_calls", 0) or 0
+                row["remote_fetches"] += m.get("remote_fetches", 0) or 0
+                if is_file_arm(cond) and m.get("carry_recorded") is False:
+                    row["reuse_rounds_unmeasured"] += 1
+                else:
+                    row["reuse"] += m.get("reuse_calls", 0) or 0
+                    row["reuse_rounds_measured"] += 1
+                if uses_manifest(cond):
+                    manifest["rounds_with_a_manifest"] += 1 if m.get("advertised_paths") else 0
+                    manifest["manifest_reads"] += m.get("manifest_reads", 0) or 0
+                    manifest["manifest_writes"] += m.get("manifest_writes", 0) or 0
+                    manifest["advertised_reuse"] += m.get("advertised_reuse", 0) or 0
+        if uses_manifest(cond):
+            row["manifest"] = manifest
+        out[cond] = row
+    return out
+
+
+def fmt_pct(v):
+    return "n/a" if v is None else f"{v:.0%}"
+
+
+def fmt_num(v):
+    return "n/a" if v is None else f"{v:,.0f}"
+
+
+def three_way_lines(three_way, conditions):
+    """The three-way table as text rows. Shared by the console and report.md,
+    so the two can never disagree."""
+    lines = [(f"{'arm':16s} {'accuracy':>9s} {'tok/round':>10s} {'tokens':>10s} "
+              f"{'re-fetch':>9s} {'findability':>12s} {'reuse':>6s} {'manifest reads':>15s}")]
+    for cond in conditions:
+        r = three_way[cond]
+        man = r.get("manifest") or {}
+        lines.append(
+            f"{cond:16s} {fmt_pct(r['accuracy']):>9s} {fmt_num(r['tokens_mean']):>10s} "
+            f"{fmt_num(r['tokens_total']):>10s} {r['refetch']:>9d} "
+            f"{r['findability']:>12d} {r['reuse']:>6d} "
+            f"{(str(man.get('manifest_reads', 0)) if man else '-'):>15s}")
+    return lines
+
+
+def write_report_md(report, conditions):
+    """The console tables in results/report.md, so a run's numbers can be read
+    without re-running anything. Every number here comes from report.json."""
+    lines = ["# Benchmark report", "",
+             "Generated by `python report.py` from `results/` — do not edit by hand.", "",
+             "## Three-way comparison", "",
+             "Accuracy and tokens cover every round. Re-fetch, findability and reuse "
+             "cover R2+ only: R1 is the seed round, before any arm has produced "
+             "anything to find or reuse.", "", "```"]
+    lines += three_way_lines(report["three_way"], conditions)
+    lines += ["```", "", "## Per round", "",
+              "| round | arm | accuracy | mean tokens | tool calls | seconds |",
+              "|---|---|---|---|---|---|"]
+    for rnd, row in report["per_round"].items():
+        for cond in conditions:
+            r = row[cond]
+            if not r["n"]:
+                continue
+            lines.append(f"| {rnd} | {cond} | {fmt_pct(r['accuracy'])} | "
+                         f"{fmt_num(r['tokens_total_mean'])} | {r['tool_calls_total']} | "
+                         f"{r['duration_s_total']} |")
+    lines += ["", "## Reuse in R2+", "",
+              "| table | arm | round | findability | re-fetch | reuse calls | "
+              "manifest reads | advertised reuse |",
+              "|---|---|---|---|---|---|---|---|"]
+    for table, row in report["per_table"].items():
+        for cond in conditions:
+            for rnd, m in sorted(row["reuse"].get(cond, {}).items()):
+                unmeasured = is_file_arm(cond) and m.get("carry_recorded") is False
+                lines.append(
+                    f"| {table} | {cond} | {rnd} | {m.get('findability_calls', 0)} | "
+                    f"{m.get('raw_data_touches', m.get('new_dataset_registrations', 0))} | "
+                    f"{'n/a' if unmeasured else m.get('reuse_calls', 0)} | "
+                    f"{m.get('manifest_reads', '-')} | {m.get('advertised_reuse', '-')} |")
+    lines += ["", "`n/a` = the run predates carry recording, so reuse was not measured "
+                  "for that round. `re-fetch` is calls touching the raw CSV (file arms) "
+                  "or new dataset registrations (dsos).", "",
+              "## Models", ""]
+    for cond in conditions:
+        lines.append(f"- `{cond}`: {', '.join(report['models'][cond]) or '(not recorded)'}")
+    lines.append("")
+    (RESULTS / "report.md").write_text("\n".join(lines), encoding="utf-8")
+
+
 def main():
-    answers = {c: rounds_of(load_json(RESULTS / f"answers_{c}.json")) for c in CONDITIONS}
+    conditions = discover_conditions()
+    answers = {c: rounds_of(load_json(RESULTS / f"answers_{c}.json")) for c in conditions}
     # score.py keys conditions by the answers filename stem: "answers_file"/"answers_dsos".
     raw_scores = load_json(RESULTS / "scores.json")
-    scores = {c: raw_scores.get(f"answers_{c}", {"results": {}}) for c in CONDITIONS}
+    scores = {c: raw_scores.get(f"answers_{c}", {"results": {}}) for c in conditions}
     sessions, arts = dsos_store_metrics() if (HERE / "store.db").exists() else ({}, {})
     store_m = dsos_metrics(sessions, arts) if sessions else {}
 
@@ -174,7 +342,7 @@ def main():
     # any --label, and a truncated log silently mis-paired rounds with sessions,
     # which would quietly corrupt every reuse number.
     dsos_round_metrics = {}
-    for label in CONDITIONS:
+    for label in conditions:
         index_path = RESULTS / f"runs_{label}.json"
         if not index_path.exists():
             continue
@@ -191,17 +359,19 @@ def main():
                 dsos_round_metrics[(label, entry["table"], entry["round"])] = store_m[sid]
 
     # Build the report
-    report = {"per_round": {}, "per_table": {}, "reuse": {}, "models": {}}
-    for cond in CONDITIONS:
+    report = {"per_round": {}, "per_table": {}, "models": {}}
+    for cond in conditions:
         models = set()
         for rounds in answers[cond].values():
             for rec in rounds.values():
                 if rec.get("model"):
                     models.add(rec["model"])
         report["models"][cond] = sorted(models)
-    for rnd in (1, 2, 3):
+    # Round numbers come from the data, not a fixed 1..3: the depth chains
+    # run to R6, and a report that stops at R3 hides the reuse-heavy tail.
+    for rnd in sorted({r for c in conditions for a in answers[c].values() for r in a}):
         row = {}
-        for cond in CONDITIONS:
+        for cond in conditions:
             recs = [a[rnd] for a in answers[cond].values() if rnd in a]
             scored = []
             for table, a in answers[cond].items():
@@ -220,9 +390,9 @@ def main():
             }
         report["per_round"][f"R{rnd}"] = row
 
-    for table in sorted({t for cond in CONDITIONS for t in answers[cond]}):
+    for table in sorted({t for cond in conditions for t in answers[cond]}):
         row = {}
-        for cond in CONDITIONS:
+        for cond in conditions:
             recs = answers[cond].get(table, {})
             scored = []
             for rnd in recs:
@@ -236,17 +406,18 @@ def main():
             }
         # reuse side
         reuse = {}
-        for cond in CONDITIONS:
+        for cond in conditions:
             per = {}
             for rnd in sorted(answers[cond].get(table, {})):
                 if rnd == 1:
                     continue  # R1 is the seed; there is nothing to reuse yet
-                # A file arm is scored from its transcript, whichever label it
-                # carries ("file", "chain_file", "file_keepraw" ...). Matching
-                # on the substring keeps prefixed labels working; a bare
-                # startswith("file") silently dropped every labelled arm.
+                # Which scorer applies comes from the registry, not from the
+                # label's spelling: a file arm has a transcript, a dsos arm has
+                # the store. The old `"file" in cond` test also swallowed
+                # chain_file_manifest, scoring the manifest arm as if the
+                # manifest did not exist.
                 m = (file_transcript_metrics(cond, table, rnd)
-                     if "file" in cond else None)
+                     if is_file_arm(cond) else None)
                 if m:
                     per[f"R{rnd}"] = m
                 else:
@@ -258,41 +429,72 @@ def main():
         row["reuse"] = reuse
         report["per_table"][table] = row
 
+    report["three_way"] = build_three_way(answers, scores, report, conditions)
+
     (RESULTS / "report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n",
                                          encoding="utf-8")
 
     # Console summary
-    print("== Per round ==")
-    hdr = f"{'':4s} {'acc file':>9s} {'acc dsos':>9s} {'tok file':>9s} {'tok dsos':>9s} {'tools file':>11s} {'tools dsos':>11s} {'sec file':>9s} {'sec dsos':>9s}"
-    print(hdr)
+    print("== Per round (accuracy, mean tokens per run) ==")
+    printed = False
     for rnd, row in report["per_round"].items():
-        f, d = row["file"], row["dsos"]
-        print(f"{rnd:4s} {f['accuracy']:>8.0%} {d['accuracy']:>9.0%} "
-              f"{f['tokens_total_mean']:>9.0f} {d['tokens_total_mean']:>9.0f} "
-              f"{f['tool_calls_total']:>11d} {d['tool_calls_total']:>11d} "
-              f"{f['duration_s_total']:>9d} {d['duration_s_total']:>9d}")
+        for cond in conditions:
+            r = row[cond]
+            if not r["n"]:
+                continue
+            printed = True
+            print(f"{rnd:4s} {cond:16s} {fmt_pct(r['accuracy']):>7s} "
+                  f"{fmt_num(r['tokens_total_mean']):>9s} tok  "
+                  f"{r['tool_calls_total']:>4d} calls  {r['duration_s_total']:>5d}s")
+    if not printed:
+        print("  (no answers found in results/)")
 
-    print("\n== Reuse in R2/R3 (the claim under test) ==")
-    print(f"{'table':22s} {'cond':5s} {'rnd':4s} {'findability':>12s} {'raw/re-registered':>18s} {'reuse calls':>12s}")
+    print("\n== Three-way comparison (accuracy / tokens / re-fetch / findability) ==")
+    print("  re-fetch, findability and reuse are R2+ only; R1 is the seed round.")
+    for line in three_way_lines(report["three_way"], conditions):
+        print("  " + line)
+    for cond in conditions:
+        r = report["three_way"][cond]
+        print(f"  {cond:16s} n={r['n_runs']} runs, {len(r['rounds'])} rounds, "
+              f"scored {r['scored_rounds']}, reuse measured on {r['reuse_rounds_measured']} "
+              f"round(s)"
+              + (f", unmeasured {r['reuse_rounds_unmeasured']}"
+                 if r["reuse_rounds_unmeasured"] else "")
+              + (f", remote fetches {r['remote_fetches']}" if r["remote_fetches"] else ""))
+    if any((report["three_way"][c].get("manifest") or {}).get("advertised_reuse")
+           for c in conditions):
+        print("  manifest reads = calls touching MANIFEST.md; advertised reuse = calls "
+              "that then loaded a file an earlier round's manifest listed.")
+
+    print("\n== Reuse in R2+ (the claim under test) ==")
+    print(f"{'table':22s} {'cond':16s} {'rnd':4s} {'findability':>12s} "
+          f"{'raw/re-registered':>18s} {'reuse calls':>12s}")
     for table, row in report["per_table"].items():
-        for cond in CONDITIONS:
+        for cond in conditions:
             for rnd, m in sorted(row["reuse"].get(cond, {}).items()):
                 # A file-arm round with no carry record predates that metric,
                 # so its reuse count is unmeasured, not zero. Printing a bare
                 # 0 would let missing data read as a measured result.
-                if "file" in cond and m.get("carry_recorded") is False:
+                if is_file_arm(cond) and m.get("carry_recorded") is False:
                     reuse = "n/a"
                 else:
                     reuse = str(m.get("reuse_calls", 0))
-                print(f"{table:22s} {cond:5s} {rnd:4s} "
+                extra = ""
+                if uses_manifest(cond) and m.get("manifest_reads"):
+                    extra = (f"  (manifest read: {m['manifest_reads']}, advertised "
+                             f"reuse: {m.get('advertised_reuse', 0)})")
+                print(f"{table:22s} {cond:16s} {rnd:4s} "
                       f"{m.get('findability_calls', 0):>12d} "
                       f"{m.get('raw_data_touches', m.get('new_dataset_registrations', 0)):>18d} "
-                      f"{reuse:>12s}")
+                      f"{reuse:>12s}{extra}")
     print("  (n/a = run predates carry recording; reuse was not measured for that round)")
     print("\n== models seen per arm ==")
-    for cond in CONDITIONS:
-        print(f"  {cond:6s} {report['models'][cond] or '(not recorded — run predates model capture)'}")
-    print("\nWrote results/report.json")
+    for cond in conditions:
+        print(f"  {cond:16s} {report['models'][cond] or '(not recorded — run predates model capture)'}")
+    write_report_md(report, conditions)
+    print("\nWrote results/report.json and results/report.md")
+
+
 
 
 if __name__ == "__main__":

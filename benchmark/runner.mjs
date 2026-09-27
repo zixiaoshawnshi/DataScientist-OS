@@ -5,16 +5,26 @@
  * point: no ambient memory), with the tool set fixed by condition:
  *
  *   file — built-in file tools only (read/bash/edit/write/grep/find/ls)
+ *   file_manifest — the same built-in tools, plus a system prompt that
+ *          requires a MANIFEST.md in the working directory: one entry per
+ *          derived file, naming the question it served, how it was computed
+ *          and its input paths. The point of this arm is Doc II's "baseline
+ *          that matters" — the file workflow done properly, with an index a
+ *          later session can read. If the store cannot beat files plus a
+ *          manifest, the store is not earning its keep.
  *   dsos — the same built-ins plus the dsos MCP server's tools, exposed as
  *          custom pi tools. The runner spawns the dsos server itself
  *          (benchmark/mcp_client.mjs, dedicated store benchmark/store.db),
  *          because the pi-mcp-adapter only auto-boots cached/approved
  *          servers in headless sessions. No global config is touched.
  *
- * --hide-raw deletes the raw CSV from the workspace after R1, so rounds
- * 2+ can only reach the data through the store. That is the arm that
- * actually exercises the re-finding claim: with the file sitting in cwd,
- * the file condition's baseline is at its strongest.
+ * The arms live in benchmark/arms.json, which metrics.py and report.py read
+ * too: one entry decides what exists, what the workspace holds, and how an
+ * arm is scored. --hide-raw, i.e. deleting the raw CSV after R1 so rounds
+ * 2+ can only reach the data through the store, is the arm's raw_csv_policy
+ * rather than a per-condition special case. That is the arm that actually
+ * exercises the re-finding claim: with the file sitting in cwd, the file
+ * condition's baseline is at its strongest.
  *
  * Workspaces persist per (condition, table) across rounds: benchmark/runs/
  * <cond>/<table>/ — the CSV is copied in for R1 and whatever the agent
@@ -44,9 +54,17 @@ const SDK_URL = pathToFileURL(join(
   "AppData/Roaming/npm/node_modules/@earendil-works/pi-coding-agent/dist/index.js"
 )).href;
 
+// One registry for every arm, shared with metrics.py/report.py. `order` fixes
+// a column in the three-way table; `raw_csv_policy` decides whether the raw
+// CSV survives R1; `scored_from` decides which side holds the arm's record.
+const ARMS = JSON.parse(readFileSync(join(HERE, "arms.json"), "utf8")).arms;
+
 const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
-const VENV_PY = join(REPO, ".venv/Scripts/python.exe");
+// The venv that runs the dsos server. A git worktree has no .venv of its own,
+// so BENCH_PYTHON can point at the shared one; the default is this repo's.
+const VENV_PY = process.env.BENCH_PYTHON || join(REPO, ".venv/Scripts/python.exe");
 const BENCH_STORE = join(HERE, "store.db");
+const MANIFEST_NAME = "MANIFEST.md";
 const ROUND_TIMEOUT_MS = 20 * 60 * 1000;
 const TOOL_CALL_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -71,19 +89,22 @@ function parseArgs(argv) {
     else if (a === "--timeout-min") out.timeoutMs = Number(argv[++i]) * 60 * 1000;
     else { console.error(`unknown arg ${a}`); process.exit(2); }
   }
-  if (!["file", "dsos"].includes(out.condition)) {
-    console.error("usage: node runner.mjs --condition file|dsos [--table x.csv | --tables all]\n"
+  if (!ARMS[out.condition]) {
+    console.error("usage: node runner.mjs --condition " + Object.keys(ARMS).join("|")
+      + " [--table x.csv | --tables all]\n"
       + "                       [--rounds 1,2,3] [--reset-store] [--keep-raw] [--no-file-tools]\n"
       + "                       [--manifest results/manifest_chains.json] [--label chain_file]\n"
       + "                       [--model m] [--timeout-min 20]");
     process.exit(2);
   }
-  // dsos's intended workflow is register-once-then-rely-on-the-store, so the
-  // raw CSV is removed after R1 by default: from R2 on, the store is the only
-  // way to the data. Leaving the file in place turns the dsos arm into
-  // "files + extra tools" — the agent reads the local file and the store is
-  // never exercised, which is what the pre-fix pilot measured.
-  out.hideRaw = out.condition === "dsos" && !out.keepRaw;
+  // The raw-CSV policy is the arm's, not the condition's spelling: dsos's
+  // intended workflow is register-once-then-rely-on-the-store, so its store
+  // is the only path to the data from R2 on, and the manifest arm gets the
+  // same treatment or the two are not comparable. Leaving the file in place
+  // turns dsos into "files + extra tools" — the agent reads the local file
+  // and the store is never exercised, which is what the pre-fix pilot
+  // measured. --keep-raw overrides it and writes to its own label namespace.
+  out.hideRaw = ARMS[out.condition].raw_csv_policy === "remove_after_r1" && !out.keepRaw;
   return out;
 }
 
@@ -101,7 +122,83 @@ const PERSIST_HINT =
   "a derived column, a summary), save it now so a later question can reuse it " +
   "instead of redoing the work.";
 
-function promptFor(table, round, workspace) {
+// The file_manifest arm's system prompt. This is the whole arm: a file-based
+// workflow with an index, which is what a competent person maintaining a
+// directory of derived data would actually do. The plain file arm has the
+// files and no index, so a later round has to guess filenames and recall
+// shapes; this arm is told what exists, how it was made, and what it came
+// from. The format is fixed so metrics.py can parse what the agent wrote —
+// an unparseable manifest is a finding, not a nuisance.
+const MANIFEST_SYSTEM_PROMPT = [
+  `This working directory keeps a ${MANIFEST_NAME}: an index of the derived files in it.`,
+  "",
+  "Later questions about this data arrive in fresh sessions with no memory of",
+  "this one. They will rely on that index to find work you already did, so it is",
+  "the only way your work past this session is reachable.",
+  "",
+  "Rules:",
+  `1. Before you analyse anything, read ${MANIFEST_NAME} in the working directory. If it`,
+  "   lists a file that answers the question in front of you, load that file and",
+  "   use it. Do not recompute it, and do not re-derive its inputs.",
+  "2. Every intermediate result you create — a cleaned table, a derived column, a",
+  `   summary, the script that writes it — goes to a file in this directory, and`,
+  `   gets an entry in ${MANIFEST_NAME}. Keep the entries already there; add to them.`,
+  "3. A round is not finished until the manifest lists everything that round",
+  "   produced, including the files it updated in place.",
+  "",
+  "One entry per file, in exactly this format (path relative to the working",
+  "directory, one line each):",
+  "",
+  "## <path>",
+  "- question: <the question this file serves, one line>",
+  "- computed: <how it was computed: the command, or the formula>",
+  '- inputs: <comma-separated paths it was built from, or "none">',
+].join("\n");
+
+// Seeded into a fresh workspace so "read the manifest at round start" is a
+// well-defined instruction rather than a hunt for a file that may not exist.
+// The entry format is indented, so it does not parse as an entry.
+const MANIFEST_SEED = [
+  `# ${MANIFEST_NAME}`,
+  "",
+  "Index of the derived files in this working directory. One entry per file:",
+  "",
+  "    ## <path relative to this directory>",
+  "    - question: <the question this file serves>",
+  "    - computed: <how it was computed: the command, or the formula>",
+  '    - inputs: <comma-separated paths it was built from, or "none">',
+  "",
+  "No entries yet — this is the first round of work in this directory.",
+  "",
+].join("\n");
+
+// Appended to the round prompt so the arm's contract holds at the end of the
+// round too. The system prompt says to do it; this says to do it before
+// answering, which is where the harness takes the measurement.
+const MANIFEST_REMINDER =
+  `Before you give your final answer, make sure ${MANIFEST_NAME} lists every derived ` +
+  "file you produced this round (path, question, how it was computed, its inputs).";
+
+function seedManifest(workspace) {
+  const p = join(workspace, MANIFEST_NAME);
+  if (existsSync(p)) return false;
+  writeFileSync(p, MANIFEST_SEED, "utf8");
+  return true;
+}
+
+// What the manifest looked like at the end of a round, so the next round's
+// reuse can be scored against what the manifest actually advertised rather
+// than against the workspace listing (which is the plain file arm's only
+// affordance).
+function snapshotManifest(label, table, round, workspace) {
+  const src = join(workspace, MANIFEST_NAME);
+  if (!existsSync(src)) return;
+  const p = join(HERE, "results", "manifests", label, `${table.file_name}_R${round}.md`);
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(p, readFileSync(src, "utf8"), "utf8");
+}
+
+function promptFor(table, round, workspace, manifest = false) {
   const q = table.rounds.find((r) => r.round === round);
   if (!q) throw new Error(`round ${round} not in manifest for ${table.file_name}`);
   const dataset = round === 1
@@ -110,7 +207,8 @@ function promptFor(table, round, workspace) {
   const chain = q.depends_on && q.depends_on.length
     ? "\n\n(This continues earlier work on this dataset — reuse what you already derived.)"
     : "";
-  return `${dataset}${q.question}${chain}\n\nConstraints: ${q.constraints}\n\n${PERSIST_HINT}\n\nGive your final answer in exactly this format: ${q.format}`;
+  const manifestHint = manifest ? `\n\n${MANIFEST_REMINDER}` : "";
+  return `${dataset}${q.question}${chain}\n\nConstraints: ${q.constraints}\n\n${PERSIST_HINT}${manifestHint}\n\nGive your final answer in exactly this format: ${q.format}`;
 }
 
 function setupWorkspace(label, table) {
@@ -194,7 +292,7 @@ function recordRun(label, entry) {
 // The dsos server records the session the agent started; the newest one in
 // the store belongs to the round that just finished.
 function newestStoreSession() {
-  const py = join(REPO, ".venv/Scripts/python.exe");
+  const py = VENV_PY;
   if (!existsSync(py)) return null;
   const r = spawnSync(py, ["-c",
     "import sqlite3,sys;c=sqlite3.connect(sys.argv[1]);" +
@@ -263,6 +361,22 @@ function lastAssistantText(messages) {
       const texts = (m.content ?? []).filter((c) => c.type === "text").map((c) => c.text);
       if (texts.length) return texts.join("\n");
     }
+  }
+  return "";
+}
+
+// The last thing the agent said that actually carried the requested tags.
+// Usually the same as lastAssistantText, but a turn can end with a closing
+// summary that drops the tag block after the agent already stated its answer
+// — scoring that as "no answer" measures the harness's choice of message,
+// not the arm. Kept as a separate field so both texts stay on disk and the
+// rule is applied identically to every arm.
+function lastTaggedText(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!isAssistant(m)) continue;
+    const text = (m.content ?? []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
+    if (/@[\w.\-]+\[/.test(text)) return text;
   }
   return "";
 }
@@ -337,6 +451,7 @@ function dsosToolExtension(client) {
 // -------------------------------------------------------------------- main
 
 const args = parseArgs(process.argv.slice(2));
+const ARM = ARMS[args.condition];
 const MANIFEST = args.manifest ?? join(HERE, "manifest.json");
 // --keep-raw writes to its own namespace so the arms never overwrite each other;
 // --label additionally keeps a manifest (e.g. the depth chains) from clobbering
@@ -356,13 +471,16 @@ console.log(`condition=${args.condition}${args.hideRaw ? " (raw removed after R1
 
 for (const table of tables) {
   const { workspace, csv } = setupWorkspace(LABEL, table);
+  if (ARM.manifest && seedManifest(workspace)) {
+    console.log(`  seeded ${MANIFEST_NAME} in ${workspace}`);
+  }
   for (const round of args.rounds) {
     if (args.hideRaw && round > 1 && existsSync(csv)) {
       rmSync(csv);
       console.log(`\n--- hid raw CSV for ${table.file_name} R${round} (store is the only path) ---`);
     }
     const key = `${table.file_name}::R${round}`;
-    const prompt = promptFor(table, round, workspace);
+    const prompt = promptFor(table, round, workspace, ARM.manifest);
     // Snapshot what this round inherits, before the agent can add to it.
     const filesBefore = listFiles(workspace);
     console.log(`\n=== ${key} [${args.condition}] prompt ${prompt.length} chars ===`);
@@ -384,6 +502,16 @@ for (const table of tables) {
         cwd: workspace,
         agentDir: getAgentDir(),
         extensionFactories: [dsosToolExtension(client)],
+      });
+      await loader.reload();
+    } else if (ARM.manifest) {
+      // The manifest instruction has to reach the model through the system
+      // prompt: appended to the round prompt it would compete with the
+      // question and the answer format, and a weak model drops it.
+      loader = new DefaultResourceLoader({
+        cwd: workspace,
+        agentDir: getAgentDir(),
+        appendSystemPrompt: [MANIFEST_SYSTEM_PROMPT],
       });
       await loader.reload();
     }
@@ -418,12 +546,14 @@ for (const table of tables) {
     const messages = session.messages ?? [];
     const usage = sumUsage(messages);
     const answer = lastAssistantText(messages);
+    const answerTagged = lastTaggedText(messages);
     const dur = Math.round((Date.now() - t0) / 1000);
     const usedModel = session.model?.id ?? session.model ?? null;
     session.dispose();
     client?.stop();
     snapshotWorkspace(LABEL, table, workspace);
     writeCarry(LABEL, table, round, table.file_name, filesBefore, listFiles(workspace));
+    if (ARM.manifest) snapshotManifest(LABEL, table, round, workspace);
 
     const tdir = join(HERE, "results", "transcripts", LABEL);
     mkdirSync(tdir, { recursive: true });
@@ -432,6 +562,7 @@ for (const table of tables) {
 
     const answersPath = mergeAnswers(LABEL, key, {
       answer_text: answer,
+      answer_text_tagged: answerTagged,
       tokens_in: usage.input,
       tokens_out: usage.output,
       duration_s: dur,
