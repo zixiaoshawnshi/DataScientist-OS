@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
     tags TEXT NOT NULL,              -- JSON list
     content_ref TEXT NOT NULL,       -- path under data/blobs/
     content_format TEXT NOT NULL,    -- csv | parquet | python | sql | markdown | json | png
+    content_hash TEXT,               -- fingerprint of the stored content; identical
+                                      -- content is registered once, not per session
     source TEXT,                     -- JSON: {url, fetched_at} for fetched datasets, else NULL
     embedding BLOB NOT NULL,         -- float32 vector, see dsos/embeddings.py
     created_at TEXT NOT NULL,
@@ -38,6 +40,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 
 CREATE INDEX IF NOT EXISTS idx_artifacts_artifact_id ON artifacts(artifact_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_session_id ON artifacts(session_id);
+CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(type, content_hash);
 
 -- Keyword/tag fallback alongside embedding search. Plain (non-external-content)
 -- FTS5 table, kept in sync manually in store.save_artifact — artifacts.row_id
@@ -115,10 +118,28 @@ def connect(db_path: str | Path = "data/store.db") -> sqlite3.Connection:
     # Default (rollback-journal) mode throws "database is locked" under that
     # read/write overlap; WAL lets readers and a writer coexist.
     conn.execute("PRAGMA journal_mode=WAL")
+    # Column migration runs BEFORE the schema script: on an existing store the
+    # table is already there and needs the new column before SCHEMA's
+    # CREATE INDEX on it can succeed. On a fresh store the table doesn't
+    # exist yet, the guard skips, and SCHEMA creates it with the column.
+    _add_missing_columns(conn)
     conn.executescript(SCHEMA)
     conn.commit()
     conn._dsos_db_path = str(path)
     return conn
+
+
+# Columns added after the first released schema. CREATE TABLE IF NOT EXISTS
+# won't add these to an existing store.db, so an opened older file is
+# upgraded in place — one guarded ALTER per column, a no-op once present.
+_ADDED_COLUMNS = (("artifacts", "content_hash", "TEXT"),)
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    for table, column, decl in _ADDED_COLUMNS:
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if existing and column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 def blob_dir_for(conn: sqlite3.Connection) -> Path:

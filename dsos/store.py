@@ -7,6 +7,7 @@ execution runner, GUI) is built on top of.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 import uuid
@@ -83,6 +84,119 @@ def start_session(conn: sqlite3.Connection, question: str) -> str:
     return session_id
 
 
+def session_exists(conn: sqlite3.Connection, session_id: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone() is not None
+
+
+def _content_hash(content: Any, content_format: str) -> str | None:
+    """Fingerprint of the stored content, for identifying an identical
+    re-registration. Returns None when the content can't be hashed
+    deterministically (the caller then just stores NULL).
+
+    Tabular content hashes the DataFrame's values, not its serialized
+    bytes: parquet encoding and float repr are not stable across pyarrow /
+    pandas versions, and a hash that changes on upgrade would only cause
+    missed dedupes, never a wrong merge.
+    """
+    if content is None:
+        return None
+    try:
+        if content_format == "parquet" and hasattr(content, "columns"):
+            import pandas as pd
+
+            values = pd.util.hash_pandas_object(content, index=True).values.tobytes()
+            header = repr([(str(c), str(t)) for c, t in zip(content.columns, content.dtypes)]).encode()
+            payload = header + b"\x00" + values
+        else:
+            payload = str(content).encode("utf-8", errors="replace")
+        return hashlib.sha256(payload).hexdigest()
+    except Exception:
+        return None
+
+
+def find_by_content_hash(
+    conn: sqlite3.Connection, type: str, content_hash: str | None
+) -> str | None:
+    """row_id of the earliest artifact of `type` with this exact content, or
+    None. Used by save_artifact's MCP wrapper to collapse a re-registration
+    of data already in the store into the existing row."""
+    if not content_hash:
+        return None
+    row = conn.execute(
+        """SELECT row_id FROM artifacts
+           WHERE type = ? AND content_hash = ?
+           ORDER BY created_at ASC, rowid ASC LIMIT 1""",
+        (type, content_hash),
+    ).fetchone()
+    return row["row_id"] if row else None
+
+
+# Types that don't count as "prior work" for the session-start signal.
+# Seeded skills are present in every store from first use, so counting them
+# would make a brand-new store look like it already has a history.
+_NOT_PRIOR_WORK = ("skill",)
+
+
+def prior_work_signal(conn: sqlite3.Connection, question: str, top_k: int = 3) -> dict:
+    """What this store already holds, relevant to `question`.
+
+    Returned from start_session so a fresh session knows the store is not
+    empty and that prior work may already cover the question. Without it
+    the store is invisible until the agent goes looking: in the benchmark
+    pilot it called search_artifacts zero times across ten reuse rounds
+    and re-fetched data it had already registered.
+
+    Candidate scores come from the same keyword-first/semantic-fallback
+    ranking as search_artifacts, and the fallback embedder is weak —
+    measured separation between a clearly relevant and a clearly
+    irrelevant question was 0.39 vs 0.30. So no score threshold is applied
+    and `match` is reported honestly (keyword = literal term hit,
+    semantic = embedding similarity only): a candidate is a thing to
+    check, not a claim that it fits.
+    """
+    placeholders = ",".join("?" * len(_NOT_PRIOR_WORK))
+    counts = {
+        r["type"]: r["n"]
+        for r in conn.execute(
+            f"SELECT type, COUNT(*) AS n FROM artifacts WHERE type NOT IN ({placeholders}) "
+            f"GROUP BY type",
+            _NOT_PRIOR_WORK,
+        )
+    }
+    total = sum(counts.values())
+    if not total:
+        return {
+            "prior_work": {"artifact_count": 0, "by_type": {}},
+            "candidates": [],
+            "note": "This store is empty — first session, so there is no prior work to reuse.",
+        }
+
+    candidates = []
+    for art, score in search_artifacts(conn, question, top_k=top_k * 2):
+        if art.type in _NOT_PRIOR_WORK:
+            continue
+        candidates.append({
+            "row_id": art.row_id, "type": art.type, "title": art.title,
+            "score": round(score, 3),
+            "match": "keyword" if score >= 0.999 else "semantic",
+        })
+        if len(candidates) >= top_k:
+            break
+
+    by_type = ", ".join(f"{n} {t}" for t, n in sorted(counts.items(), key=lambda kv: -kv[1]))
+    note = (
+        f"This store already holds {total} artifact(s) from earlier work ({by_type}). "
+        f"Check the candidates below before fetching or rebuilding anything — if one covers "
+        f"this question, reuse it via run_sql/run_python instead of redoing the work. "
+        f"'semantic' candidates are embedding-similarity only and may well be irrelevant; "
+        f"verify before relying on one. call search_artifacts for a fuller search."
+    )
+    return {"prior_work": {"artifact_count": total, "by_type": counts},
+            "candidates": candidates, "note": note}
+
+
 def save_artifact(
     conn: sqlite3.Connection,
     *,
@@ -146,19 +260,20 @@ def save_artifact(
 
     row_id = _new_id()
     content_ref = _write_blob(conn, artifact_id, version, content, content_format)
+    content_hash = _content_hash(content, content_format)
     vector = embeddings.embed(f"{title}\n{description}\n{' '.join(tags)}")
 
     conn.execute(
         """
         INSERT INTO artifacts (
             row_id, artifact_id, version, type, title, description, tags,
-            content_ref, content_format, source, embedding,
+            content_ref, content_format, content_hash, source, embedding,
             created_at, session_id, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             row_id, artifact_id, version, type, title, description, json.dumps(tags),
-            content_ref, content_format, json.dumps(source) if source else None,
+            content_ref, content_format, content_hash, json.dumps(source) if source else None,
             vector.astype(np.float32).tobytes(),
             _now(), session_id, status,
         ),
