@@ -11,7 +11,11 @@ Sep 27, 2026 · @Shawn Shi
 1. **Read first:** Doc II §Architecture, §MVP scope and §Data model changes, then your WP. Also read every file in your WP's *Owns* list before editing.
 2. **Tests first.** Write the WP's new smoke test before the implementation. Run it, and confirm it fails *for the reason the WP describes*. Paste that failing output into the PR description, then implement until it passes.
 3. **Stay in your files.** Modify only the files listed under *Owns*. If you need to change anything else, stop and report back; don't widen the WP.
-4. **Full suite green.** `.venv/Scripts/python tests/run_all.py` (created by WP-00) must pass before you open the PR. Update existing tests *only* where your WP changes the behaviour they assert, and say which ones in the PR.
+4. **Tests you own must be green; the full suite is run at merge time.** This is the one rule the TTD's own parallelism breaks, so it is split:
+   - **During the WP**, you must pass every test in your *Owns* list, plus your new test. You do **not** have to pass the whole suite, because WPs run concurrently in separate worktrees and a sibling's half-finished refactor will turn a suite red for reasons you are forbidden by rule 3 to fix.
+   - **At merge**, the integrator runs the full `tests/run_all.py` and resolves what broke. Report honestly in the PR which tests you ran and which you left red, and why.
+   - If you *do* run the full suite and it is green, say so; if it is red, paste the failing test names and say whether the cause is in your files.
+   - Update existing tests *only* where your WP changes the behaviour they assert, and say which ones in the PR.
 5. **Test style.** Match `tests/execution_hygiene_smoke_test.py`: a standalone script, a `check(label, ok, detail)` helper, `DSOS_DB_PATH` set to `data/test-runs/<test_name>/store.db` (wiped at start) **before** importing dsos, exit code 1 on any failure. MCP-level tests use the in-process `fastmcp.Client`.
 6. **Conventions.** Pass `encoding="utf-8"` on every text read or write. Use `.venv/Scripts/python`, never a bare `python`. Don't bump the package version. Match the surrounding comment density.
 7. **Branch / PR.** Name the branch `wp/<id>-<slug>`, with one PR per WP. The PR body lists the tests added and any existing tests changed.
@@ -58,15 +62,31 @@ WP-00 test runner
 H1 files+manifest arm: independent, start now      H2 consumer arm: after F1      H3 parallel arm: after E3 + D1
 ```
 
+The wave table below is a **schedule, not a claim that every cell is safe to parallelise.** Two cells were found to conflict on file ownership during a review of the ownership lists, and are marked. The real constraint is not the dependency graph, it is that 6 files are each owned by 4 or 5 WPs:
+
+| file | WPs that own it |
+|---|---|
+| `dsos/store.py` | B2, B3, E2, F1, G1 |
+| `dsos/mcp_server.py` | B1, B2, B3, C1, D2 |
+| `dsos/db.py` | A1, A2, B3, E1 |
+| `dsos/execution.py` | B1, B2, B3, E2 |
+| `dsos/gui.py` | B3, D1, E2, G1 |
+| `dsos/server/producer.py` | C1, E2, E3, G1 |
+
+**Rule: two WPs may run concurrently only if their *Owns* lists are disjoint.** Waves 2 and 4 below violate this as originally written; the fixes are in the cells.
+
 | Wave | WPs that can run in parallel | Notes |
 |---|---|---|
-| 1 | WP-00, then {A1 → A2} · {B1 → B2} · H1 | A-lane = `db.py`; B-lane = execution/server. Each lane is **one agent working sequentially**. |
-| 2 | B3 · E1 | Both need A1. E1 only adds migrations. |
-| 3 | C1 | Big move; everything touching the server waits for it. |
-| 4 | C2 · D1 · E2 | Disjoint files. |
-| 5 | D2 · E3 | |
+| 1 | WP-00 · A1 · B1 · H1 | All four *Owns* lists are disjoint. **A1 and B1 need no predecessor** and are the only two WPs in the whole graph that can start on `main` as-is. H1 is the longest job: start it first, leave it unattended. |
+| 2 | A2 · B2 | A2 owns `db.py`; B2 owns `mcp_server.py`/`execution.py`/`store.py` search filters. Disjoint. |
+| 2b | B3 · E1 | **Amended — originally "B3 · E1, disjoint".** They are not: B3 appends M2 to `dsos/db.py` and E1 appends M3 to the same `MIGRATIONS` list. One agent does **B3's M2 first, then E1's M3**, in that order, as a single sequential lane. |
+| 3 | C1 | Big move; everything touching the server waits for it. Runs alone. |
+| 4 | C2 · D1 · E2 | **Amended — originally "C2 · D1 · E2, disjoint files".** They are not: D1 owns `dsos/gui.py` (refactoring it into `create_gui_router(db)`) and E2 owns `dsos/gui.py` + `templates/artifact_detail.html`. **D1 and E2 must be sequential, in that order** (D1 creates the router seam E2 then adds display code to). C2 is genuinely disjoint from both and runs alongside whichever is going. |
+| 5 | D2 · E3 | Disjoint (`mcp_server.py __main__` + `AGENTS.md` + `README.md` vs `spine.py` + `producer.py`). |
 | 6 | F1 | |
-| 7 | G1 · H2 · H3 | |
+| 7 | G1 · H2 · H3 | G1 owns `gui.py`; H2/H3 are `benchmark/`-only. Genuinely disjoint. |
+
+**Measured against the cutover.** WP-G1 flips the exploratory default. WP-H2 and WP-H3 therefore run *after* cutover, against a store whose `search_artifacts` hides exploratory rows and whose `questions` sweep has run. This is intentional: the parallel-arm duplicate-work measurement (H3) is only meaningful if it sees what a producer actually sees. If either arm must run earlier, record the mismatch explicitly in `benchmark/README.md` rather than presenting a pre-cutover number as a post-cutover one.
 
 ---
 
@@ -239,7 +259,7 @@ H1 files+manifest arm: independent, start now      H2 consumer arm: after F1    
   - The GUI routes. Refactor `gui.py` into `create_gui_router(db)`; `python -m dsos.gui` must still run standalone.
   - `build_producer(cfg).http_app(path="/")` mounted at **`/mcp/producer`**, and `build_consumer(cfg)` at **`/mcp/consumer`**.
   - **Compose both MCP apps' lifespans into the FastAPI lifespan.** FastMCP's mounted HTTP apps don't work without their lifespan.
-- **Auth:** `StaticTokenVerifier` on both MCP servers.
+- **Auth:** `StaticTokenVerifier` on both MCP servers. Import it from **`fastmcp.server.auth.providers.jwt`** — it is *not* re-exported from `fastmcp.server` in fastmcp 4.x, which is what `pyproject.toml` currently allows (`fastmcp>=0.4`, installed 4.0.10). Raise the declared floor to `fastmcp>=4.0` in the same change.
   - The token comes from `DSOS_TOKEN`; otherwise read or create `<db dir>/daemon.token` with `secrets.token_urlsafe(32)` (mode 0600 where the OS supports it).
   - GUI routes and `GET /healthz` need no token.
 - **Single daemon per store:**
@@ -292,6 +312,7 @@ H1 files+manifest arm: independent, start now      H2 consumer arm: after F1    
 - **`questions`:**
   - Columns: `id TEXT PK`, `question TEXT NOT NULL`, `hypothesis TEXT`, `status TEXT NOT NULL CHECK (status IN ('open','in_progress','answered','abandoned'))`, `asked_by TEXT`, `claimed_by TEXT`, `claimed_at TEXT`, `artifact_row_id TEXT`, `created_at TEXT NOT NULL`, `closed_at TEXT`.
   - Plus `questions_fts` (fts5: `id UNINDEXED`, `question`, `hypothesis`).
+  - **Index `questions(status)`.** WP-G1's abandon sweep runs inside every `start_session` and filters on `status`; without this it is a table scan on the hot path.
 - **`sessions`:** `ADD COLUMN kind TEXT NOT NULL DEFAULT 'producer'`, `question_id TEXT` and `client TEXT`.
 
 **Tests (write first)**
@@ -421,7 +442,7 @@ H1 files+manifest arm: independent, start now      H2 consumer arm: after F1    
 **Spec**
 - **Flip the exploratory default:** `search_artifacts` defaults to `include_exploratory=False`, and `prior_work_signal` excludes exploratory rows.
 - **GUI gallery** hides exploratory rows unless `?include=exploratory`.
-- **Abandon sweep:** runs lazily inside `start_session` (no background job). An `open`/`in_progress` question with no activity for `DSOS_ABANDON_DAYS` (default 14) becomes `abandoned`, with `closed_at` set and the claim cleared. Activity = `max(created_at, claimed_at, latest tool call of claimed_by)`.
+- **Abandon sweep:** runs lazily inside `start_session` (no background job). An `open`/`in_progress` question with no activity for `DSOS_ABANDON_DAYS` (default 14) becomes `abandoned`, with `closed_at` set and the claim cleared. Activity = `max(created_at, claimed_at, latest tool call of claimed_by)`. This runs on every `start_session`, so **M3 must add an index on `questions(status)`** or the sweep is a table scan on the hot path.
 - **Producer `INSTRUCTIONS`:** runs are exploratory; claim what you stand behind with `mark(status="result")` or `status="result"` on the run; close your question.
 - **Regenerate the contract** (`python -m dsos.server.contract --write`).
 
