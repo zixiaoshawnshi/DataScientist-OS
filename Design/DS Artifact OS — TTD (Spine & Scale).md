@@ -319,6 +319,7 @@ The wave table below is a **schedule, not a claim that every cell is safe to par
 - **`validations`:**
   - Columns: `id TEXT PK`, `row_id TEXT NOT NULL REFERENCES artifacts`, `verdict TEXT NOT NULL CHECK (verdict IN ('confirmed','contradicted','stale','needs_review'))`, `by TEXT NOT NULL CHECK (by IN ('model','human') OR by LIKE 'derived:%')`, `session_id TEXT`, `at TEXT NOT NULL`, `basis TEXT NOT NULL`, plus an index on `row_id`.
   - **Append-only is enforced in the schema:** `BEFORE UPDATE` and `BEFORE DELETE` triggers `RAISE(ABORT, 'validations are append-only')`.
+  - **Write the triggers with explicit `conn.execute` calls, never as DDL in a shared `SCHEMA` string.** WP-A1's migration splitter cuts statements on `;` outside line comments, and a `CREATE TRIGGER ... BEGIN ... ; ... END` body would be split in half. `dsos/db.py` documents that limitation; do not reintroduce it.
 - **`questions`:**
   - Columns: `id TEXT PK`, `question TEXT NOT NULL`, `hypothesis TEXT`, `status TEXT NOT NULL CHECK (status IN ('open','in_progress','answered','abandoned'))`, `asked_by TEXT`, `claimed_by TEXT`, `claimed_at TEXT`, `artifact_row_id TEXT`, `created_at TEXT NOT NULL`, `closed_at TEXT`.
   - Plus `questions_fts` (fts5: `id UNINDEXED`, `question`, `hypothesis`).
