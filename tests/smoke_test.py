@@ -59,7 +59,7 @@ def main() -> None:
     print(f"[ok] saved dataset artifact: {dataset_row}")
 
     query_row = run_sql(
-        conn, code="SELECT team, score FROM toy_scores WHERE score > 10",
+        conn, code="SELECT team, score FROM in_1 WHERE score > 10",
         session_id=s1, title="High scorers", description="Teams scoring above 10.",
         input_row_ids=[dataset_row],
     )
@@ -112,7 +112,7 @@ def main() -> None:
     # --- round 2: reuse round 1's dataset ---
     s2 = start_session(conn, "round 2: deeper synthetic question")
     query2_row = run_sql(
-        conn, code="SELECT AVG(score) AS avg_score FROM toy_scores",
+        conn, code="SELECT AVG(score) AS avg_score FROM in_1",
         session_id=s2, title="Average score", description="Average score across all teams.",
         input_row_ids=[dataset_row],  # reusing round 1's dataset artifact
     )
@@ -131,7 +131,7 @@ def main() -> None:
     print(f"[ok] get_artifact_by_row_id degrades gracefully on a missing blob: {art.content_error}")
 
     broken_query_row = run_sql(
-        conn, code="SELECT * FROM toy_scores",
+        conn, code="SELECT * FROM in_1",
         session_id=s2, title="Should fail", description="Input's blob is gone.",
         input_row_ids=[dataset_row],
     )

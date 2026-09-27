@@ -65,7 +65,7 @@ async def main() -> None:
         chart_row = r.data["row_id"]
 
         r = await client.call_tool("run_sql", {
-            "code": "SELECT team, score FROM toy_scores WHERE score > 10",
+            "code": "SELECT team, score FROM in_1 WHERE score > 10",
             "session_id": s1, "title": "High scorers", "description": "Teams scoring above 10.",
             "input_row_ids": [dataset_row],
         })

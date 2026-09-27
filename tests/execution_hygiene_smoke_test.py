@@ -1,14 +1,17 @@
-"""Layer-2e smoke test: digit-leading artifact titles, and failed runs kept
-out of search/lineage, over the MCP wire (same pattern as
+"""Layer-2e smoke test: input binding by alias, and failed runs kept out of
+search/lineage, over the MCP wire (same pattern as
 tests/mcp_smoke_test.py).
 
-Two bugs from the pilot report:
+One bug from the pilot report:
 
 1. A title starting with a digit (e.g. "2025 headcount by department", a
    common real-world naming pattern) derived a table_name that was a
    SyntaxError as a Python identifier — a hard, unrecoverable crash for
-   run_python, with no workaround. safe_table_name now prefixes such names
-   with "t_".
+   run_python, with no workaround. It used to be papered over with a "t_"
+   prefix on the derived name; the fix was to stop deriving names from
+   titles at all. Inputs are bound positionally as in_1..in_N in
+   input_row_ids order (see tests/input_binding_smoke_test.py), so a
+   digit-leading title is just an ordinary input name now.
 
 2. A failed run_sql/run_python call still needs a real row (its row_id
    carries error/stdout/stderr back to the caller), but that dead,
@@ -61,16 +64,20 @@ async def main() -> None:
             "description": "headcount snapshot by department",
             "content_path": str(csv), "content_format": "csv", "session_id": s1,
         })).data
-        table_name = ds["table_name"]
-        check("digit-leading title gets a letter-prefixed table_name",
-              table_name == "t_2025_headcount_by_department", table_name)
+        # no title-derived name to look up or guess: the first input_row_id is
+        # in_1, whatever the artifact is called (WP-B1)
+        check("a digit-leading title is just an ordinary input",
+              "table_name" not in ds, str(sorted(ds)))
 
         run_ok = (await client.call_tool("run_python", {
-            "code": f"result = {table_name}.n.sum()",
+            "code": "result = in_1.n.sum()",
             "session_id": s1, "title": "Total headcount", "description": "sum n",
             "input_row_ids": [ds["row_id"]],
         })).data
-        check("run_python binds the prefixed name as a valid identifier",
+        check("a digit-leading title binds as in_1",
+              run_ok.get("input_tables") == {ds["row_id"]: "in_1"},
+              str(run_ok.get("input_tables")))
+        check("run_python binds the positional alias as a valid identifier",
               run_ok["status"] == "ok", run_ok.get("error"))
 
         bad = (await client.call_tool("run_python", {

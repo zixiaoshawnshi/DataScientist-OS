@@ -45,17 +45,22 @@ def _new_id() -> str:
 
 
 def safe_table_name(title: str) -> str:
-    """The rule for turning an artifact title into a variable/table name:
-    lowercase, non-alphanumeric -> `_`, never empty, never digit-leading.
-    Lives here (not in execution.py) because both run paths — in-process
-    namespace binding and the sandbox's input re-binding — must produce
-    identical names.
+    """The rule for turning an artifact title into an id-safe slug — used to
+    derive the `artifact_id` of a skill (save_skill) or a template
+    (save_template) from its title, when the caller doesn't supply one.
 
-    A title like "2025 headcount" would otherwise derive "2025_headcount"
-    — not a valid Python identifier (run_python's binding line is a hard
-    SyntaxError, no workaround) and an unquoted SQL identifier DuckDB
-    rejects too. Prefixing "t_" keeps the name valid in both without
-    changing anything for the common (letter-leading) case."""
+    It is NOT how run inputs are named any more. An input is bound
+    positionally, as in_1..in_N in input_row_ids order (see
+    execution._alias), because a title-derived name collided when two inputs
+    shared a title, needed the "t_" prefix below to stay a legal identifier
+    for a digit-leading title, and broke whenever the input was re-titled.
+
+    lowercase, non-alphanumeric -> `_`, never empty, never digit-leading. A
+    title like "2025 headcount" would otherwise derive "2025_headcount" —
+    not a valid Python identifier (a hard SyntaxError, no workaround) and an
+    unquoted SQL identifier DuckDB rejects too, hence the "t_". That prefix
+    only matters for the artifact_id case now, but the rule keeps producing
+    it so existing skill/template ids stay stable."""
     name = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_") or "t"
     if name[0].isdigit():
         name = f"t_{name}"

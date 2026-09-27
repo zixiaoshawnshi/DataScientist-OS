@@ -8,8 +8,9 @@ already has whatever the code needs; `requirements=[...]` is only for
 filling gaps in it:
 
     1. serialize input artifacts to temp files (parquet/json/bin/text)
-    2. write a wrapper script that re-binds them as variables and execs the
-       agent's code at module level
+    2. write a wrapper script that binds them to in_1..in_N (plus an
+       `inputs` dict keyed by row_id) and execs the agent's code at module
+       level
     3. run the wrapper — directly via `python_path` if `requirements` is
        empty, or via `uv run --quiet --no-project --python <python_path>
        --with <req>... wrapper.py` if not (wheels are cached globally by
@@ -40,7 +41,7 @@ from typing import Any
 
 import pandas as pd
 
-from dsos.store import Artifact, safe_table_name  # shared binding-name rule for in-process and subprocess runs
+from dsos.store import Artifact  # the input objects themselves
 
 DEFAULT_TIMEOUT_S = 300
 _OK_MARKER = "_dsos_ok"
@@ -119,15 +120,24 @@ def find_uv() -> str | None:
     return shutil.which("uv")
 
 
-def _write_inputs(workdir: Path, inputs: list[Artifact]) -> list[str]:
-    """Serialize each input artifact to a file and emit the wrapper lines
-    that bind it back to a variable named after its title — mirroring the
-    in-process namespace exactly (same safe_table_name)."""
+def _write_inputs(workdir: Path, inputs: list[tuple[str, Artifact]]) -> list[str]:
+    """Serialize each (binding name, artifact) pair to a file and emit the
+    wrapper lines that bind it back to that variable.
+
+    The names arrive from execution.py already decided (in_1..in_N, in
+    input_row_ids order), so the subprocess binds exactly the names the
+    response reported in input_tables — there is no second naming rule here
+    that could drift from the one the caller saw.
+
+    One extra binding comes out of this loop: `inputs`, the same objects
+    keyed by row_id. Code that wants "the orders artifact" by identity
+    rather than by position reaches it there."""
     bindings: list[str] = []
-    for art in inputs:
-        name = safe_table_name(art.title)
+    by_row_id: list[str] = []
+    for name, art in inputs:
         content = art.content
         path = workdir / f"input_{name}"
+        by_row_id.append(f"{art.row_id!r}: {name}")
         if isinstance(content, pd.DataFrame):
             file = path.with_suffix(".parquet")
             content.to_parquet(file)
@@ -146,6 +156,8 @@ def _write_inputs(workdir: Path, inputs: list[Artifact]) -> list[str]:
             file = path.with_suffix(".txt")
             file.write_text(str(content), encoding="utf-8")
             bindings.append(f"{name} = Path({str(file)!r}).read_text(encoding='utf-8')")
+    if by_row_id:
+        bindings.append(f"inputs = {{{', '.join(by_row_id)}}}")
     return bindings
 
 
@@ -210,7 +222,7 @@ def run_interpreter(
 
 def run_subprocess(
     *, code: str, requirements: list[str], code_paths: list[str] | None,
-    inputs: list[Artifact], python_path: str, chart_style: str | None = None,
+    inputs: list[tuple[str, Artifact]], python_path: str, chart_style: str | None = None,
 ) -> dict:
     """Run the agent's code against `python_path` — directly if
     `requirements` is empty (the common case: that interpreter already has
@@ -218,6 +230,10 @@ def run_subprocess(
     on top of it if not (uv's job is filling gaps, not resolving the whole
     stack every time). Returns status/error/stdout/stderr/result — the run
     dict execution.py's save/record/lineage tail expects.
+
+    `inputs` is a list of (binding name, artifact) pairs, in the order the
+    caller wants them bound; execution.py builds them from the caller's
+    input_row_ids (see execution._alias).
 
     chart_style: an already-resolved style path (see execution.run_python)
     applied in the wrapper before the user code. (No reset needed for None
