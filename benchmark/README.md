@@ -106,13 +106,66 @@ python report.py
 `answers_*.json`, and `report.py` discovers arms from whatever answer files
 exist, so no code change is needed per experiment.
 
+## The files + manifest arm, and what it measured
+
+The arm works like this. The workspace is seeded with an empty `MANIFEST.md`,
+and a system prompt — not the round prompt, where it would compete with the
+question and the answer format — requires the agent to read it before analysing
+anything, to write every intermediate result to a file, and to add an entry per
+derived file giving **path, the question it served, how it was computed, and its
+input paths**. The round prompt repeats the last of those before the answer. The
+runner snapshots the manifest at the end of every round to
+`results/manifests/<label>/`, so the next round's reuse is scored against what
+the manifest *advertised*, not against the workspace listing — that is the only
+reuse path the manifest can create. It gets the same raw-CSV removal as the dsos
+arm; without that it is not a comparison, it is a different question.
+
+Measured: **the manifest arm is a real improvement on plain files, and the
+store still beats it on the claim.** 54 runs on `deepseek-v4-flash` — all three
+6-round chains, 18 runs per arm, `results/report.md`:
+
+| arm | accuracy | tokens (18 runs) | re-fetch R2+ | findability R2+ | reuse R2+ | manifest reads |
+|---|---|---|---|---|---|---|
+| `file` | 89% (16/18) | **142,275** | 46 | 26 | 10 | — |
+| `file_manifest` | 94% (17/18) | 241,425 | **15** | **20** | 9 | 5 of 15 |
+| `dsos` | **100% (18/18)** | 253,569 | **0** | 26 | **77** | — |
+
+Read honestly, that is three findings, and not all of them flatter the store:
+
+1. **Files win on tokens, by a lot.** The store spent 78% more input+output
+   tokens than plain files over the same chains, and the manifest arm spent 70%
+   more. Nothing here shows the store being cheap.
+2. **The manifest mostly buys "stop re-fetching the raw CSV" (46 → 15), not
+   reuse.** Its reuse credit is flat against plain files (9 vs 10), because it
+   read the manifest in only **5 of 15** R2+ rounds: told to keep an index, a
+   weak model mostly kept writing files and skipped the bookkeeping. A prompt
+   nobody follows is not an affordance — the same lesson as the pilot's
+   zero-`search_artifacts` result, and the reason the manifest column is
+   reported as measured rather than as the arm's potential.
+3. **The store is the only arm that reuses prior work structurally**: 77
+   cross-session reuse calls against 9–10, zero re-fetch, and the only 100%
+   accuracy. What it costs is tokens and R1's registration overhead.
+
+No arm re-downloaded a dataset (`remote_fetches` is 0 everywhere), so the
+pilot's curl confound did not fire this time. The two `file` failures and the
+one `file_manifest` failure are in `results/scores_chains.json` with their
+values; one of them is a run that never emitted the requested tag block, which
+is why `answer_text_tagged` exists (see Scoring rules).
+
 ## Arms
 
 | Arm | Command | Raw CSV in R2/R3 | Meaning |
 |---|---|---|---|
 | `file` | `--condition file` | present | built-in file tools only; the most favorable file baseline |
+| `file_manifest` | `--condition file_manifest` | **removed** | the file arm plus a system prompt that requires a `MANIFEST.md` index — Doc II's "baseline that matters": files, indexed |
 | `dsos` | `--condition dsos` | **removed** | dsos tools against a dedicated store; the store is the only path to the data |
 | `dsos --keep-raw` | `--condition dsos --keep-raw` | present | diagnostic: what happens when the file competes with the store |
+
+The arms live in `arms.json`, which `runner.mjs`, `metrics.py` and `report.py`
+all read: one entry decides which conditions exist, whether the raw CSV
+survives R1 (`raw_csv_policy`), and which side holds the arm's record
+(`scored_from`: a transcript or the store). Adding an arm is one entry —
+WP-H2's consumer arm and WP-H3's parallel arm are meant to land there.
 
 The dsos arm removes the raw CSV after R1 **by default**, because that is
 dsos's intended workflow (register once, then rely on the store) and
@@ -208,8 +261,8 @@ Harness (`benchmark/`):
 
 ## Known limitations
 
-- Only one model has been run (`deepseek-v4-flash`). A single weak model cannot separate "the affordance is weak" from "the model is weak", so nothing here should be generalised to other models until a second one is run.
-- The depth chains have been built and spot-checked on 2 of 18 rounds, but **the full 36-run chain experiment has not been run**.
+- Only one model has been run (`deepseek-v4-flash`). A single weak model cannot separate "the affordance is weak" from "the model is weak", so nothing here should be generalised to other models until a second one is run. The three-arm run sharpens that caveat: the manifest instruction was followed in a third of the rounds, so part of what the manifest arm measures is *can this model maintain an index*, not *is an index useful*.
+- The depth chains have now been run across all three arms (54 runs, `results/report.md`). Those per-round numbers are one run of one model, not a repeated trial.
 - Pilot data (5 tables × 3 rounds) is still on disk and is explicitly *not* current; it predates the arm redesign, the dedupe/prior-work fixes, the H4 metric, and the persist instruction.
 - Per-category answers use the keyed tag form `@tag[key:value]` (e.g. `@median_price[Fair:3282.00]`), which DABench's flat convention cannot express. `score.py` parses both; flat tags are unchanged (verified: re-scoring the pilot reproduces identical results).
 - The task is easy to differentiate *against* dsos: a 58KB CSV in cwd is the best case for files, and as the first post-fix attempt showed, it wins even with the workflow in the system prompt and a candidate in hand. Removing the file (now the dsos default) is what makes the comparison meaningful.
@@ -218,6 +271,12 @@ Harness (`benchmark/`):
 
 - Tags extracted with `@tag[value]` regex; every gold tag must match
   for the question to pass.
+- The runner records `answer_text` (the last thing the agent said) **and**
+  `answer_text_tagged` (the last thing it said that carried the tags). Scoring
+  uses the tagged one, because a turn that states its answer and then closes
+  with a summary would otherwise be scored as "no answer" — a property of which
+  message the harness picked, not of the arm. Older answers files carry only
+  `answer_text` and score exactly as before.
 - Numeric values compare with absolute tolerance 0.02 **or** relative
   1% (whichever is larger) — `--abs-tol` / `--rel-tol` on `score.py`.
   Non-numeric values compare case-insensitively, stripped.
