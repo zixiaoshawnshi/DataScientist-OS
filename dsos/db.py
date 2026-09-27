@@ -1,12 +1,15 @@
 """SQLite schema and connection helper for the DS Artifact OS store.
 
 Layer 1 (core library): no MCP, no HTTP — just the data model from the
-design doc (Design/DS Artifact OS — Design Doc.md, "Data model" section).
+design doc (Design/DS Artifact OS — Design Doc.md, "Data model" section),
+plus the numbered migrations that move an existing store file forward.
 """
 
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 
 SCHEMA = """
@@ -93,6 +96,144 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 """
 
 
+class MigrationError(RuntimeError):
+    """A migration could not be applied. The store is left at the version it
+    was at before the migration started — nothing is half-applied."""
+
+
+# A migration moves the store from PRAGMA user_version n-1 to n: it is given
+# the connection, already inside its own transaction, and either finishes or
+# leaves the store exactly as it found it. Append new migrations to
+# MIGRATIONS; never edit one that has shipped, because a store that has run
+# it only ever runs the entries after it.
+Migration = Callable[[sqlite3.Connection], None]
+
+
+def _split_statements(script: str) -> list[str]:
+    """Split a DDL script into individual statements.
+
+    `executescript()` can't be used inside a migration: it issues an implicit
+    COMMIT before running, which would end the transaction the migration
+    owns. So the script is split by hand, text kept verbatim, because SQLite
+    stores the statement's own text in sqlite_master — a store created with
+    the comments stripped out of SCHEMA would not match one that wasn't.
+    Splitting on ';' alone would cut a statement in half at the ';' inside
+    SCHEMA's content_hash comment, so a line comment runs on to the end of its
+    line instead of terminating anything. String literals and block comments
+    are not handled; SCHEMA has neither.
+    """
+    statements: list[str] = []
+    current: list[str] = []
+    in_comment = False
+    index = 0
+    while index < len(script):
+        char = script[index]
+        if char == "\n":
+            in_comment = False
+        elif not in_comment and script.startswith("--", index):
+            in_comment = True
+            current.append("--")
+            index += 2
+            continue
+        elif char == ";" and not in_comment:
+            statement = "".join(current).strip()
+            if statement:
+                statements.append(statement)
+            current = []
+            index += 1
+            continue
+        current.append(char)
+        index += 1
+    trailing = "".join(current).strip()
+    if trailing:
+        statements.append(trailing)
+    return statements
+
+
+def _m1_baseline(conn: sqlite3.Connection) -> None:
+    """v0 -> v1: the schema above, plus the content_hash column that stores
+    created before v0.4 predate."""
+    # The guarded ALTER runs BEFORE the schema script, because
+    # idx_artifacts_content_hash indexes a column a pre-v0.4 store doesn't
+    # have yet. On a fresh store the table doesn't exist, the guard skips,
+    # and the script creates the table with the column.
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(artifacts)")}
+    if columns and "content_hash" not in columns:
+        conn.execute("ALTER TABLE artifacts ADD COLUMN content_hash TEXT")
+    for statement in _split_statements(SCHEMA):
+        conn.execute(statement)
+
+
+MIGRATIONS: list[Migration] = [_m1_baseline]
+
+
+def _is_empty(conn: sqlite3.Connection) -> bool:
+    """True of a store file that has no tables yet. Backing one of those up
+    would leave every fresh store littered with a .bak-v0 of nothing."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'"
+        " AND name NOT LIKE 'sqlite_%'").fetchone()
+    return not row[0]
+
+
+def _backup(path: Path, from_version: int) -> None:
+    """Copy the store to `<db path>.bak-v<from_version>` before it is changed,
+    so a bad migration can be backed out by hand. Uses the backup API rather
+    than a file copy, because the store is in WAL mode and a plain copy of the
+    main file would miss whatever is still in the -wal."""
+    source = sqlite3.connect(path)
+    try:
+        target = sqlite3.connect(f"{path}.bak-v{from_version}")
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+    finally:
+        source.close()
+
+
+def _apply(conn: sqlite3.Connection, number: int, migration: Migration) -> None:
+    # BEGIN IMMEDIATE takes the write lock up front rather than discovering at
+    # COMMIT time that someone else got there first, and every statement in the
+    # migration — including PRAGMA user_version, which is a header write and so
+    # rolls back with everything else — lands in one transaction.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        migration(conn)
+        conn.execute(f"PRAGMA user_version = {number}")
+        conn.execute("COMMIT")
+    except Exception as exc:  # noqa: BLE001 — re-raised as MigrationError
+        with suppress(sqlite3.Error):
+            conn.execute("ROLLBACK")
+        raise MigrationError(f"migration {number} failed: {exc}") from exc
+
+
+def migrate(conn: sqlite3.Connection, path: str | Path) -> int:
+    """Bring the store up to the latest schema version, returning its new
+    user_version. A store that is already current is left alone, backup and
+    all; a store from a newer dsos is refused."""
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version > len(MIGRATIONS):
+        raise MigrationError(
+            f"store was created by a newer dsos (schema v{version}); upgrade dsos.")
+    if version == len(MIGRATIONS):
+        return version
+    if not _is_empty(conn):
+        _backup(Path(path), version)
+    # isolation_level=None is what makes BEGIN IMMEDIATE/COMMIT mean what they
+    # say: in the default mode sqlite3 opens a transaction of its own around
+    # DML and would end the migration's transaction early. Restored on the way
+    # out, so callers keep the implicit-transaction behaviour they had before.
+    previous = conn.isolation_level
+    conn.isolation_level = None
+    try:
+        for number in range(version + 1, len(MIGRATIONS) + 1):
+            _apply(conn, number, MIGRATIONS[number - 1])
+    finally:
+        conn.isolation_level = previous
+    return len(MIGRATIONS)
+
+
 class _Connection(sqlite3.Connection):
     """Plain sqlite3.Connection has no __dict__ (C extension type), so it
     can't hold a stashed db_path attribute directly — subclassing it is the
@@ -104,7 +245,7 @@ class _Connection(sqlite3.Connection):
 
 
 def connect(db_path: str | Path = "data/store.db") -> sqlite3.Connection:
-    """Open (and if needed, initialize) the store's SQLite database."""
+    """Open (and if needed, migrate) the store's SQLite database."""
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     # check_same_thread=False: the MCP server runs tools in a thread pool by
@@ -118,28 +259,13 @@ def connect(db_path: str | Path = "data/store.db") -> sqlite3.Connection:
     # Default (rollback-journal) mode throws "database is locked" under that
     # read/write overlap; WAL lets readers and a writer coexist.
     conn.execute("PRAGMA journal_mode=WAL")
-    # Column migration runs BEFORE the schema script: on an existing store the
-    # table is already there and needs the new column before SCHEMA's
-    # CREATE INDEX on it can succeed. On a fresh store the table doesn't
-    # exist yet, the guard skips, and SCHEMA creates it with the column.
-    _add_missing_columns(conn)
-    conn.executescript(SCHEMA)
-    conn.commit()
+    # A migration's BEGIN IMMEDIATE waits for whoever else holds the write
+    # lock instead of failing immediately — the read-only GUI keeps its own
+    # connection open on this file, including across a restart.
+    conn.execute("PRAGMA busy_timeout=5000")
+    migrate(conn, path)
     conn._dsos_db_path = str(path)
     return conn
-
-
-# Columns added after the first released schema. CREATE TABLE IF NOT EXISTS
-# won't add these to an existing store.db, so an opened older file is
-# upgraded in place — one guarded ALTER per column, a no-op once present.
-_ADDED_COLUMNS = (("artifacts", "content_hash", "TEXT"),)
-
-
-def _add_missing_columns(conn: sqlite3.Connection) -> None:
-    for table, column, decl in _ADDED_COLUMNS:
-        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
-        if existing and column not in existing:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 def blob_dir_for(conn: sqlite3.Connection) -> Path:
