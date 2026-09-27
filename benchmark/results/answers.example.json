@@ -1,0 +1,37 @@
+{
+  "titanic.csv::R1": {
+    "answer_text": "The mean fare paid by passengers was @mean_fare[34.65].",
+    "tokens_in": null,
+    "tokens_out": null,
+    "duration_s": null,
+    "tool_calls": null,
+    "notes": "R1: fresh session, ingest round"
+  },
+  "titanic.csv::R2": {
+    "answer_text": "",
+    "tokens_in": null,
+    "tokens_out": null,
+    "duration_s": null,
+    "tool_calls": null,
+    "notes": "R2: fresh session, no file path in prompt"
+  },
+  "titanic.csv::R3": {
+    "answer_text": "",
+    "tokens_in": null,
+    "tokens_out": null,
+    "duration_s": null,
+    "tool_calls": null
+  },
+  "auto-mpg.csv::R1": { "answer_text": "", "tokens_in": null, "tokens_out": null, "duration_s": null, "tool_calls": null },
+  "auto-mpg.csv::R2": { "answer_text": "", "tokens_in": null, "tokens_out": null, "duration_s": null, "tool_calls": null },
+  "auto-mpg.csv::R3": { "answer_text": "", "tokens_in": null, "tokens_out": null, "duration_s": null, "tool_calls": null },
+  "insurance.csv::R1": { "answer_text": "", "tokens_in": null, "tokens_out": null, "duration_s": null, "tool_calls": null },
+  "insurance.csv::R2": { "answer_text": "", "tokens_in": null, "tokens_out": null, "duration_s": null, "tool_calls": null },
+  "insurance.csv::R3": { "answer_text": "", "tokens_in": null, "tokens_out": null, "duration_s": null, "tool_calls": null },
+  "hotel_data.csv::R1": { "answer_text": "", "tokens_in": null, "tokens_out": null, "duration_s": null, "tool_calls": null },
+  "hotel_data.csv::R2": { "answer_text": "", "tokens_in": null, "tokens_out": null, "duration_s": null, "tool_calls": null },
+  "hotel_data.csv::R3": { "answer_text": "", "tokens_in": null, "tokens_out": null, "duration_s": null, "tool_calls": null },
+  "microsoft.csv::R1": { "answer_text": "", "tokens_in": null, "tokens_out": null, "duration_s": null, "tool_calls": null },
+  "microsoft.csv::R2": { "answer_text": "", "tokens_in": null, "tokens_out": null, "duration_s": null, "tool_calls": null },
+  "microsoft.csv::R3": { "answer_text": "", "tokens_in": null, "tokens_out": null, "duration_s": null, "tool_calls": null }
+}

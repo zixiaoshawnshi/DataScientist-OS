@@ -1,0 +1,12 @@
+# Downloaded DABench tables (re-created by prepare.py)
+data/
+
+# The benchmark's own dsos store + blobs (re-created per batch with --reset-store)
+store.db
+store.db-shm
+store.db-wal
+blobs/
+
+# Recorded runs, transcripts, scores — everything except the example template
+results/*
+!results/answers.example.json
