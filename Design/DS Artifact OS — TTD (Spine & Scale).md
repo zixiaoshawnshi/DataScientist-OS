@@ -142,7 +142,15 @@ The wave table below is a **schedule, not a claim that every cell is safe to par
 
 ### WP-B1 — Bind inputs by alias, not title
 
-**Owns:** `dsos/sandbox.py`, `dsos/execution.py`, `dsos/mcp_server.py` (the `run_sql`, `run_python`, `save_artifact` docstrings/payloads and `_execution_result_payload`), `dsos/seed.py` (skill text only), `tests/input_binding_smoke_test.py` (new), plus the existing tests that assert title-derived names
+**Owns:** `dsos/sandbox.py`, `dsos/execution.py`, `dsos/mcp_server.py` (the `run_sql`, `run_python`, `save_artifact` docstrings/payloads and `_execution_result_payload`), `dsos/seed.py` (skill text only), `tests/input_binding_smoke_test.py` (new), plus **every** existing test whose only breakage is a title-derived binding name
+
+**Ownership exceptions granted to B1** (added during execution, after the WP found a real gap in its own `Owns` list). These are narrow and one-time; they are not a general relaxation of rule 3.
+
+- **`dsos/store.py`, `safe_table_name` docstring only.** The spec below says to update that docstring, but `store.py` is owned by B2/B3/E2/F1/G1. B1 may change **only that docstring** — no code, no signature, no other function. A comment-only change cannot conflict.
+- **`tests/smoke_test.py`, `tests/gui_smoke_test.py`, `tests/publish_smoke_test.py`** — owned by no WP and by B2 respectively; each breaks on `FROM toy_scores`. The "existing tests that assert title-derived names" clause is the TTD's own language and covers them. Change the binding reference only.
+- **`tests/execution_hygiene_smoke_test.py`** (B3's) — this test's premise is the `t_` prefix workaround that B1 removes, so B1 invalidates it. **B1 fixes the binding assertion and docstring, and touches nothing else in the file.** B3's failed-run assertions are left intact; B3 branches after B1 merges and inherits a correct file.
+
+**The line that matters, for all of the above:** B1 may fix breakage that *is* a binding-name change and nothing else. A logic difference, a status value, an execution id, or a response key other than `table_name` is a finding to report, not a fix to make.
 
 **Spec**
 - **SQL:** register each input as `in_1..in_N`, in `input_row_ids` order.
@@ -154,6 +162,8 @@ The wave table below is a **schedule, not a claim that every cell is safe to par
 - **`_schema_hint`** lists `in_1 "<title>" (col, ...)`.
 - **`safe_table_name`** stays, but is used only to derive `artifact_id` for skills and templates. Update its docstring to say so.
 - **Update every reference** to title-derived names: tool docstrings, `INSTRUCTIONS`, and the skill texts in `seed.py`. Grep `dsos/`, `tests/` and `benchmark/` for `table_name`, `input_tables` and `safe_table_name`. Report any hits in `benchmark/` rather than editing them; they belong to Lane H.
+
+  **Grep result (Sep 27, B1 execution):** the binding-name breakage reaches further than the two originally anticipated. Beyond `mcp_smoke_test.py` and `dedupe_smoke_test.py`, `smoke_test.py`, `gui_smoke_test.py` and `publish_smoke_test.py` all bind `toy_scores`, and `execution_hygiene_smoke_test.py` reads `ds["table_name"]`. See the ownership exceptions above — this list is the authority, not the original `Owns` line.
 
 **Tests (write first)**
 1. Two inputs with **identical titles** can both be addressed as `in_1`/`in_2`, in SQL and in Python.
