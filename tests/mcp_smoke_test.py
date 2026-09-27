@@ -74,14 +74,14 @@ async def main() -> None:
             })
             assert "row_id" in r.data, r.data
             dataset_row = r.data["row_id"]
-            assert r.data.get("table_name") == "toy_scores", (
-                "save_artifact should surface the normalized table/variable name "
-                "up front, not make the agent guess or wait for an error (feedback #1)"
+            assert "table_name" not in r.data, (
+                "inputs are bound positionally (in_1..in_N), so there is no "
+                "title-derived name to hand back (WP-B1)"
             )
-            print(f"[ok] save_artifact ingested csv -> dataset row {dataset_row}, table_name inlined")
+            print(f"[ok] save_artifact ingested csv -> dataset row {dataset_row}, no table_name")
 
         r = await client.call_tool("run_sql", {
-            "code": "SELECT team, score FROM toy_scores WHERE score > 10",
+            "code": "SELECT team, score FROM in_1 WHERE score > 10",
             "session_id": s1, "title": "High scorers", "description": "Teams scoring above 10.",
             "input_row_ids": [dataset_row],
         })
@@ -93,15 +93,15 @@ async def main() -> None:
         # id run_sql actually returns) was itself broken. Both fixed now.
         assert r.data["row_count"] == 2, r.data
         assert r.data["preview"], "run_sql should inline a preview, not just a row_id"
-        assert r.data.get("table_name") == "high_scorers", (
-            "the output artifact's own table name should be inlined too, for chaining "
-            "into a later run_sql/run_python call (feedback #1)"
+        assert "table_name" not in r.data, (
+            "the output artifact has no title-derived name any more; it is "
+            "bound as in_1 of the next call (WP-B1)"
         )
-        assert r.data.get("input_tables") == {dataset_row: "toy_scores"}, (
-            "run_sql should map each input row_id to the table name it registered "
-            "it under (feedback #1)"
+        assert r.data.get("input_tables") == {dataset_row: "in_1"}, (
+            "run_sql should map each input row_id to the alias it registered "
+            "it under, by position (WP-B1)"
         )
-        print(f"[ok] run_sql (over the wire) -> query row {query_row}, preview + table names inlined")
+        print(f"[ok] run_sql (over the wire) -> query row {query_row}, preview + input aliases inlined")
 
         r = await client.call_tool("get_artifact", {"row_id": query_row, "session_id": s1})
         assert "error" not in r.data, r.data
@@ -125,7 +125,7 @@ async def main() -> None:
         print("[ok] narrative's {{artifact:...}} embed auto-derived lineage, with no parent_row_ids passed")
 
         r = await client.call_tool("run_sql", {
-            "code": "SELECT this_column_does_not_exist FROM toy_scores",
+            "code": "SELECT this_column_does_not_exist FROM in_1",
             "session_id": s1, "title": "Deliberately broken query",
             "description": "Exercises the error path.", "input_row_ids": [dataset_row],
         })
@@ -136,7 +136,7 @@ async def main() -> None:
         )
         assert "Traceback" not in r.data["error"], "error should exclude internal frame noise"
         assert "Traceback" in r.data.get("stderr", ""), "full traceback should still be in stderr"
-        assert "toy_scores(team, score)" in r.data["error"], (
+        assert 'in_1 "Toy Scores" (team, score)' in r.data["error"], (
             "a failed run_sql should name the available tables/columns, not just "
             "the bad reference (feedback #8)"
         )
@@ -152,7 +152,7 @@ async def main() -> None:
         r = await client.call_tool("start_session", {"question": "round 2: deeper question"})
         s2 = r.data["session_id"]
         r = await client.call_tool("run_sql", {
-            "code": "SELECT AVG(score) AS avg_score FROM toy_scores",
+            "code": "SELECT AVG(score) AS avg_score FROM in_1",
             "session_id": s2, "title": "Average score", "description": "Average score, round 2.",
             "input_row_ids": [dataset_row],
         })
@@ -161,7 +161,7 @@ async def main() -> None:
 
         # --- round 3: scratch mode + ImportError hint (feedback #7, #8) ---
         r = await client.call_tool("run_sql", {
-            "code": "SELECT COUNT(*) AS n FROM high_scorers",
+            "code": "SELECT COUNT(*) AS n FROM in_1",
             "session_id": s2, "title": "Scratch count",
             "description": "Scratch run — must NOT become an artifact.",
             "input_row_ids": [query_row], "scratch": True,
@@ -236,7 +236,7 @@ async def main() -> None:
             # (parquet out, parquet back in), resolved per-call by uv
             r = await client.call_tool("run_python", {
                 "code": "import tabulate; "
-                        "result = tabulate.tabulate(high_scorers.to_dict('records'), headers='keys')",
+                        "result = tabulate.tabulate(in_1.to_dict('records'), headers='keys')",
                 "session_id": s2, "title": "Scratch via uv",
                 "description": "Scratch run pulling a missing package via uv, with a DataFrame input.",
                 "input_row_ids": [query_row], "scratch": True,
@@ -264,7 +264,7 @@ async def main() -> None:
         # --- round 5: agent-facing diagnostics (feedback #4, #5, #10) ---
         r = await client.call_tool("run_python", {
             "code": "print('computing averages'); "
-                    "result = toy_scores.groupby('team')['score'].mean().reset_index()",
+                    "result = in_1.groupby('team')['score'].mean().reset_index()",
             "session_id": s2, "title": "Mean by team",
             "description": "Mean score per team; also exercises stdout passthrough.",
             "input_row_ids": [dataset_row],
@@ -281,7 +281,7 @@ async def main() -> None:
             "code": (
                 "import matplotlib.pyplot as plt\n"
                 "fig, ax = plt.subplots()\n"
-                "ax.plot(toy_scores['score'])\n"
+                "ax.plot(in_1['score'])\n"
                 "result = fig\n"
             ),
             "session_id": s2, "title": "Score chart", "description": "A plot of scores.",
@@ -299,7 +299,7 @@ async def main() -> None:
         print("[ok] run_python: a matplotlib Figure `result` auto-renders to an inline PNG image")
 
         r = await client.call_tool("run_sql", {
-            "code": "SELECT COUNT(*) AS n FROM toy_scores",
+            "code": "SELECT COUNT(*) AS n FROM in_1",
             "session_id": s2, "title": "Scratch to promote",
             "description": "A scratch run worth keeping after all.",
             "input_row_ids": [dataset_row], "scratch": True,
@@ -307,7 +307,7 @@ async def main() -> None:
         assert r.data["status"] == "ok", r.data
         scratch_id = r.data.get("scratch_id")
         assert scratch_id, "a scratch run should return a scratch_id (feedback #4)"
-        assert r.data.get("input_tables") == {dataset_row: "toy_scores"}
+        assert r.data.get("input_tables") == {dataset_row: "in_1"}
         print(f"[ok] scratch run_sql -> scratch_id {scratch_id}, input_tables inlined")
 
         r = await client.call_tool("promote_scratch", {
@@ -405,7 +405,7 @@ async def main() -> None:
         print("[ok] get_artifact on a missing blob returns a named, actionable error (feedback #4)")
 
         r = await client.call_tool("run_sql", {
-            "code": "SELECT * FROM toy_scores",
+            "code": "SELECT * FROM in_1",
             "session_id": s2, "title": "Should fail",
             "description": "Input blob was deleted above.",
             "input_row_ids": [dataset_row],

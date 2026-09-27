@@ -47,7 +47,7 @@ import duckdb
 import pandas as pd
 
 from dsos import templating
-from dsos.store import Artifact, get_artifact_by_row_id, safe_table_name, save_artifact
+from dsos.store import Artifact, get_artifact_by_row_id, save_artifact
 
 _STDOUT_LIMIT = 2_000
 _STDERR_LIMIT = 4_000  # tail-capped: the traceback's final frames are the useful ones
@@ -74,13 +74,58 @@ def _output_summary(result: Any) -> dict:
     return {}
 
 
+def _alias(i: int) -> str:
+    """The binding name for the i-th input of a call (1-based): in_1, in_2,
+    ... Positional, never derived from the title — the single rule every
+    run path and every response field follows (see input_aliases)."""
+    return f"in_{i}"
+
+
+def input_aliases(inputs: list) -> dict[str, str]:
+    """{row_id: binding name} for a resolved input list, in list order. This
+    is what the `input_tables` response field reports, and it is why the
+    aliases are the same in the response, in DuckDB, and in the sandbox
+    wrapper: one function, one rule.
+
+    The names are positional rather than title-derived on purpose. A name
+    from the title collided when two inputs shared one, needed a "t_"
+    prefix to stay a legal identifier for a digit-leading title, and broke
+    outright when the input was re-titled. A position can't do any of that.
+    """
+    return {art.row_id: _alias(i) for i, art in enumerate(inputs, start=1)}
+
+
+def _resolve_inputs(conn: sqlite3.Connection, input_row_ids: list[str]) -> list[Artifact]:
+    """Load every input artifact the caller listed, in the order they listed
+    them, and raise a named ValueError for an unknown or repeated id.
+
+    Both used to be silent-or-crash: get_artifact_by_row_id returns None for
+    an unknown row_id, so the run died later with an AttributeError on None
+    (or, for a repeat, quietly read the same artifact twice under one name).
+    The message names the offending id, because these are 32-char hex ids a
+    model mistypes."""
+    inputs: list[Artifact] = []
+    seen: set[str] = set()
+    for row_id in input_row_ids:
+        art = get_artifact_by_row_id(conn, row_id)
+        if art is None:
+            raise ValueError(f"unknown input_row_id {row_id!r}")
+        if row_id in seen:
+            raise ValueError(f"duplicate input_row_id {row_id!r}")
+        seen.add(row_id)
+        inputs.append(art)
+    return inputs
+
+
 def _schema_hint(inputs: list) -> str:
-    """Table/column names for every registered DataFrame input, appended to
-    a run_sql failure (feedback #8) — so a column/table typo is fixable from
-    the error alone, without a separate scratch DESCRIBE/schema poke."""
+    """Alias, title and columns for every registered DataFrame input,
+    appended to a run_sql failure (feedback #8) — so a column/table typo is
+    fixable from the error alone, without a separate scratch DESCRIBE/schema
+    poke. The title is here, not in the name: it's what the agent needs to
+    recognize which in_k it meant."""
     tables = [
-        f"{safe_table_name(a.title)}({', '.join(a.content.columns)})"
-        for a in inputs if isinstance(a.content, pd.DataFrame)
+        f'{_alias(i)} "{a.title}" ({", ".join(a.content.columns)})'
+        for i, a in enumerate(inputs, start=1) if isinstance(a.content, pd.DataFrame)
     ]
     return f" | available tables: {'; '.join(tables)}" if tables else ""
 
@@ -128,7 +173,7 @@ def _scratch_payload(
     from dsos import present
 
     input_row_ids = [a.row_id for a in inputs]
-    input_tables = {a.row_id: safe_table_name(a.title) for a in inputs}
+    input_tables = input_aliases(inputs)
     scratch_id = uuid.uuid4().hex
     _SCRATCH_CACHE[scratch_id] = {
         "kind": kind, "code": code, "title": title, "description": description,
@@ -210,7 +255,10 @@ def run_sql(
     input_row_ids: list[str], scratch: bool = False,
 ) -> str | dict:
     """Runs `code` in DuckDB with each input artifact registered as a table
-    named after its title (lowercased, non-alnum -> `_`). The result becomes a
+    named `in_1`, `in_2`, ... in the order the caller listed them in
+    `input_row_ids` — positional, never derived from the title, so two
+    inputs sharing a title, a digit-leading title, and a re-titled input all
+    behave the same. The result becomes a
     new `query` artifact, lineage-linked to every input — unless
     scratch=True, in which case the payload comes back inline and nothing is
     persisted."""
@@ -218,13 +266,14 @@ def run_sql(
     stdout = io.StringIO()
     status, error, stderr_text, result = "ok", None, "", None
 
-    inputs = [get_artifact_by_row_id(conn, rid) for rid in input_row_ids]
+    inputs: list[Artifact] = []
     duck = duckdb.connect(":memory:")
 
     try:
+        inputs = _resolve_inputs(conn, input_row_ids)
         _check_inputs(inputs)
-        for art in inputs:
-            duck.register(safe_table_name(art.title), art.content)  # content: pandas.DataFrame
+        for i, art in enumerate(inputs, start=1):
+            duck.register(_alias(i), art.content)  # content: pandas.DataFrame
         with contextlib.redirect_stdout(stdout):
             result = duck.execute(code).fetchdf()
     except Exception as exc:
@@ -260,8 +309,10 @@ def run_python(
     style: str | None = "dsos",
 ) -> str | dict:
     """Runs `code` in a subprocess against `python_path`, with each input
-    artifact bound to a variable named after its title (lowercased,
-    non-alnum -> `_`), plus `pd`. The code must set a variable named
+    artifact bound to `in_1`, `in_2`, ... in the order the caller listed
+    them in `input_row_ids` — positional, never derived from the title — plus
+    `inputs`, a dict of the same objects keyed by row_id, and `pd` (pandas).
+    The code must set a variable named
     `result`; that becomes the new artifact's content — unless scratch=True,
     in which case the payload comes back inline and nothing is persisted.
 
@@ -282,15 +333,19 @@ def run_python(
     runs, so a bad reference is a one-call error, not a matplotlib error
     mid-chart."""
     started_at = _now()
-    inputs = [get_artifact_by_row_id(conn, rid) for rid in input_row_ids]
+    inputs: list[Artifact] = []
 
     try:
+        inputs = _resolve_inputs(conn, input_row_ids)
         _check_inputs(inputs)
         chart_style = templating.resolve_chart_style(conn, style)
         from dsos import sandbox
         run = sandbox.run_subprocess(
             code=code, requirements=list(requirements or []),
-            code_paths=code_paths, inputs=inputs, chart_style=chart_style,
+            code_paths=code_paths, chart_style=chart_style,
+            # the alias/artifact pairs, so the wrapper binds exactly the
+            # names this module reports in input_tables
+            inputs=[(_alias(i), art) for i, art in enumerate(inputs, start=1)],
             python_path=python_path,
         )
     except Exception as exc:

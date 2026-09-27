@@ -64,8 +64,11 @@ your own with save_skill.
 tools, then save_artifact to register it (type="dataset", with source). An \
 unregistered dataset is invisible to search, lineage, and every future question.
 5. run_sql / run_python against the registered artifacts to compute the \
-actual answer — never eyeball or summarize the raw data yourself. Their \
-result is returned inline in the same response (a preview, row_count, \
+actual answer — never eyeball or summarize the raw data yourself. Your \
+inputs are bound positionally: the first row_id in input_row_ids is \
+`in_1`, the second `in_2`, and so on (in Python, `inputs["<row_id>"]` \
+reaches one by id). Each response echoes that mapping in `input_tables`. \
+Their result is returned inline in the same response (a preview, row_count, \
 columns) — do not call get_artifact right after just to see what you \
 produced; it's already there. Charts: output_type="chart" — styled with \
 the dark house style by default; style= picks another (list_templates).
@@ -245,11 +248,9 @@ def save_artifact(
     computes staleness automatically — before reusing a dataset, check
     `fetched_at`/`refresh_after` yourself and decide if it's worth refetching.
 
-    The response's `table_name` is this artifact's title, normalized
-    exactly the way run_sql/run_python will register it (lowercased,
-    non-alphanumeric -> `_`) — use it directly as the table/variable name
-    in your next run_sql/run_python call instead of guessing or waiting
-    for a "table does not exist" error.
+    The response's `input_tables` (on run_sql/run_python) maps each input
+    row_id to the name it was bound under — in_1, in_2, ... in the order
+    you passed input_row_ids.
 
     Registering the same content twice is collapsed: if this exact content
     is already in the store, you get that artifact's existing row_id back
@@ -275,7 +276,7 @@ def save_artifact(
         if existing is not None:
             art = store.get_artifact_by_row_id(conn, existing)
             return {
-                "row_id": existing, "table_name": store.safe_table_name(art.title),
+                "row_id": existing,
                 "artifact_row_ids": [existing], "deduplicated": True,
                 "note": f"identical {type} already in the store as {art.title!r} "
                         f"(row {existing}); reused it instead of registering a duplicate. "
@@ -292,7 +293,7 @@ def save_artifact(
     except ValueError as exc:
         return {"error": str(exc), "artifact_row_ids": []}
     return {
-        "row_id": row_id, "table_name": store.safe_table_name(title),
+        "row_id": row_id,
         "artifact_row_ids": [row_id],
     }
 
@@ -386,15 +387,12 @@ def _execution_result_payload(row_id: str, input_row_ids: list[str]) -> dict | o
     payload = {
         **_artifact_payload(art),
         "status": art.status,
-        # This run's own output, normalized the same way as any input table
-        # (feedback #1) — chain it straight into your next run_sql/
-        # run_python call instead of re-deriving it from the title.
-        "table_name": store.safe_table_name(art.title),
-        "input_tables": {
-            rid: store.safe_table_name(in_art.title)
-            for rid in input_row_ids
-            if (in_art := store.get_artifact_by_row_id(conn, rid, load_content=False))
-        },
+        # Which alias each input got, by the same positional rule the run
+        # itself used (execution.input_aliases) — so the agent can chain
+        # this run's output into the next call without re-deriving anything.
+        # Position, not title: an input re-titled or duplicated can't change
+        # what in_1 means mid-session.
+        "input_tables": {rid: f"in_{i}" for i, rid in enumerate(input_row_ids, start=1)},
         "artifact_row_ids": [row_id, *input_row_ids],
     }
     # stdout is top-level on success AND failure (feedback #10): it's where
@@ -428,8 +426,12 @@ def run_sql(
     scratch: bool = False,
 ) -> dict:
     """Run SQL (DuckDB) against one or more artifacts. Each input row_id is
-    available as a table named after that artifact's title (lowercased,
-    non-alphanumeric -> _). The result is returned inline below (row_count,
+    registered as a table named in_1, in_2, ... in the order you list them
+    in input_row_ids — the response's `input_tables` says which row_id got
+    which name. The names are positional, never derived from the title, so
+    two inputs with the same title, a title starting with a digit, and an
+    input you later re-titled all behave the same.
+    The result is returned inline below (row_count,
     columns, a 10-row preview) — you do NOT need a second call to see it.
     It's also saved as a new `query` artifact, automatically lineage-linked
     to every input and recorded — no separate save_artifact call needed.
@@ -442,12 +444,13 @@ def run_sql(
     promote it later via promote_scratch(scratch_id=...) without
     re-running the query, if it turns out you do want to keep it after all.
 
-    On failure, the error includes the schema (columns) of every registered
-    input table, so a column/table typo is fixable from the error alone.
+    On failure, the error includes each registered input as
+    `in_k "<title>" (columns)`, so a column/table typo is fixable from the
+    error alone.
 
     Example:
       run_sql(
-        code="SELECT team, score FROM toy_scores WHERE score > 10",
+        code="SELECT team, score FROM in_1 WHERE score > 10",
         session_id="s1", title="High scorers",
         description="Teams scoring above 10.",
         input_row_ids=["<row_id of the toy_scores dataset artifact>"],
@@ -468,8 +471,13 @@ def run_python(
     style: str | None = "dsos", python_path: str | None = None,
 ) -> dict:
     """Run Python against one or more artifacts. Each input row_id is bound
-    to a variable named after that artifact's title (see `input_tables` in
-    the response for the exact name used); `pd` (pandas) is available. Your
+    to a variable named in_1, in_2, ... in the order you list them in
+    input_row_ids (the response's `input_tables` says which row_id got which
+    name), and every input is also reachable by id as
+    `inputs["<row_id>"]`; `pd` (pandas) is available. The names are
+    positional, never derived from the title, so two inputs with the same
+    title, a title starting with a digit, and an input you later re-titled
+    all behave the same. Your
     code MUST assign a `result` variable — a DataFrame, a dict/list (saved
     as JSON), a string, or for output_type="chart" a matplotlib Figure/Axes
     (e.g. whatever `plt.gcf()`/`plt.subplots()` gives you — it's rendered to
@@ -522,7 +530,7 @@ def run_python(
 
     Example:
       run_python(
-        code="result = toy_scores.groupby('team')['score'].mean().reset_index()",
+        code="result = in_1.groupby('team')['score'].mean().reset_index()",
         session_id="s1", title="Average score by team",
         description="Mean score per team.",
         input_row_ids=["<row_id of the toy_scores dataset artifact>"],

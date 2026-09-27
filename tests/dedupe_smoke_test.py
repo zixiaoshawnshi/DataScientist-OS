@@ -81,7 +81,7 @@ async def main() -> None:
               r4.get("row_id") and r4.get("row_id") != r1.get("row_id"))
 
         n_rows = (await client.call_tool("run_sql", {
-            "code": "SELECT COUNT(*) AS n FROM titanic", "session_id": s2,
+            "code": "SELECT COUNT(*) AS n FROM in_1", "session_id": s2,
             "title": "Row count", "description": "Count rows in the registered dataset.",
             "input_row_ids": [r1["row_id"]],
         })).data

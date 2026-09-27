@@ -64,6 +64,13 @@ whether it's still good enough or worth refetching.
 Once registered, use run_sql / run_python against the artifact's row_id
 for every query, transform, or chart you build from it, so lineage stays
 connected.
+
+How the inputs reach your code: the first row_id in input_row_ids is
+`in_1`, the second is `in_2`, and so on — in SQL as a table, in Python
+as a variable (plus `inputs["<row_id>"]` to reach one by id). Every
+response echoes the mapping in `input_tables`. Never name a table or
+variable after a title yourself: titles are for humans and change, these
+names don't.
 """
 
 _EDA_MD = """\
@@ -73,8 +80,9 @@ Purpose: get from "raw dataset artifact" to "understood, cleaned, reusable
 artifacts" — leaving every step addressable for the next question.
 
 1. **Peek with scratch runs.** run_sql/run_python with scratch=True for row
-   counts, SELECT * LIMIT 10, value counts on the columns that matter.
-   Scratch peeks never become artifacts — use them freely, register nothing.
+   counts, SELECT * FROM in_1 LIMIT 10, value counts on the columns that
+   matter. Scratch peeks never become artifacts — use them freely,
+   register nothing.
 2. **Compute summaries, don't eyeball previews.** A 10-row preview is not
    evidence. Make the summary the `result` (shape, dtypes, missingness per
    column, duplicates) so it's a number you can cite, not a print you
