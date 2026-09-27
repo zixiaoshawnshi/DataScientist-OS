@@ -12,16 +12,22 @@
   :root {
     --bg: #fbfbfa; --ink: #14161a; --muted: #6b7078; --accent: #2f6f5e; --line: #e4e3df;
     --footer-h: 2.75rem;
+    --blob-fill: 30, 32, 35; /* card fill: near-black neutral, not pure
+                                black — a grey wash reads as a tint, pure
+                                black reads as a hole punched in the slide */
+    --blob: rgba(var(--blob-fill), 0.03); /* text-blob card; see .panel-inner */
     color-scheme: light;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
       --bg: #101214; --ink: #eceae4; --muted: #8b9088; --accent: #6fcbb2; --line: #262a26;
+      --blob: rgba(var(--blob-fill), 0.2);
       color-scheme: dark;
     }
   }
   :root[data-theme="dark"] {
     --bg: #101214; --ink: #eceae4; --muted: #8b9088; --accent: #6fcbb2; --line: #262a26;
+    --blob: rgba(var(--blob-fill), 0.2);
     color-scheme: dark;
   }
 
@@ -41,43 +47,85 @@
     overflow: hidden;
     padding: 2.75rem 1.25rem calc(2.75rem + var(--footer-h));
   }
-  .panel-inner { max-width: 36rem; width: 100%; margin: 0 auto; }
-
-  /* --- any slide with a video backdrop: full-bleed, forced dark regardless
-     of page theme, so text stays legible over arbitrary footage --- */
-  .video-bg {
-    position: relative; overflow: hidden; background: #0b0d0f;
-    align-items: stretch; padding: 0;
+  /* The text blob carries its own translucent card so slide copy stays
+     readable independently of what the slide is sitting on. --blob is a
+     theme-level token: barely-there on the plain light slide (already
+     dark-on-cream, so it needs no help), stronger on dark, strongest over
+     media. */
+  .panel-inner {
+    max-width: 36rem; width: 100%; margin: 0 auto;
+    background: var(--blob);
+    border-radius: 0.5rem;
+    padding: 1.4rem 1.5rem;
   }
-  .video-bg .bg-media {
+
+  /* --- any slide with a media backdrop (video or still): full-bleed, forced
+     dark regardless of page theme, so text stays legible over arbitrary
+     imagery --- */
+  .media-bg {
+    position: relative; overflow: hidden; background: #0b0d0f;
+    align-items: stretch; padding: 0 1.25rem;
+    /* Retheme the slide's subtree. The per-element rules below pin the
+       colors that actually appear on the video slides, but any other
+       component (code blocks, tabs, copy buttons) reads --ink/--muted/
+       --accent/--line, which would otherwise still resolve to the light
+       theme's values and vanish against a dark backdrop. */
+    --ink: #f5f4f0; --muted: #9a9d95; --accent: #6fcbb2; --line: #3a3d38;
+    --blob: rgba(var(--blob-fill), 0.3);
+    color-scheme: dark;
+  }
+  .media-bg .bg-media {
     position: absolute; inset: 0; width: 100%; height: 100%;
     object-fit: cover; opacity: 0.55;
   }
-  .video-bg .bg-scrim {
+  .media-bg .bg-scrim {
     position: absolute; inset: 0;
     background: linear-gradient(180deg, rgba(11,13,15,0.30) 0%, rgba(11,13,15,0.88) 100%);
   }
-  .video-bg .panel-inner {
+  .media-bg .panel-inner {
     position: relative; z-index: 1;
-    padding: 0 1.25rem;
+    /* Frost the card: separates the copy from whatever is moving underneath,
+       which a flat scrim alone cannot do where the footage is busy. Carries
+       more of the weight than the card's own alpha, so the fill can stay
+       light enough to read as a tint rather than a slab. */
+    backdrop-filter: blur(9px) saturate(1.2);
+    -webkit-backdrop-filter: blur(9px) saturate(1.2);
   }
-  .video-bg .eyebrow { color: #9a9d95; }
-  .video-bg .eyebrow::before { color: #6fcbb2; }
-  .video-bg h1 { color: #f5f4f0; }
-  .video-bg p.pitch { color: #c7c9c2; }
-  .video-bg p.pitch em { color: #f5f4f0; }
-  .video-bg .watch-link {
+  .media-bg .eyebrow { color: #9a9d95; }
+  .media-bg .eyebrow::before { color: #6fcbb2; }
+  .media-bg h1 { color: #f5f4f0; }
+  .media-bg p.pitch { color: #c7c9c2; }
+  .media-bg p.pitch em { color: #f5f4f0; }
+  .media-bg .watch-link {
     display: inline-block; font-size: 0.8rem; color: #9a9d95;
     text-decoration: underline; text-decoration-color: #3a3d38; text-underline-offset: 3px;
   }
-  .video-bg .watch-link:hover, .video-bg .watch-link:focus-visible {
+  .media-bg .watch-link:hover, .media-bg .watch-link:focus-visible {
     color: #6fcbb2; text-decoration-color: #6fcbb2;
   }
-  .video-bg .block-head .label { color: #9a9d95; }
-  .video-bg .block-head .label::before { color: #6fcbb2; }
-  .video-bg ul.features li { color: #c7c9c2; }
-  .video-bg ul.features strong { color: #f5f4f0; }
-  .video-bg ul.features li::before { color: #6fcbb2; }
+  .media-bg .block-head .label { color: #9a9d95; }
+  .media-bg .block-head .label::before { color: #6fcbb2; }
+  .media-bg ul.features li { color: #c7c9c2; }
+  .media-bg ul.features strong { color: #f5f4f0; }
+  .media-bg ul.features li::before { color: #6fcbb2; }
+
+  /* A still needs no motion to hide behind, but it is a screenshot of a
+     document: at full strength its own headings read as text and fight the
+     slide's copy. Drop it well back, blur it, and scale slightly so the
+     blur has no soft edge at the viewport border. */
+  .image-bg .bg-media {
+    opacity: 0.32;
+    filter: blur(3px);
+    transform: scale(1.05);
+  }
+  .image-bg .bg-scrim {
+    background: linear-gradient(180deg, rgba(11,13,15,0.35) 0%, rgba(11,13,15,0.88) 100%);
+  }
+
+  /* The install slide has the tallest content of the backdrop slides.
+     .media-bg zeroes the panel's vertical padding so the media can bleed edge
+     to edge, which leaves the fixed footer with no clearance — restore it. */
+  #panel-install { padding-bottom: calc(2.75rem + var(--footer-h)); }
 
   /* --- phase-in intro on the hero's own text, on page load --- */
   @keyframes phase-in {
@@ -217,7 +265,7 @@
 <div class="swiper" id="site-swiper">
   <div class="swiper-wrapper">
 
-    <section class="swiper-slide panel hero video-bg" id="panel-hero">
+    <section class="swiper-slide panel hero media-bg" id="panel-hero">
       <video class="bg-media" autoplay muted loop playsinline preload="auto" onerror="this.style.display='none'">
         <source src="media/demo.mp4" type="video/mp4">
       </video>
@@ -235,7 +283,7 @@
       </div>
     </section>
 
-    <section class="swiper-slide panel video-bg" id="panel-features">
+    <section class="swiper-slide panel media-bg" id="panel-features">
       <video class="bg-media" autoplay muted loop playsinline preload="auto" onerror="this.style.display='none'">
         <source src="media/demo-gui.mp4" type="video/mp4">
       </video>
@@ -251,7 +299,9 @@
       </div>
     </section>
 
-    <section class="swiper-slide panel" id="panel-install">
+    <section class="swiper-slide panel media-bg image-bg" id="panel-install">
+      <img class="bg-media" src="media/demo-report.jpg" alt="" aria-hidden="true" decoding="async">
+      <div class="bg-scrim"></div>
       <div class="panel-inner">
         <div class="block-head">
           <div class="tabs" role="tablist" aria-label="Coding agent">
