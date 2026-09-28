@@ -24,6 +24,44 @@
       "raw_csv_policy": "remove_after_r1",
       "manifest": false,
       "tools": "builtin+dsos"
+    },
+    "consumer": {
+      "label": "consumer (PM, store only)",
+      "order": 4,
+      "scored_from": "transcript",
+      "raw_csv_policy": "n/a",
+      "manifest": false,
+      "tools": "consumer",
+      "mode": "claims"
+    },
+    "consumer_files": {
+      "label": "consumer + files (ceiling)",
+      "order": 5,
+      "scored_from": "transcript",
+      "raw_csv_policy": "n/a",
+      "manifest": false,
+      "tools": "builtin",
+      "mode": "claims"
+    },
+    "parallel_board": {
+      "label": "parallel producers (board on)",
+      "order": 6,
+      "scored_from": "store",
+      "raw_csv_policy": "n/a",
+      "manifest": false,
+      "tools": "builtin+dsos",
+      "mode": "parallel",
+      "board": "on"
+    },
+    "parallel_noboard": {
+      "label": "parallel producers (board off)",
+      "order": 7,
+      "scored_from": "store",
+      "raw_csv_policy": "n/a",
+      "manifest": false,
+      "tools": "builtin+dsos",
+      "mode": "parallel",
+      "board": "off"
     }
   }
 }

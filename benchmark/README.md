@@ -152,6 +152,100 @@ one `file_manifest` failure are in `results/scores_chains.json` with their
 values; one of them is a run that never emitted the requested tag block, which
 is why `answer_text_tagged` exists (see Scoring rules).
 
+## The consumer arm, and what it measured
+
+The producer arms ask what reuse *costs*; the consumer arm asks a different
+question — given a claim a colleague wrote down, can an agent that has no data
+decide whether to back it, and cite the right row? The scenario is a PM on
+`/mcp/consumer` (`find_evidence`, `get_claim`, `cite`, `ask`), nothing else.
+
+`build_claims.py` prepares a store of chain results with the three lifecycle
+hazards placed on the rows the claims are about: a **superseded** first-pass
+premium share, a **contradicted** recomputation, and a **stale** census result
+(its dataset is past its `refresh_after`, so the verdict is derived on read —
+D11 — not written). It then writes ten claims: five true, five false, three of
+the false ones resting on one of those repudiated rows.
+
+```sh
+python build_claims.py                 # results/claims.json + benchmark/consumer/store.db
+python -m dsos.daemon --port 8766      # DSOS_DB_PATH=benchmark/consumer/store.db
+node runner.mjs --condition consumer --label claims_consumer \
+                --claims results/claims.json --store benchmark/consumer/store.db
+node runner.mjs --condition consumer_files --label claims_consumer_files \
+                --claims results/claims.json          # the ceiling
+python report.py
+```
+
+The ceiling is the same PM with the raw CSVs and a `MANIFEST.md` in its
+working directory (the file_manifest arm's affordance) and no store. It is the
+strongest thing files can do for "should I believe this number" — and it is the
+arm the store is *supposed* to beat outright.
+
+Measured — `results/report.md`, from `results/answers_claims_consumer.json`,
+`results/answers_claims_consumer_files.json` and `results/claims.json`:
+
+| arm | verdicts correct | cited the right row | bad backing (target 0) | refuted by a repudiated row | tokens |
+|---|---|---|---|---|---|
+| `consumer` (store only) | **10/10** | **8/10** | **0** | 2 | 16,566 |
+| `consumer_files` (ceiling) | 8/10 | 0/10 | 0 | 0 | 26,131 |
+
+Definitions, fixed before the run rather than after (see `metrics.claims_metrics`):
+`bad backing` is a claim marked **supported** with a superseded, contradicted or
+stale row — a citation used as evidence for a claim the row does not back.
+Citing one to **refute** a claim is the healthy case, not the error, so those are
+counted separately as `refuted by a repudiated row`; the store arm did it twice.
+The ceiling has no rows to cite, so its citations are `none` by construction.
+
+Read honestly, three findings:
+
+1. **The store wins outright, and on exactly the axis predicted.** 10/10 verdicts
+   against 8/10, and 8 correct row citations against 0 — a file cannot cite a
+   row that does not exist. The store was also cheaper in tokens (16.6k vs 26.1k),
+   because reading results beats recomputing them from 8 MB of CSVs.
+2. **Both file-arm failures are the store's unique contribution.** On claim 4
+   (*premium diamonds are 40.38%*) the file agent refuted a **true** claim because
+   it read "premium" as the **Premium cut** (25.56%) — the chain's definition
+   (price per carat above the mean) lived in R4's result, not in the raw CSV. On
+   claim 8 (*total net capital = 32,246,624*) it recomputed the number correctly
+   and **supported a stale result**, because a file cannot know the dataset is
+   past its refresh window. One is a lost definition, the other a lost lifecycle:
+   neither is reachable from the data alone.
+3. **The agent can tell a contradicted row from a good one.** The two class-7/8
+   claims were correctly refuted *by naming the repudiated row as the reason*,
+   which is the discrimination the arm exists to test — not a bad citation. A
+   weaker result here (the store citing the bad row as support) would have been
+   the more interesting failure; it did not happen on this run.
+
+## Exploratory noise — does `status='exploratory'` survive contact with an agent?
+
+Doc II open question 1 worries that everything gets marked `result` because that
+is the path of least resistance, which is the assumption WP-G1's default flip
+rests on. `metrics.exploratory_noise_metrics` turns it into a number, computed
+from the store the dsos arm actually produced. Measured over the 18-run chain
+(`results/report.md`, section "Exploratory noise"; store `benchmark/store.db`,
+the run behind `results/answers_chain_dsos.json`):
+
+- **4 of 28 artifacts are exploratory (14.3%).** The fraction is not near zero,
+  so the design's two-tier draft/commit model is doing real work: run outputs are
+  left unclaimed at a measurable rate rather than being promoted wholesale.
+- **10 of the 13 sessions' searches returned at least one exploratory row**, and
+  **0 searches returned only exploratory rows**. So flipping the default (WP-G1)
+  shrinks what a search returns here, but on this run it never turns a search
+  that returned something into one that returns nothing.
+
+One caveat stated plainly: this is measured **pre-cutover**. WP-G1 is not merged
+in this worktree, so `search_artifacts` still defaults `include_exploratory=True`;
+the numbers above describe the store as built, and the post-flip effect is
+inferred from each search call's recorded hits, not re-executed. Re-running this
+section after cutover is the honest next step, not a formality.
+
+## U2 — dead `FINDABILITY_TOOLS` entry removed
+
+`list_skills` was removed from the product two waves ago (WP-B2), so counting it
+in findability was dead weight that misled anyone reading the numbers. It is now
+out of `FINDABILITY_TOOLS` in both `metrics.py` and `report.py`; `list_templates`
+(restored by U1) stays. Covered by `benchmark/arms_test.py`.
+
 ## Arms
 
 | Arm | Command | Raw CSV in R2/R3 | Meaning |
@@ -160,6 +254,8 @@ is why `answer_text_tagged` exists (see Scoring rules).
 | `file_manifest` | `--condition file_manifest` | **removed** | the file arm plus a system prompt that requires a `MANIFEST.md` index — Doc II's "baseline that matters": files, indexed |
 | `dsos` | `--condition dsos` | **removed** | dsos tools against a dedicated store; the store is the only path to the data |
 | `dsos --keep-raw` | `--condition dsos --keep-raw` | present | diagnostic: what happens when the file competes with the store |
+| `consumer` | `--condition consumer --claims results/claims.json` | n/a | a PM on `/mcp/consumer` only, adjudicating claims against the store |
+| `consumer_files` | `--condition consumer_files --claims results/claims.json` | n/a | the ceiling: the same PM with the raw CSVs and a `MANIFEST.md`, no store |
 
 The arms live in `arms.json`, which `runner.mjs`, `metrics.py` and `report.py`
 all read: one entry decides which conditions exist, whether the raw CSV
