@@ -334,8 +334,11 @@ The wave table below is a **schedule, not a claim that every cell is safe to par
 - **Rewrite AGENTS.md** §4 (register) and §5 (verify) around this flow:
   1. Start the daemon.
   2. Register the shim with `claude mcp add ... -- <python> -m dsos.mcp_server --profile producer`.
-  3. For HTTP-capable clients, the direct alternative is `claude mcp add --transport http dsos http://127.0.0.1:8765/mcp/producer --header "Authorization: Bearer <token>"`.
+  3. For HTTP-capable clients, the direct alternative is `claude mcp add --transport http dsos http://127.0.0.1:8765/mcp/producer/ --header "Authorization: Bearer <token>"`. **Note the trailing slash** (see below).
   4. For a consumer agent, use `--profile consumer`.
+- **§5's verify step is `start_session` with any question, not a "read-only tool"** (amended after execution). The original text said to call one read-only tool, naming `list_skills`/`list_templates`, and that has been wrong since before this refactor: **every** producer tool requires at least one argument — `list_templates` needs `session_id`, `search_artifacts` needs `query` and `session_id`, `get_artifact`/`get_lineage` need `row_id` — so there is no zero-argument read the reader can make on a fresh store. `start_session` needs no prior state and exercises daemon → auth → shim → store write, which is more evidence than a read would.
+- **Do not name a tool that does not exist yet.** `find_evidence` is WP-F1; the consumer profile has zero tools until it lands. Documenting it here is the same drift WP-C2 exists to prevent, in the file a new user reads first.
+- **The HTTP endpoints need the trailing slash.** `/mcp/producer` answers a `307` redirect to `/mcp/producer/` because the app is mounted with `path="/"`, and the auth check runs after the redirect — so an unauthenticated POST to the slashless form gets a `307`, not the `401` you would expect. Auth is still enforced correctly on the real endpoint. Document the slash; do not "fix" the mount, which is WP-D1's and working as specified.
 
 **Tests (write first)**
 1. With the daemon running, a stdio `fastmcp.Client` pointed at the shim lists the producer tools.
