@@ -569,7 +569,35 @@ WP-B3 needed the session-detail page to list that session's failed executions. I
 
 **Assigned to WP-D1**, which owns `dsos/gui.py` and is already a `gui.py` refactor (into `create_gui_router`). Move the query into `store.py` there and add it to D1's `Owns` note. It is small; the point is that it should not survive to the daemon, where the GUI becomes a mounted router over a shared `Database`.
 
-### U4 — two features now depend on one private function
+### U5 — the coordination board only matches IDENTICAL phrasing (found by E3, confirmed by the integrator)
+
+`related_questions` uses the same AND-prefix FTS rule as `search_artifacts`, plus exact normalised-text matching. Measured against a real store after WP-E3 merged:
+
+| producer asks | board hits |
+|---|---|
+| `is red really the q3 leader?` (identical to the consumer's) | 1 |
+| `which player leads q3?` | **0** |
+| `who is leading q3` | **0** |
+| `q3 leader` (high overlap, short) | **0** |
+
+**Why this matters more than a ranking nit.** Doc II §Architecture says the board is "how the PM agent's request reaches an analysis agent" — a consumer calls `ask`, a producer picks the question up at `start_session`. With AND-matching, that only works if both agents phrase the question identically, which is the one thing two independent agents will not do. The consumer hand-off, and the duplicate-work rate H3 measures, both rest on this.
+
+**The rule was designed for the other feature.** `_fts_query`'s own docstring says AND is deliberate because "OR'd terms make a long question match almost anything via common words, drowning the exact-term-wins signal." That reasoning is right for `search_artifacts` — artifact titles are short and keyword-like, and search has a semantic fallback behind it. It is **wrong for `questions`**, which are long natural-language sentences with no semantic fallback, because AND over two differently-phrased sentences almost never holds. Copying the rule to the board inherited a decision whose premises did not travel.
+
+**The cost asymmetry is what settles it.** A spurious related question costs an agent one glance. A missed one means two agents do the same analysis — the exact failure this whole design exists to prevent, and the thing H3 is instrumented to measure. For the board, recall should beat precision.
+
+**Options for the maintainer to decide (do not change this unilaterally):**
+1. **OR'd FTS ranked by shared content terms** — no new schema, no embeddings, and the cost asymmetry justifies the false positives. Needs a ranking and a stopword list.
+2. **A semantic fallback for questions**, mirroring `search_artifacts`. This requires an embedding column on `questions` and an M4 migration, which Doc II explicitly rejected on hot-path grounds.
+3. **Keep AND** and accept that the consumer hand-off works only on near-identical phrasing — and say so in Doc II rather than discovering it in a demo.
+
+Whatever is chosen, the decision belongs before **WP-F1**, whose `ask` tool exists specifically to put a consumer's question where a producer will see it.
+
+### U6 — `with db.write()` serialises writers but does not COMMIT them
+
+Found by E3, which introduced it: its first `start_session` left the `sessions` UPDATE uncommitted. The process-wide `RLock` is released when the tool returns, but the SQLite transaction on that thread's connection is **not**, so a RESERVED lock stayed on the file and every *other* thread's write then failed with `database is locked` after the busy timeout. The first tool call in the process died.
+
+This is a general hazard, not an E3 bug: `Database.write()` gives mutual exclusion, not a transaction boundary. **Every write path must `commit()` inside the block** — the store functions already do their own `commit()`, which is why most call sites are safe, but any tool that writes directly must not assume the context manager ended the transaction. Worth a line in `db.py`'s `write()` docstring, which currently implies more than it delivers.
 
 The FTS AND-prefix rule lives in `dsos/store.py:_fts_query`, a private function. `search_artifacts` uses it internally, and since **WP-E3** the question board uses it too, across a module boundary: `dsos/spine.py` imports `store._fts_query`.
 
