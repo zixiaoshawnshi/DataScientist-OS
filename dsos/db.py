@@ -244,7 +244,123 @@ def _m2_failed_runs_are_executions(conn: sqlite3.Connection) -> None:
     )
 
 
-MIGRATIONS: list[Migration] = [_m1_baseline, _m2_failed_runs_are_executions]
+# The spine's three new tables, as one script so that a reader can see the
+# whole shape at once. It is NOT in SCHEMA and is NOT run through
+# _split_statements: it belongs to M3, which is why a store that predates it
+# gets it, and it is applied statement by statement below rather than as
+# one blob. The triggers are the reason for that rule — a CREATE TRIGGER
+# body contains a ';' that _split_statements would happily cut a trigger in
+# half — so nothing here is ever handed to the splitter.
+_SPINE_TABLES = """
+CREATE TABLE IF NOT EXISTS validations (
+    id TEXT PRIMARY KEY,
+    row_id TEXT NOT NULL REFERENCES artifacts(row_id),
+    verdict TEXT NOT NULL CHECK (verdict IN ('confirmed','contradicted','stale','needs_review')),
+    by TEXT NOT NULL CHECK (by IN ('model','human') OR by LIKE 'derived:%'),
+    session_id TEXT,
+    at TEXT NOT NULL,
+    basis TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_validations_row_id ON validations(row_id);
+
+-- The coordination board: what is being worked on, by whom, and what came
+-- of it. artifact_row_id is the answer a finished question points at, which
+-- is also how reuse is spotted later.
+CREATE TABLE IF NOT EXISTS questions (
+    id TEXT PRIMARY KEY,
+    question TEXT NOT NULL,
+    hypothesis TEXT,
+    status TEXT NOT NULL CHECK (status IN ('open','in_progress','answered','abandoned')),
+    asked_by TEXT,
+    claimed_by TEXT,
+    claimed_at TEXT,
+    artifact_row_id TEXT,
+    created_at TEXT NOT NULL,
+    closed_at TEXT
+);
+
+-- WP-G1's abandon sweep filters on status inside every start_session, so
+-- this index is on the hot path, not an optimisation.
+CREATE INDEX IF NOT EXISTS idx_questions_status ON questions(status);
+"""
+
+_QUESTIONS_FTS = """
+CREATE VIRTUAL TABLE IF NOT EXISTS questions_fts USING fts5(
+    id UNINDEXED,
+    question,
+    hypothesis
+)
+"""
+
+# Append-only is a property of the table, not a convention the code is
+# trusted to keep: a verdict is a claim about what was known at a moment in
+# time, and rewriting one destroys the only record that the belief changed.
+# RAISE(ABORT) rather than RAISE(IGNORE) so the statement fails loudly
+# instead of silently doing nothing.
+_APPEND_ONLY_TRIGGERS = [
+    """
+    CREATE TRIGGER IF NOT EXISTS validations_no_update
+    BEFORE UPDATE ON validations
+    BEGIN
+        SELECT RAISE(ABORT, 'validations are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS validations_no_delete
+    BEFORE DELETE ON validations
+    BEGIN
+        SELECT RAISE(ABORT, 'validations are append-only');
+    END
+    """,
+]
+
+
+def _m3_spine_schema(conn: sqlite3.Connection) -> None:
+    """v2 -> v3: the spine — lifecycle columns, the validation ledger and
+    the question board.
+
+    Three changes, none of which touches a row that already means
+    something:
+
+    - artifacts.status: 'ready' and 'ok' are renamed to 'result' in place,
+      because those are the two spellings the same state has had. 'error'
+      rows are left alone: they are the dead artifact rows WP-B3 stopped
+      writing, and a store may still hold some. The column's DEFAULT
+      stays 'ready' — code writes status explicitly and never relies on it
+      (D2/D3), and changing it here would desynchronise a fresh store from
+      a migrated one for no gain.
+    - artifacts gains confidence/caveats/superseded_by, and sessions gains
+      kind/question_id/client. All NULL (or defaulted) so every existing
+      row still inserts and reads back as it did.
+    - validations and questions are new tables, created here rather than
+      added to SCHEMA so that a store of any age converges on the same
+      schema as a fresh one.
+    """
+    conn.execute("UPDATE artifacts SET status = 'result' WHERE status IN ('ready', 'ok')")
+    for column in ("confidence", "caveats", "superseded_by"):
+        conn.execute(f"ALTER TABLE artifacts ADD COLUMN {column} TEXT")
+    # kind is NOT NULL, so it needs a default for the rows already there;
+    # a session that exists before this migration is a producer session,
+    # which is what the column means (D12 adds the consumer kind later).
+    conn.execute("ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'producer'")
+    conn.execute("ALTER TABLE sessions ADD COLUMN question_id TEXT")
+    conn.execute("ALTER TABLE sessions ADD COLUMN client TEXT")
+
+    for statement in _split_statements(_SPINE_TABLES):
+        conn.execute(statement)
+    conn.execute(_QUESTIONS_FTS)
+    # One conn.execute per trigger, deliberately: a trigger body's ';' is
+    # the one thing _split_statements cannot survive.
+    for trigger in _APPEND_ONLY_TRIGGERS:
+        conn.execute(trigger)
+
+
+MIGRATIONS: list[Migration] = [
+    _m1_baseline,
+    _m2_failed_runs_are_executions,
+    _m3_spine_schema,
+]
 
 
 def _is_empty(conn: sqlite3.Connection) -> bool:

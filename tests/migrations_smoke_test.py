@@ -14,6 +14,18 @@ refuse a store it doesn't understand). Covered here:
    schema, no bumped user_version, and an error naming which migration failed.
 5. A store from a newer dsos is refused rather than opened.
 
+Plus the spine schema itself (WP-E1's M3), which is where the constraints
+that have to survive a file on disk are defined:
+
+6. A v2 store's legacy `ready`/`ok` artifact rows become `result`, and its
+   `error` rows are left exactly as they were.
+7. `validations` is append-only in the schema, not in convention: UPDATE
+   and DELETE both abort.
+8. The verdict/by/question-status CHECK constraints reject bad values.
+9. A store created fresh and a store migrated from v2 end up with the same
+   schema — the property that makes "run the migrations" and "start empty"
+   interchangeable, and that no other test in the suite would catch.
+
 Run: .venv/Scripts/python.exe tests/migrations_smoke_test.py
 """
 
@@ -33,6 +45,7 @@ ROOT = Path(os.environ["DSOS_DB_PATH"]).parent
 shutil.rmtree(ROOT, ignore_errors=True)
 
 from dsos import db  # noqa: E402 — import after DSOS_DB_PATH is set
+from dsos import embeddings  # noqa: E402 — for a right-sized embedding blob
 
 # The v0.3 schema, verbatim: the current SCHEMA minus the content_hash column
 # and minus the index over it, since a store without the column could not have
@@ -149,6 +162,219 @@ def build_v03_store(path: Path) -> None:
     )
     con.commit()
     con.close()
+
+
+# --- WP-E1: the spine schema (M3) ------------------------------------------
+#
+# The v2 store below is built by running the real MIGRATIONS list truncated
+# to 2, not by hard-coding a schema the way V03_SCHEMA above does. The
+# hard-coded fixture is right for a v0.3 store — a store that predates
+# dsos.db's SCHEMA entirely, which is exactly what that check is for — but
+# check 9 compares a migrated store against a fresh one character by
+# character, so a hand-written v2 fixture would drift the moment a word of
+# dsos/db.py changed and every difference would read as a migration bug. A
+# v2 store produced by the real code is what a user who ran an earlier
+# release actually has on disk.
+
+V2_STATUSES = [("r-ready", "ready"), ("r-ok", "ok"), ("r-error", "error")]
+
+
+def build_v2_store(path: Path) -> None:
+    """A store at user_version 2 holding one artifact row per legacy
+    status, so M3's status mapping can be checked against all three."""
+    with mock.patch.object(db, "MIGRATIONS", db.MIGRATIONS[:2]):
+        conn = db.connect(path)
+    try:
+        conn.execute("INSERT INTO sessions VALUES ('s0', 'a v2 question', '2026-01-01')")
+        for row_id, status in V2_STATUSES:
+            conn.execute(
+                "INSERT INTO artifacts (row_id, artifact_id, version, type, title,"
+                " description, tags, content_ref, content_format, created_at,"
+                " embedding, session_id, status) VALUES (?, ?, 1, 'query', ?, ?,"
+                " '[]', 'x.sql', 'sql', '2026-01-01', ?, 's0', ?)",
+                (row_id, row_id, row_id, f"a {status} row", bytes(4 * embeddings.DIM), status),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    check("the fixture really is a v2 store", user_version(path) == 2, f"v{user_version(path)}")
+
+
+def schema_of(path: Path) -> dict[str, str]:
+    """Every declared object in a store, as {name: normalised SQL}, with
+    fts5's shadow tables left out — they are an implementation detail of
+    the virtual table, and what this compares is what dsos declares."""
+    con = sqlite3.connect(path)
+    try:
+        rows = con.execute(
+            "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL"
+            " AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    finally:
+        con.close()
+    out = {}
+    for name, sql in rows:
+        if name.endswith(("_data", "_idx", "_content", "_docsize", "_config")):
+            continue
+        out[name] = " ".join(sql.split())
+    return out
+
+
+def test_legacy_statuses_become_results() -> None:
+    spine = ROOT / "spine" / "store.db"
+    build_v2_store(spine)
+    conn = db.connect(spine)
+    try:
+        rows = dict(conn.execute("SELECT row_id, status FROM artifacts"))
+        check("M3 maps a legacy 'ready' row to 'result'", rows.get("r-ready") == "result",
+              str(rows.get("r-ready")))
+        check("M3 maps a legacy 'ok' row to 'result'", rows.get("r-ok") == "result",
+              str(rows.get("r-ok")))
+        check("M3 leaves a legacy 'error' row alone", rows.get("r-error") == "error",
+              str(rows.get("r-error")))
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(artifacts)")}
+        check("M3 adds confidence, caveats and superseded_by to artifacts",
+              {"confidence", "caveats", "superseded_by"} <= cols, str(sorted(cols)))
+        sess_cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
+        check("M3 adds kind, question_id and client to sessions",
+              {"kind", "question_id", "client"} <= sess_cols, str(sorted(sess_cols)))
+        kinds = {r["kind"] for r in conn.execute("SELECT kind FROM sessions")}
+        check("an existing session gets kind='producer'", kinds == {"producer"}, str(kinds))
+    finally:
+        conn.close()
+
+
+def test_validations_are_append_only() -> None:
+    spine = ROOT / "spine" / "store.db"
+    conn = db.connect(spine)
+    try:
+        conn.execute(
+            "INSERT INTO validations (id, row_id, verdict, by, session_id, at, basis)"
+            " VALUES ('v1', 'r-ready', 'confirmed', 'model', 's0', '2026-01-02', 'recomputed')"
+        )
+        conn.execute(
+            "INSERT INTO validations (id, row_id, verdict, by, session_id, at, basis)"
+            " VALUES ('v2', 'r-ready', 'contradicted', 'human', 's0', '2026-01-03', 'checked')"
+        )
+        conn.commit()
+        check("a validations row can be appended",
+              conn.execute("SELECT COUNT(*) FROM validations").fetchone()[0] == 2)
+
+        messages = []
+        for statement in ("UPDATE validations SET verdict = 'stale' WHERE id = 'v1'",
+                          "DELETE FROM validations WHERE id = 'v1'"):
+            try:
+                conn.execute(statement)
+                conn.commit()
+                messages.append("")
+            except sqlite3.IntegrityError as exc:
+                conn.rollback()
+                messages.append(str(exc))
+        check("UPDATE on validations aborts", "validations are append-only" in messages[0],
+              messages[0] or "the UPDATE was allowed")
+        check("DELETE on validations aborts", "validations are append-only" in messages[1],
+              messages[1] or "the DELETE was allowed")
+        check("an aborted write leaves the rows alone",
+              conn.execute("SELECT COUNT(*) FROM validations").fetchone()[0] == 2)
+    finally:
+        conn.close()
+
+
+def test_check_constraints() -> None:
+    spine = ROOT / "spine" / "store.db"
+    conn = db.connect(spine)
+    try:
+        rejected = []
+        for bad in ("probably", "a robot"):
+            column, value = ("verdict", bad) if bad == "probably" else ("by", bad)
+            try:
+                conn.execute(
+                    "INSERT INTO validations (id, row_id, verdict, by, at, basis)"
+                    " VALUES ('bad', 'r-ok', ?, ?, 'now', 'because')",
+                    (value, value) if column == "verdict" else ("confirmed", value),
+                )
+                conn.commit()
+                rejected.append("")
+            except sqlite3.IntegrityError as exc:
+                conn.rollback()
+                rejected.append(str(exc))
+        check("a verdict outside the four allowed values is rejected",
+              "CHECK" in rejected[0].upper(), rejected[0] or "it was accepted")
+        check("a 'by' that is neither model, human nor derived:* is rejected",
+              "CHECK" in rejected[1].upper(), rejected[1] or "it was accepted")
+
+        # derived:<how> is the escape hatch, so it has to work or every
+        # computed check would have to be recorded as a human/model claim.
+        conn.execute(
+            "INSERT INTO validations (id, row_id, verdict, by, at, basis)"
+            " VALUES ('vd', 'r-ok', 'confirmed', 'derived:schema', 'now', 'same query, same data')"
+        )
+        conn.commit()
+        check("by='derived:...' is accepted", True)
+
+        status_error = ""
+        try:
+            conn.execute(
+                "INSERT INTO questions (id, question, status, created_at)"
+                " VALUES ('q-bad', 'is it so?', 'maybe', 'now')"
+            )
+            conn.commit()
+        except sqlite3.IntegrityError as exc:
+            conn.rollback()
+            status_error = str(exc)
+        check("a question status outside the four allowed values is rejected",
+              "CHECK" in status_error.upper(), status_error or "it was accepted")
+
+        conn.execute(
+            "INSERT INTO questions (id, question, hypothesis, status, asked_by, created_at)"
+            " VALUES ('q1', 'is it so?', 'yes', 'in_progress', 's0', 'now')"
+        )
+        # The sync from questions into questions_fts is the code's job
+        # (WP-E3); what is checked here is that the virtual table this
+        # migration created is searchable and joins back to its row.
+        conn.execute(
+            "INSERT INTO questions_fts (id, question, hypothesis)"
+            " VALUES ('q1', 'is it so?', 'yes')"
+        )
+        conn.commit()
+        check("a valid question can be created", True)
+        hit = conn.execute(
+            "SELECT q.id FROM questions_fts JOIN questions q ON q.id = questions_fts.id"
+            " WHERE questions_fts MATCH 'so' AND q.id = 'q1'"
+        ).fetchall()
+        check("questions_fts indexes the question text and resolves back to the row",
+              bool(hit), "" if hit else "no fts hit")
+    finally:
+        conn.close()
+
+
+def test_fresh_and_migrated_agree() -> None:
+    fresh = ROOT / "compare-fresh" / "store.db"
+    legacy = ROOT / "compare-legacy" / "store.db"
+    db.connect(fresh).close()
+    build_v2_store(legacy)
+    db.connect(legacy).close()
+
+    a, b = schema_of(fresh), schema_of(legacy)
+    only_fresh = sorted(set(a) - set(b))
+    only_legacy = sorted(set(b) - set(a))
+    differing = sorted(k for k in set(a) & set(b) if a[k] != b[k])
+    check("a fresh store and a migrated store declare the same objects",
+          not only_fresh and not only_legacy,
+          f"only fresh: {only_fresh}, only migrated: {only_legacy}")
+    check("a fresh store and a migrated store declare the same SQL", not differing,
+          f"{len(a)} objects compared" if not differing else "\n" + "\n".join(
+              f"      {k}\n        fresh:    {a[k]}\n        migrated: {b[k]}" for k in differing))
+    ready_default = [schema.get("artifacts", "").count("DEFAULT 'ready'") for schema in (a, b)]
+    check("the status column keeps its 'ready' default in both", ready_default == [1, 1],
+          "" if ready_default == [1, 1] else f"{ready_default} occurrences of the default")
+    indexed = ["questions(status)" in schema.get("idx_questions_status", "") for schema in (a, b)]
+    check("both stores index questions(status)", indexed == [True, True],
+          "" if indexed == [True, True] else str(indexed))
+    check("both stores carry the two append-only triggers",
+          {"validations_no_update", "validations_no_delete"} <= set(a)
+          and {"validations_no_update", "validations_no_delete"} <= set(b),
+          str(sorted(set(a) & set(b))))
 
 
 def test_fresh_store() -> None:
@@ -277,6 +503,10 @@ def main() -> None:
     case("reopening a current store changes nothing", test_reopen_is_a_no_op)
     case("a failing migration rolls back", test_failing_migration_rolls_back)
     case("a newer store is refused", test_newer_store_is_refused)
+    case("a v2 store's legacy statuses become results", test_legacy_statuses_become_results)
+    case("validations are append-only in the schema", test_validations_are_append_only)
+    case("the spine CHECK constraints reject bad values", test_check_constraints)
+    case("a fresh store and a migrated store agree", test_fresh_and_migrated_agree)
 
     shutil.rmtree(ROOT, ignore_errors=True)
     if FAILURES:
