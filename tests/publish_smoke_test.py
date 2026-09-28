@@ -37,7 +37,15 @@ shutil.rmtree(Path(os.environ["DSOS_DB_PATH"]).parent, ignore_errors=True)
 from fastmcp import Client  # noqa: E402
 
 from dsos import publish  # noqa: E402
-from dsos.mcp_server import conn as mcp_conn, mcp  # noqa: E402 — import after DSOS_DB_PATH is set
+from dsos.db import connect  # noqa: E402
+
+# The test's own read of the store the server writes to, on the path set
+# above. WP-C1 removed the module-level `conn` from dsos.mcp_server on
+# purpose — a process can no longer have "the" connection — so this opens
+# its own, on the same file.
+mcp_conn = connect(os.environ["DSOS_DB_PATH"])
+
+from dsos.mcp_server import mcp  # noqa: E402 — import after DSOS_DB_PATH is set
 
 # A minimal valid 1x1 transparent PNG.
 _TINY_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="

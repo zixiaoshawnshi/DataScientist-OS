@@ -334,7 +334,14 @@ async def main() -> None:
         # publish_report is no longer an MCP tool (WP-B2); the renderer
         # behind it is library code and is driven directly from here.
         from dsos import publish as publish_mod
-        from dsos.mcp_server import conn as mcp_conn
+        from dsos.db import connect
+
+        # The test's own read of the store the server just wrote to, on the
+        # path this test set. WP-C1 removed the module-level `conn` from
+        # dsos.mcp_server on purpose — a process can no longer have "the"
+        # connection — so the server's connection is not something a test
+        # should reach into.
+        mcp_conn = connect(os.environ["DSOS_DB_PATH"])
         preview = publish_mod.preview_report(mcp_conn, preview_narrative_row)
         assert "path" not in preview, "dry_run must not write an HTML file"
         assert any(e["row_id"] == dataset_row and e["resolved"] for e in preview["embeds"]), preview
