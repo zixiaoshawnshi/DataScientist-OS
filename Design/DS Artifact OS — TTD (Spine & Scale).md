@@ -175,7 +175,11 @@ The wave table below is a **schedule, not a claim that every cell is safe to par
 
 ### WP-B2 — Trim the MVP surface (after B1, same agent)
 
-**Owns:** `dsos/mcp_server.py`, `dsos/execution.py`, `dsos/store.py` (search/prior-work type filters only), `tests/surface_smoke_test.py` (new), `tests/skills_templates_smoke_test.py`, `tests/publish_smoke_test.py`, `tests/mcp_smoke_test.py`
+**Owns:** `dsos/mcp_server.py`, `dsos/execution.py`, `dsos/store.py` (search/prior-work type filters only), `tests/surface_smoke_test.py` (new), `tests/skills_templates_smoke_test.py`, `tests/publish_smoke_test.py`, `tests/mcp_smoke_test.py`, `tests/prior_work_smoke_test.py`
+
+**`tests/prior_work_smoke_test.py` added to the Owns list** (Sep 27, before dispatch). It is not in the original list, but line 118 calls `list_skills` over MCP — a tool this WP removes — so it breaks on this WP and on no other. Same class of gap B1 hit: a test whose only breakage is the behaviour this WP changes. Fix its `list_skills` assertion to use the library-level `seed` path (the same conversion the other three test files get) and change nothing else in it.
+
+**Known, deliberately not fixed here:** `benchmark/metrics.py` and `benchmark/report.py` both list `list_skills`/`list_templates` in `FINDABILITY_TOOLS`. Those entries become dead the moment this WP lands — harmless, because a removed tool can never appear in a transcript and so is never counted — but they are stale. They belong to Lane H; **report the hits, do not edit `benchmark/`**, and leave them for the next Lane H WP.
 
 **Spec**
 - **Remove these MCP tools:** `promote_scratch`, `list_skills`, `save_skill`, `list_templates`, `save_template`, `publish_report`. **Keep** `seed.py`, `templating.py`, `publish.py`, and the GUI report route; they are deferred, not dead.
