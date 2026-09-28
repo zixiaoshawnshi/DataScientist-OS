@@ -41,6 +41,7 @@ These resolve ambiguities in Doc II so that agents don't each resolve them diffe
 | D10 | **A claim lease is activity-based:** it's live while the claiming session made any tool call within `DSOS_LEASE_MINUTES` (default 30). It's computed on read and never swept. | Renewal comes free from `tool_calls`, so there's no heartbeat tool. |
 | D11 | **`stale` is computed on read** from ancestor datasets' `source.refresh_after`, and never written. | That's what Doc II means by "computed, not asserted". |
 | D12 | **Consumer calls are logged** against an auto-created session with `kind='consumer'`, one per MCP client session. | Consumer reuse is the metric that matters, and `tool_calls.session_id` is `NOT NULL`. |
+| D13 | **A concurrency test must prove serialisation, not the absence of errors.** "No `database is locked` under 8 writers" passes even with the write lock removed, because `busy_timeout=5000` absorbs the contention. The assertions that actually discriminate are **non-overlap of the critical sections** and a **duty-cycle** figure. | Added after WP-A2, which ran the same workload with the lock neutered: 400 rows, **0 errors**, 399 overlapping sections, 786% duty. The case `busy_timeout` genuinely cannot cover is `SQLITE_BUSY_SNAPSHOT` — a read-then-write transaction, which is `save_artifact`'s versioning path — where SQLite returns BUSY immediately without consulting the busy handler. |
 
 ---
 
@@ -471,7 +472,7 @@ The wave table below is a **schedule, not a claim that every cell is safe to par
 
 ## Lane H — benchmark
 
-All three WPs live in `benchmark/`, which is currently untracked. **Read `benchmark/README.md` first.** None of them touch `dsos/`.
+All three WPs live in `benchmark/`, now tracked on `feature/spine-and-scale` and extended with an arm registry (`benchmark/arms.json`) that H1 added. **Read `benchmark/README.md` first.** None of them touch `dsos/`.
 
 ### WP-H1 — Files + manifest arm (start now)
 
@@ -500,6 +501,34 @@ All three WPs live in `benchmark/`, which is currently untracked. **Read `benchm
 - Measure the duplicate-work rate: both agents registering or computing the same thing. Compare the board on vs off (`DSOS_DISABLE_BOARD=1`).
 
 ---
+
+## Unassigned — found during execution, needs an owner before cutover
+
+These are real, and none of the WPs below owns the file they live in. Recorded here so they are not lost, not handed to an agent silently, and not fixed by whoever happens to be editing nearby.
+
+### U1 — a live dead-end in a removed tool's error message
+
+WP-B2 removed `save_template` and `list_templates` from the MCP surface but, correctly, left `templating.py` alone. One of its error strings is still reachable from `run_python(style=...)`, which stays. Verified by hand against the merged branch:
+
+```
+$ run_python(..., output_type="chart", style="nonexistent_style")
+status = error
+error  = ValueError: unknown chart style 'nonexistent_style'. Built-ins: dsos, minimal, report.
+         Custom chart-style templates: (none saved yet — create one with save_template)
+```
+
+The agent is told to call a tool it does not have. Two other strings have the same shape (`templating.py:105`, `:121`, `:156`, `:263`).
+
+**This is a product decision, not a string edit, so it is not being fixed unilaterally.** The question is whether a producer agent may create a chart-style template *at all* now. Two defensible answers:
+
+- **Templates are read-only on this surface.** The message names the built-ins and says custom styles from an earlier session still resolve but cannot be created here. Consistent with skills/templates being deferred in §MVP scope.
+- **Creation moves to another surface** (GUI, or direct registration), and the message points there.
+
+Whichever is chosen, `templating.py`'s chart-style and report-template error strings need it. Until then an agent that mistypes a style name is sent to a tool that does not exist.
+
+### U2 — stale `FINDABILITY_TOOLS` in the benchmark
+
+`benchmark/metrics.py:47` and `benchmark/report.py:50` both list `list_skills` and `list_templates` in `FINDABILITY_TOOLS`. Dead since WP-B2. Harmless — a removed tool cannot appear in a transcript, so it is never counted — but wrong, and it will mislead anyone reading the findability numbers. **Belongs to the next Lane H WP (H2).**
 
 ## Out of scope for this TTD
 
