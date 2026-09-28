@@ -74,19 +74,36 @@ analysis stack into the dedicated venv from step 1 —
 (or `.venv/Scripts/pip install -e ".[analysis]"` for the editable-install
 case) — and point `DSOS_PYTHON_PATH` at that same venv's interpreter.
 
-## 4. Register the MCP server
+## 4. Start the daemon, then register the MCP server
 
 Find the python executable from step 1 first (the venv's, not a system
 one) — call it `<python>` below, the chosen path from step 2 `<db>`, and
 the interpreter from step 3 `<analysis-python>`.
 
-**Claude Code:**
+**First, start the daemon.** The store is owned by a long-lived process, not
+by the MCP server: one `python -m dsos.daemon` per store, serving the GUI and
+both MCP profiles off one database connection. `dsos.mcp_server` is now only
+a shim — it finds that daemon and forwards to it over stdio, which is what
+lets a stdio-only client talk to a server that is not a subprocess of its
+own. Without a daemon, the shim exits immediately and says so.
+
+```sh
+"<python>" -m dsos.daemon
+```
+
+It prints its base URL and where the store is, and writes `daemon.json` and
+`daemon.token` next to the store — that is how the shim finds it, so the
+daemon and the client must agree on `DSOS_DB_PATH`. Leave it running for as
+long as you want dsos available; it serves the read-only GUI at
+`http://127.0.0.1:8765/` too.
+
+**Claude Code** (the shim, over stdio):
 
 ```sh
 claude mcp add dsos -s user \
   -e DSOS_DB_PATH="<db>" \
   -e DSOS_PYTHON_PATH="<analysis-python>" \
-  -- "<python>" -m dsos.mcp_server
+  -- "<python>" -m dsos.mcp_server --profile producer
 ```
 
 **Pi coding agent** (needs `pi install npm:pi-mcp-adapter` first). Add to
@@ -97,7 +114,7 @@ claude mcp add dsos -s user \
   "mcpServers": {
     "dsos": {
       "command": "<python>",
-      "args": ["-m", "dsos.mcp_server"],
+      "args": ["-m", "dsos.mcp_server", "--profile", "producer"],
       "env": { "DSOS_DB_PATH": "<db>", "DSOS_PYTHON_PATH": "<analysis-python>" }
     }
   }
@@ -108,12 +125,79 @@ claude mcp add dsos -s user \
 same `command` / `args` / `env` shape applies — adapt to that client's own
 config file location and schema.
 
+**If your client speaks HTTP, skip the shim** and register the endpoint
+directly. One fewer process, and no proxy hop per tool call:
+
+```sh
+claude mcp add --transport http -s user dsos \
+  http://127.0.0.1:8765/mcp/producer/ \
+  --header "Authorization: Bearer <token>"
+```
+
+`<token>` is what the daemon printed, or the contents of the `daemon.token`
+file next to the store. If `DSOS_TOKEN` is set in the daemon's environment
+instead of written to a file, pass that same value here.
+
+Keep the **trailing slash**. The daemon mounts the MCP app with `path="/"`,
+so `/mcp/producer` answers a `307` redirect to `/mcp/producer/` before the
+auth check even runs. Clients that follow redirects cope; ones that don't
+report the server as broken. (An unauthenticated POST to the slashless form
+therefore gets a `307`, not the `401` you would expect — check auth against
+the real endpoint.)
+
+**For a consumer agent** — a PM or reviewer role that reads results and asks
+questions rather than running analysis — use the other profile:
+
+```sh
+claude mcp add dsos-consumer -s user \
+  -e DSOS_DB_PATH="<db>" \
+  -- "<python>" -m dsos.mcp_server --profile consumer
+```
+
+It reaches `/mcp/consumer/`, which is mounted and authenticated today but
+serves an empty tool set — its read-oriented tools arrive in a later
+release. Register it now and it will be there when they land; register both
+profiles if you want both roles.
+
 ## 5. Verify
 
-Restart/reconnect the agent, then confirm the server is live by calling
-one read-only tool, e.g. `list_skills` or `list_templates`. Both should
-return without error on a fresh store (skills are seeded automatically on
-first use).
+Restart/reconnect the agent, then call **`start_session`** with any question
+you actually care about:
+
+```json
+{"question": "Is dsos wired up?"}
+```
+
+It should return a `session_id`. `start_session` is the one producer tool
+that needs no prior state, which makes it the only honest liveness check on
+a store you have not written to yet — every other tool takes a `session_id`
+it does not have. It is also the better check, not just the easier one: a
+successful call exercises the entire path (daemon, bearer token, shim, a
+real write into the store), so it is more evidence of a working setup than
+any read would be.
+
+Then confirm reads come back over the same path, reusing the id:
+
+```json
+{"query": "dsos", "session_id": "<the id start_session returned>", "top_k": 5}
+```
+
+An empty result list is the correct answer on a fresh store and still means
+the call worked — what you are checking is that it returns at all.
+
+**Consumer profile:** there is nothing to call yet. `/mcp/consumer/` is
+mounted and authenticated, but it serves an empty tool set today; its
+read-oriented tools arrive in a later release. So the check is that it
+connects — a `list_tools` that returns cleanly with zero tools is the
+expected result, not a failure. Once the tools land, call one of those
+instead.
+
+If a call on the *producer* comes back with an empty tool list, the shim
+connected to nothing: check that the daemon is still running (open
+`http://127.0.0.1:8765/healthz`, which answers `{ok, version, db_path}` with
+no token) and that the client and the daemon were given the same
+`DSOS_DB_PATH`. Launching the shim by hand prints the reason on stderr if it
+cannot find a daemon at all.
 
 ## Notes for the agent doing the installing
 
