@@ -562,13 +562,20 @@ These are real, and none of the WPs below owns the file they live in. Recorded h
 `benchmark/metrics.py:47` and `benchmark/report.py:50` both list `list_skills` and `list_templates` in `FINDABILITY_TOOLS`. Dead since WP-B2. Harmless — a removed tool cannot appear in a transcript, so it is never counted — but wrong, and it will mislead anyone reading the findability numbers. **Belongs to the next Lane H WP (H2).**
 
 ### U3 — a raw SQL query living in `gui.py`
-
 WP-B3 needed the session-detail page to list that session's failed executions. Its `store.py` ownership is `get_execution` only, so rather than widen the WP it put a small `conn.execute` in `dsos/gui.py` and flagged the gap instead. Correct call under rule 3, and the gap is real:
 
 - §Refactor plan says `store.py` "is doing a coherent persistence job and is the layer the GUI already reads". SQL in the GUI route contradicts that, and it is the first crack in the layering WP-C1 is about to enforce.
 - The natural home is `store.failed_executions(conn, session_id) -> list[Execution]`, sitting next to the `get_execution` B3 already added.
 
 **Assigned to WP-D1**, which owns `dsos/gui.py` and is already a `gui.py` refactor (into `create_gui_router`). Move the query into `store.py` there and add it to D1's `Owns` note. It is small; the point is that it should not survive to the daemon, where the GUI becomes a mounted router over a shared `Database`.
+
+### U4 — two features now depend on one private function
+
+The FTS AND-prefix rule lives in `dsos/store.py:_fts_query`, a private function. `search_artifacts` uses it internally, and since **WP-E3** the question board uses it too, across a module boundary: `dsos/spine.py` imports `store._fts_query`.
+
+That is a deliberate wart, approved during E3's execution rather than discovered later. The tidier fix is to promote it to a public helper, which is a change to `store.py` — a file E3, F1 and G1 all own and E3 did not. Copying the rule into `spine.py` was the alternative and was rejected: two spellings of one rule is the exact drift this project keeps paying to undo, and a tuned AND-prefix would silently diverge between artifact search and the board.
+
+**Whoever is next in `store.py` for another reason should promote it** — a rename to `fts_match` with the underscore dropped, updating both call sites. It is a two-line mechanical change. Until then the import carries a comment saying it is deliberate.
 
 ## Out of scope for this TTD
 
