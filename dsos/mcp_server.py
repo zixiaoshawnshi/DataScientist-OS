@@ -22,7 +22,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware
 
-from dsos import execution, present, store, update_check
+from dsos import execution, present, store, templating, update_check
 from dsos.db import connect
 
 DB_PATH = os.environ.get("DSOS_DB_PATH", "data/store.db")
@@ -70,10 +70,18 @@ produced; it's already there. Pass scratch=True for a quick check (a row \
 count, a schema poke) that should cost nothing: the result comes back \
 inline, and no artifact, lineage or searchable row is written. Charts: \
 output_type="chart" — styled with the dark house style by default, or \
-pick another with style=.
+pick another with style= (list_templates for the built-ins and this store's \
+custom ones).
 5. Answer using the computed output, citing the row_ids you used. If a \
 check you ran in scratch mode turns out to be worth keeping, re-run it \
 with scratch=False.
+6. Once you know how this workstream should look, save it once: \
+save_template(kind="chart-style" | "report") with the content, or base= an \
+existing template to edit a copy of it. list_templates lists the built-ins \
+plus whatever this store has customized, and a custom template is \
+referenced by the row_id/artifact_id it returns — for charts that is \
+run_python's style=, for reports it is the layout the GUI's report page \
+renders for a narrative.
 
 Every tool that returns an artifact — save_artifact, run_sql, run_python, \
 search_artifacts — gives you a row_id. That row_id is the only id you need \
@@ -517,6 +525,139 @@ def get_lineage(row_id: str, session_id: str, direction: str = "ancestors") -> d
     arts = store.get_lineage(conn, row_id, direction=direction)
     results = [{"row_id": a.row_id, "type": a.type, "title": a.title} for a in arts]
     return {"results": results, "artifact_row_ids": [row_id, *(a.row_id for a in arts)]}
+
+
+# The consistency layer, back on the tool surface by the maintainer's U1
+# decision (WP-B2R): a shared chart style and a house report layout are the
+# reuse case the store exists for, and templating.py still held every
+# library function these two need. Only these two came back — the skill
+# library, publish_report and the import-time seeding stay cut.
+
+
+@mcp.tool()
+def list_templates(session_id: str, kind: str | None = None) -> dict:
+    """Chart styles and report templates — the consistency layer, built-ins
+    and custom. Chart styles are run_python's style= (default "dsos", the
+    dark house style); report templates are the layout the GUI's report page
+    (/artifacts/<row_id>/report?template=...) renders a narrative with
+    (default "report", the dark house layout). Custom templates made with
+    save_template are referenced by row_id or artifact_id — the id is
+    stable across version edits. kind="chart-style" or "report" to list
+    one kind.
+    """
+    if kind is not None and kind not in templating.TEMPLATE_KINDS:
+        return {
+            "error": f"kind must be one of {sorted(templating.TEMPLATE_KINDS)}, got {kind!r}",
+            "artifact_row_ids": [],
+        }
+    customs = store.list_artifacts(conn, type="template")
+
+    def _custom(kind_tag: str) -> list[dict]:
+        return [
+            {
+                "artifact_id": a.artifact_id, "row_id": a.row_id, "version": a.version,
+                "title": a.title, "description": a.description, "tags": a.tags,
+            }
+            for a in customs if kind_tag in a.tags
+        ]
+
+    result: dict = {"artifact_row_ids": [a.row_id for a in customs]}
+    if kind in (None, templating.CHART_STYLE_KIND):
+        result["chart_styles"] = {
+            "builtins": [
+                {"name": n, "description": d}
+                for n, d in sorted(templating.CHART_STYLE_BUILTINS.items())
+            ],
+            "custom": _custom(templating.CHART_STYLE_KIND),
+        }
+    if kind in (None, templating.REPORT_KIND):
+        result["report_templates"] = {
+            "builtins": [
+                {"name": n, "description": d}
+                for n, d in sorted(templating.REPORT_TEMPLATE_BUILTINS.items())
+            ],
+            "custom": _custom(templating.REPORT_KIND),
+        }
+    return result
+
+
+@mcp.tool()
+def save_template(
+    session_id: str, kind: str, content: str | None = None,
+    artifact_id: str | None = None, title: str | None = None,
+    description: str | None = None, tags: list[str] | None = None,
+    base: str | None = None,
+) -> dict:
+    """Create or re-version a template — the customizable half of the
+    consistency layer. Save the look of this workstream once here, and every
+    later session gets it by reference.
+
+    kind: "chart-style" (matplotlib rcParams text, .mplstyle syntax — used
+    via run_python's style=) or "report" (HTML with {{title}}/{{body}}/
+    {{published_at}}/{{session_question}} tokens, where {{body}} is where
+    the rendered narrative goes — the layout the GUI's report page renders a
+    narrative with).
+
+    base: an existing template (built-in name or row_id/artifact_id) to
+    copy from — customize instead of rewriting from scratch. If you pass
+    no content, the base's text becomes your starting point; the base is
+    recorded in the new template's source either way.
+
+    content: the template text (required unless base provides it).
+    Validated at SAVE time, not first use — an unparsable .mplstyle or a
+    report template without {{body}} fails here in one call.
+
+    artifact_id: the stable id to re-version later — an edit becomes a new
+    version with the same id, so references keep resolving. Omit to derive
+    one from the title. title/description are what search ranks on — give
+    them real ones.
+    """
+    try:
+        if kind not in templating.TEMPLATE_KINDS:
+            raise ValueError(
+                f"kind must be one of {sorted(templating.TEMPLATE_KINDS)}, got {kind!r}"
+            )
+        if base is not None:
+            base_text = templating.base_template_content(conn, kind, base)
+            if content is None:
+                content = base_text
+        if not content or not content.strip():
+            raise ValueError(
+                "content is required — pass content, or base to copy an existing template"
+            )
+        if kind == templating.CHART_STYLE_KIND:
+            templating.validate_chart_style_text(content, DEFAULT_PYTHON_PATH)
+        else:
+            templating.validate_report_template_text(content)
+
+        if artifact_id is None:
+            artifact_id = f"{kind}-" + store.safe_table_name(title or "custom")
+        if title is None:
+            title = f"Custom {kind} template" + (f" (based on {base})" if base else "")
+        if description is None:
+            description = (
+                f"Custom {kind} template for consistent styling"
+                + (f", customized from {base!r}." if base else ".")
+            )
+        final_tags = templating.template_tags(kind) + [
+            t for t in (tags or []) if t not in ("template", kind)
+        ]
+        row_id = store.save_artifact(
+            conn, artifact_id=artifact_id, type="template", title=title,
+            description=description, content=content,
+            content_format=(
+                "mplstyle" if kind == templating.CHART_STYLE_KIND else "html"
+            ),
+            tags=final_tags, session_id=session_id,
+            source={"base": base} if base else None,
+        )
+    except (ValueError, OSError) as exc:
+        return {"error": str(exc), "artifact_row_ids": []}
+    art = store.get_artifact_by_row_id(conn, row_id, load_content=False)
+    return {
+        "row_id": row_id, "artifact_id": artifact_id, "version": art.version,
+        "kind": kind, "artifact_row_ids": [row_id],
+    }
 
 
 if __name__ == "__main__":

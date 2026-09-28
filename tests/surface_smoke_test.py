@@ -1,21 +1,26 @@
-"""Layer-2f smoke test: the trimmed MVP tool surface (WP-B2).
+"""Layer-2f smoke test: the trimmed MVP tool surface (WP-B2, amended by WP-B2R).
 
 Doc II argues the trim is what pays back the 25% registration premium an
-agent pays for every tool in the tool list: six tools — the skill library,
-the template registry and the publish path — went away, and everything they
-needed is still reachable as library code (dsos/seed.py, dsos/templating.py,
-dsos/publish.py). What must not survive is the *tool* itself.
+agent pays for every tool in the tool list. WP-B2 cut six tools; the
+maintainer's U1 decision put two of them back, so the cut that stands is
+four — the skill library and the publish path — and everything those
+needed is still reachable as library code (dsos/seed.py, dsos/publish.py).
+What must not survive is the *tool* itself.
 
-Four things this pins down:
-1. list_tools() returns exactly the seven MVP tools — not "at least", not
-   "at most". A seventh tool surviving by accident costs every session that
-   has to read it.
+Five things this pins down:
+1. list_tools() returns exactly the nine tools — not "at least", not "at
+   most": the seven MVP tools plus save_template and list_templates, which
+   U1 brought back. A tenth surviving by accident costs every session that
+   has to read it, and a missing one means a restored tool quietly didn't.
 2. A scratch run has no scratch_id: with the promotion cache gone there is
    nothing for an id to point at.
 3. A fresh store has zero skill rows after its first start_session — the
-   server no longer seeds a library on import.
+   server no longer seeds a library on import, and the restoration did not
+   re-enable it. save_template is the one restored tool that must work on
+   that unseeded store.
 4. skills/templates are hidden from search and from the prior-work signal
    unless the caller asks for one by type=.
+5. list_skills is still gone: restoring templates is not restoring skills.
 
 Run: .venv/Scripts/python.exe tests/surface_smoke_test.py
 """
@@ -44,17 +49,17 @@ from fastmcp import Client  # noqa: E402
 
 from dsos.mcp_server import mcp  # noqa: E402 — import after DSOS_DB_PATH is set
 
-# The seven MVP tools. Not a subset: the trim's whole point is that the
-# other six are gone.
+# The nine producer tools: the seven MVP ones plus the two the maintainer's
+# U1 decision restored. Not a subset — both directions are load-bearing. A
+# tenth tool is something that should not have come back; a seventh here is
+# something that was dropped.
 EXPECTED_TOOLS = {
     "start_session", "search_artifacts", "get_artifact", "save_artifact",
-    "run_sql", "run_python", "get_lineage",
+    "run_sql", "run_python", "get_lineage", "save_template", "list_templates",
 }
-# Removed in WP-B2; kept here so a regression names the tool, not a diff.
-REMOVED_TOOLS = {
-    "promote_scratch", "list_skills", "save_skill",
-    "list_templates", "save_template", "publish_report",
-}
+# Still cut after U1; kept here so a regression names the tool, not a diff.
+# save_template/list_templates were in this set between WP-B2 and WP-B2R.
+REMOVED_TOOLS = {"promote_scratch", "list_skills", "save_skill", "publish_report"}
 
 FAILURES: list[str] = []
 
@@ -68,10 +73,10 @@ def check(label: str, ok: bool, detail: str = "") -> None:
 async def main() -> None:
     async with Client(mcp) as client:
         tools = {t.name for t in (await client.list_tools())}
-        check("list_tools() returns exactly the seven MVP tools",
+        check("list_tools() returns exactly the nine producer tools",
               tools == EXPECTED_TOOLS,
               f"extra={sorted(tools - EXPECTED_TOOLS)} missing={sorted(EXPECTED_TOOLS - tools)}")
-        check("no removed tool survives", not (tools & REMOVED_TOOLS),
+        check("no still-cut tool survives", not (tools & REMOVED_TOOLS),
               str(sorted(tools & REMOVED_TOOLS)))
 
         s1 = (await client.call_tool(
@@ -164,6 +169,22 @@ async def main() -> None:
         check("neither is offered as a reuse candidate",
               not any(c["row_id"] in (skill_row, template_row) for c in signal["candidates"]),
               str([c["title"][:24] for c in signal["candidates"]]))
+
+        # 3 (continued). The one tool U1 put back has to work on a store
+        #     that was never seeded: templates are store rows, not library
+        #     rows, and nothing about save_template may depend on seeding.
+        saved = (await client.call_tool("save_template", {
+            "session_id": s1, "kind": "chart-style", "artifact_id": "chart-style-unseeded",
+            "title": "Unseeded house style", "description": "Saved on a store with no skill library.",
+            "content": "lines.markersize: 7\n",
+        })).data
+        check("save_template works on a store that was never seeded",
+              "row_id" in saved and saved.get("version") == 1, str(sorted(saved))[:120])
+        listed = (await client.call_tool(
+            "list_templates", {"session_id": s1, "kind": "chart-style"})).data
+        check("list_templates finds it, and list_skills is still not a tool",
+              "chart-style-unseeded" in {t["artifact_id"] for t in listed["chart_styles"]["custom"]}
+              and "list_skills" not in tools)
 
     shutil.rmtree(Path(os.environ["DSOS_DB_PATH"]).parent, ignore_errors=True)
     if FAILURES:

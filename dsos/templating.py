@@ -154,6 +154,8 @@ def resolve_report_template(conn: sqlite3.Connection, template: str) -> str:
         f"unknown report template {template!r}. Built-ins: "
         f"{', '.join(sorted(REPORT_TEMPLATE_BUILTINS))}. Custom report templates: "
         f"{', '.join(_custom_template_refs(conn, REPORT_KIND)) or '(none saved yet — create one with save_template)'}"
+        ". A report template is the layout the GUI's report page renders for a "
+        "narrative (/artifacts/<row_id>/report?template=<name-or-id>)."
     )
 
 

@@ -1,11 +1,14 @@
 """Layer-2c smoke test: the skill library and the template system.
 
-Skills, templates and publishing are no longer MCP tools (WP-B2) — the
-library code behind them is deferred, not dead, and this test is where it
-keeps its coverage. Seeding, save/edit versioning and validation now go
-through dsos.seed / dsos.templating / dsos.publish / dsos.store directly;
-run_python and get_artifact are still driven over the MCP wire, because
-the custom chart style has to resolve through the real tool path.
+Skills and publishing are no longer MCP tools (WP-B2) — the library code
+behind them is deferred, not dead, and this test is where it keeps its
+coverage. Seeding, save/edit versioning and validation go through dsos.seed
+/ dsos.templating / dsos.publish / dsos.store directly. Templates came back
+on the tool surface (WP-B2R, the maintainer's U1 decision), so the same
+behaviours are also driven over the MCP wire in the "restored surface"
+section below — that is the only place an agent meets them now. run_python
+and get_artifact are still driven over MCP too, because the custom chart
+style has to resolve through the real tool path.
 
 Covers the cases the design specifically calls out:
 - seeding is idempotent, and an agent-edited skill SURVIVES a re-seed (the
@@ -14,6 +17,9 @@ Covers the cases the design specifically calls out:
   and a bad reference fails in one call with the options listed
 - custom templates validate at SAVE time and are selectable by BOTH
   row_id and the stable artifact_id
+- save_template/list_templates work over MCP on a store that was never
+  seeded, a bad kind is refused with the allowed set, and re-versioning
+  keeps every existing reference resolving
 - report token substitution is order-safe: a literal token written in the
   narrative's own text must survive publishing untouched
 
@@ -297,6 +303,105 @@ async def main() -> None:
             bad_template = str(exc)
         assert "report" in bad_template, bad_template
         print(f"[ok] unknown template fails cleanly: {bad_template[:80]}...")
+
+        # --- the restored MCP surface (WP-B2R) ---------------------------------
+        # Everything above drives templating.py at the library level. The
+        # same contract, over the wire, is what an agent gets now: U1 put
+        # save_template and list_templates back on the producer server (and
+        # deliberately did not put publish_report back), so these two are
+        # the whole of the agent-facing template API.
+        saved = (await client.call_tool("save_template", {
+            "session_id": s1, "kind": "chart-style", "artifact_id": "chart-style-mcp",
+            "title": "House markers (MCP)", "description": "Saved through save_template.",
+            "content": "lines.markersize: 13\naxes.grid: True\n",
+        })).data
+        assert saved["artifact_id"] == "chart-style-mcp" and saved["version"] == 1, saved
+        assert "error" not in saved, saved
+        style_row, style_ref = saved["row_id"], saved["artifact_id"]
+
+        listed = (await client.call_tool(
+            "list_templates", {"session_id": s1, "kind": "chart-style"})).data
+        assert "report_templates" not in listed, sorted(listed)
+        customs = {t["artifact_id"]: t for t in listed["chart_styles"]["custom"]}
+        assert style_ref in customs and customs[style_ref]["row_id"] == style_row, listed
+        print(f"[ok] save_template/list_templates over MCP: {style_ref} listed as a custom chart style")
+
+        # The row_id list_templates hands back is what run_python's style=
+        # takes, so the agent never has to know about artifact_id at all.
+        r = await client.call_tool("run_python", {
+            "code": "import matplotlib.pyplot as plt; result = plt.rcParams['lines.markersize']",
+            "session_id": s1, "title": "Scratch custom style via MCP row_id",
+            "description": "Scratch run applying the MCP-saved chart style.",
+            "input_row_ids": [], "scratch": True, "style": style_row,
+        })
+        assert r.data["content"] == "13.0", r.data
+        print("[ok] run_python(style=<row_id>) resolves the MCP-saved chart style")
+
+        # Validate at SAVE time, over the wire: one call, an error payload
+        # the agent can act on, and nothing written to the store.
+        before = len(store_mod.list_artifacts(conn, type="template"))
+        bad = (await client.call_tool("save_template", {
+            "session_id": s1, "kind": "chart-style", "artifact_id": "chart-style-broken",
+            "title": "Broken", "description": "Not rcParams at all.",
+            "content": "this is !!! not valid rcParams !!!",
+        })).data
+        assert "error" in bad and "rcparams" in bad["error"].lower(), bad
+        assert "row_id" not in bad and not bad["artifact_row_ids"], bad
+        assert len(store_mod.list_artifacts(conn, type="template")) == before, (
+            "a rejected template must not leave a row behind"
+        )
+        print(f"[ok] invalid chart style rejected by save_template in one call: {bad['error'][:80]}...")
+
+        # A bad kind is a one-call error listing the allowed set, on both
+        # tools — not a 500 and not a silent save.
+        for call in (
+            {"session_id": s1, "kind": "notebook", "content": "x"},
+            {"session_id": s1, "kind": "notebook"},
+        ):
+            kind_err = (await client.call_tool("save_template", call)).data
+            assert "error" in kind_err, kind_err
+            assert "chart-style" in kind_err["error"] and "report" in kind_err["error"], kind_err
+        list_err = (await client.call_tool(
+            "list_templates", {"session_id": s1, "kind": "notebook"})).data
+        assert "error" in list_err and "chart-style" in list_err["error"], list_err
+        assert "chart_styles" not in list_err and "report_templates" not in list_err, list_err
+        print(f"[ok] a bad kind is refused with the allowed set: {list_err['error']}")
+
+        # re-versioning over MCP: the artifact_id is the stable reference, so
+        # an edit must not break a run_python style= or a base= built on it.
+        v2 = (await client.call_tool("save_template", {
+            "session_id": s1, "kind": "chart-style", "artifact_id": style_ref,
+            "title": "House markers v2", "description": "Even bigger markers.",
+            "content": "lines.markersize: 21\n",
+        })).data
+        assert v2["artifact_id"] == style_ref and v2["version"] == 2, v2
+        r = await client.call_tool("run_python", {
+            "code": "import matplotlib.pyplot as plt; result = plt.rcParams['lines.markersize']",
+            "session_id": s1, "title": "Scratch re-versioned style",
+            "description": "Scratch run applying the re-versioned chart style.",
+            "input_row_ids": [], "scratch": True, "style": style_ref,
+        })
+        assert r.data["content"] == "21.0", r.data
+        assert "lines.markersize: 21" in templating.base_template_content(
+            conn, templating.CHART_STYLE_KIND, style_ref
+        )
+        re_listed = (await client.call_tool(
+            "list_templates", {"session_id": s1, "kind": "chart-style"})).data
+        re_customs = {t["artifact_id"]: t for t in re_listed["chart_styles"]["custom"]}
+        assert re_customs[style_ref]["version"] == 2 and re_customs[style_ref]["row_id"] == v2["row_id"]
+        print("[ok] re-versioning keeps the same artifact_id resolvable (style=, base=, listing)")
+
+        # No kind: both kinds, built-ins included — the discovery an agent
+        # needs before it decides to write a template of its own.
+        everything = (await client.call_tool("list_templates", {"session_id": s1})).data
+        assert {b["name"] for b in everything["chart_styles"]["builtins"]} == {
+            "dsos", "report", "minimal"}
+        assert {b["name"] for b in everything["report_templates"]["builtins"]} == {
+            "report", "default", "minimal"}
+        assert custom_style_id in {t["artifact_id"] for t in everything["chart_styles"]["custom"]}
+        assert custom_report_id in {t["artifact_id"] for t in everything["report_templates"]["custom"]}
+        assert style_ref in {t["artifact_id"] for t in everything["chart_styles"]["custom"]}
+        print("[ok] list_templates() with no kind lists both kinds, built-ins and custom")
 
         # --- sandbox path gets the same chart styling ---
         from dsos import sandbox as dsos_sandbox
