@@ -46,8 +46,27 @@ def session_detail(request: Request, session_id: str):
         return HTMLResponse(f"<p>no session {session_id!r}</p>", status_code=404)
     artifacts = store.list_artifacts(conn, session_id=session_id)
     return templates.TemplateResponse(
-        request, "session_detail.html", {"session": session, "artifacts": artifacts}
+        request, "session_detail.html",
+        {"session": session, "artifacts": artifacts,
+         "failed_runs": _failed_runs(session_id)},
     )
+
+
+# A failed run used to leave a dead 'error' artifact row behind, which is
+# why this page has nothing to show for one. It doesn't any more: the run
+# is an execution with output_row_id NULL, and executions.session_id is the
+# only thing that can find it — there is no artifact to navigate from. The
+# query lives here rather than in dsos.store because it is a display-only
+# read of one page; nothing else needs it.
+_FAILED_RUNS_SQL = """
+    SELECT kind, error, ended_at FROM executions
+    WHERE session_id = ? AND status = 'error'
+    ORDER BY ended_at DESC LIMIT 20
+"""
+
+
+def _failed_runs(session_id: str) -> list[dict]:
+    return [dict(r) for r in conn.execute(_FAILED_RUNS_SQL, (session_id,)).fetchall()]
 
 
 @app.get("/sessions/{session_id}/tool_calls", response_class=HTMLResponse)
@@ -106,7 +125,7 @@ def artifact_detail(request: Request, row_id: str):
             "used_by": used_by,
             "graph": _mermaid_graph(art, uses, used_by),
             "versions": store.list_versions(conn, art.artifact_id),
-            "execution": store.get_execution(conn, row_id),
+            "execution": store.get_execution(conn, output_row_id=row_id),
         },
     )
 

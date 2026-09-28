@@ -60,7 +60,7 @@ def main() -> None:
         conn, code="SELECT team, score FROM in_1 WHERE score > 10",
         session_id=s1, title="High scorers", description="Teams scoring above 10.",
         input_row_ids=[dataset_row],
-    )
+    ).row_id
     chart_row = save_artifact(
         conn, type="chart", title="Score chart",
         description="A toy chart, to exercise the GUI's inlined-PNG path.",

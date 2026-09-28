@@ -321,31 +321,51 @@ def _ingest_path(path: str, type: str, content_format: str) -> tuple:
     return df, "parquet"
 
 
-def _execution_result_payload(row_id: str, input_row_ids: list[str]) -> dict | object:
+def _execution_result_payload(outcome: execution.RunOutcome, input_row_ids: list[str]) -> dict:
     """Shared by run_sql/run_python: always inline the result (or, on
     failure, the diagnostics) — never make the agent make a second call
-    just to see what its own run produced."""
-    art = store.get_artifact_by_row_id(conn, row_id, load_content=True)
-    info = store.get_execution(conn, row_id) or {}
+    just to see what its own run produced.
+
+    The two outcomes get different payloads because they are different
+    kinds of thing. A successful run produced an artifact, so its response
+    is that artifact's own payload plus the aliases its inputs were bound
+    to. A failed run produced nothing — there is no artifact to describe —
+    so the response is the execution's diagnostics and an `execution_id`,
+    with no `row_id` key at all: a `row_id` that names nothing is worse
+    than no key, because the agent will try to use it.
+    """
+    # Which alias each input got, by the same positional rule the run
+    # itself used (execution.input_aliases) — so the agent can chain this
+    # run's output into the next call without re-deriving anything.
+    # Position, not title: an input re-titled or duplicated can't change
+    # what in_1 means mid-session. Echoed on both paths, so an agent reads
+    # the same field either way.
+    input_tables = {rid: f"in_{i}" for i, rid in enumerate(input_row_ids, start=1)}
+    info = store.get_execution(conn, execution_id=outcome.execution_id) or {}
+
+    if outcome.row_id is None:
+        # stdout is top-level on success AND failure (feedback #10): it's
+        # where progress prints and anything printed before a crash live,
+        # and it used to be invisible on success and buried on failure.
+        return {
+            "status": "error",
+            "execution_id": outcome.execution_id,
+            "error": info.get("error"),
+            "stdout": (info.get("stdout") or "")[:2_000],
+            # stderr's tail carries the traceback's final (most useful) frames.
+            "stderr": (info.get("stderr") or "")[-4_000:],
+            "input_tables": input_tables,
+            "artifact_row_ids": list(input_row_ids),
+        }
+
+    art = store.get_artifact_by_row_id(conn, outcome.row_id, load_content=True)
     payload = {
         **_artifact_payload(art),
         "status": art.status,
-        # Which alias each input got, by the same positional rule the run
-        # itself used (execution.input_aliases) — so the agent can chain
-        # this run's output into the next call without re-deriving anything.
-        # Position, not title: an input re-titled or duplicated can't change
-        # what in_1 means mid-session.
-        "input_tables": {rid: f"in_{i}" for i, rid in enumerate(input_row_ids, start=1)},
-        "artifact_row_ids": [row_id, *input_row_ids],
+        "input_tables": input_tables,
+        "artifact_row_ids": [outcome.row_id, *input_row_ids],
     }
-    # stdout is top-level on success AND failure (feedback #10): it's where
-    # progress prints and anything printed before a crash live, and it used
-    # to be invisible on success and buried on failure.
     payload["stdout"] = (info.get("stdout") or "")[:2_000]
-    if art.status != "ok":
-        payload["error"] = info.get("error")
-        # stderr's tail carries the traceback's final (most useful) frames.
-        payload["stderr"] = (info.get("stderr") or "")[-4_000:]
     return _with_inline_image(payload, art)
 
 
@@ -378,7 +398,9 @@ def run_sql(
     columns, a 10-row preview) — you do NOT need a second call to see it.
     It's also saved as a new `query` artifact, automatically lineage-linked
     to every input and recorded — no separate save_artifact call needed.
-    On failure, status="error" and `error`/`stdout`/`stderr` below show why.
+    On failure, status="error" and `error`/`stdout`/`stderr` below show why;
+    a failed run produces no artifact, so that response carries an
+    `execution_id` and no `row_id`.
 
     scratch=True: run and return the result inline but persist nothing —
     no artifact, no lineage, not searchable. For quick checks (row counts,
@@ -431,7 +453,8 @@ def run_python(
     type="transform"; pass output_type="chart" for a plot), lineage-linked
     to every input and recorded automatically. On failure, status="error"
     and `error`/`stdout`/`stderr` below show the traceback and anything
-    printed before it failed.
+    printed before it failed; a failed run produces no artifact, so that
+    response carries an `execution_id` and no `row_id`.
 
     scratch=True: run and return the result inline but persist nothing —
     no artifact, no lineage, not searchable (a chart still comes back as a

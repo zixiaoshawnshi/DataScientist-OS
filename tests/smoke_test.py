@@ -21,6 +21,7 @@ from dsos.execution import run_sql
 from dsos.seed import seed
 from dsos.store import (
     get_artifact_by_row_id,
+    get_execution,
     get_lineage,
     log_tool_call,
     reused_artifact_row_ids,
@@ -62,7 +63,7 @@ def main() -> None:
         conn, code="SELECT team, score FROM in_1 WHERE score > 10",
         session_id=s1, title="High scorers", description="Teams scoring above 10.",
         input_row_ids=[dataset_row],
-    )
+    ).row_id
     log_tool_call(conn, s1, "run_sql", {"title": "High scorers"}, "2 rows", [query_row, dataset_row])
     print(f"[ok] ran SQL, produced query artifact: {query_row}")
 
@@ -119,7 +120,7 @@ def main() -> None:
         conn, code="SELECT AVG(score) AS avg_score FROM in_1",
         session_id=s2, title="Average score", description="Average score across all teams.",
         input_row_ids=[dataset_row],  # reusing round 1's dataset artifact
-    )
+    ).row_id
     log_tool_call(conn, s2, "run_sql", {"title": "Average score"}, "1 row", [query2_row, dataset_row])
 
     reused = reused_artifact_row_ids(conn, s2)
@@ -134,14 +135,19 @@ def main() -> None:
     assert art.content is None and art.content_error, "missing blob should set content_error, not raise"
     print(f"[ok] get_artifact_by_row_id degrades gracefully on a missing blob: {art.content_error}")
 
-    broken_query_row = run_sql(
+    broken = run_sql(
         conn, code="SELECT * FROM in_1",
         session_id=s2, title="Should fail", description="Input's blob is gone.",
         input_row_ids=[dataset_row],
     )
-    broken = get_artifact_by_row_id(conn, broken_query_row, load_content=False)
-    assert broken.status == "error", "run_sql against a missing-blob input should fail cleanly, not crash"
-    print("[ok] run_sql against a missing-blob input reports status=error instead of crashing")
+    assert broken.status == "error" and broken.row_id is None, (
+        "run_sql against a missing-blob input should fail cleanly and leave no artifact behind"
+    )
+    # The error lives on the execution row: there is no artifact to carry it
+    # any more, so this is the only place it can be read from.
+    failed = get_execution(conn, execution_id=broken.execution_id)
+    assert failed and failed["error"], "a failed run should record why it failed"
+    print("[ok] run_sql against a missing-blob input records a failed execution, not an artifact")
 
     print("\nLayer 1 smoke test passed.")
 

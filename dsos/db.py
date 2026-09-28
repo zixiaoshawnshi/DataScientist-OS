@@ -165,7 +165,86 @@ def _m1_baseline(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
-MIGRATIONS: list[Migration] = [_m1_baseline]
+def _m2_failed_runs_are_executions(conn: sqlite3.Connection) -> None:
+    """v1 -> v2: a failed run is an execution, not an artifact.
+
+    Until this, `executions.output_row_id` was NOT NULL, so the only way to
+    keep a failed run's error/stdout/stderr was to invent an artifact row
+    for it — a dead, content-less node that then had to be filtered back
+    out of search and lineage everywhere it appeared. This rebuild makes
+    that impossible: a run that produced nothing has output_row_id NULL.
+
+    The standard twelve-step rebuild, all four steps inside the
+    transaction _apply() opened:
+
+    1. create the new table under a temporary name, with the columns the
+       new shape needs and the NOT NULL dropped from output_row_id;
+    2. copy the rows across, backfilling the two new columns from what the
+       store already knows — the output artifact's session_id, and its
+       lineage parents as the inputs the run used. That parent list is
+       best-effort by nature: a pre-migration execution row never recorded
+       the order its inputs were bound in, and nothing can recover it
+       after the fact. (The two subqueries have to be correlated on the
+       outer row directly; a derived table in FROM cannot reference it.)
+    3. drop the old table (which drops any index that was on it);
+    4. rename the new one into place.
+
+    Because the index step comes after the rename, the indexes are named
+    for the table they actually live on rather than for the temporary
+    name; nothing is created before the rename that could be lost with the
+    old table.
+    """
+    conn.execute(
+        """
+        CREATE TABLE executions_v2 (
+            id TEXT PRIMARY KEY,
+            output_row_id TEXT REFERENCES artifacts(row_id),
+            kind TEXT NOT NULL,
+            code TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            stdout TEXT NOT NULL DEFAULT '',
+            stderr TEXT NOT NULL DEFAULT '',
+            error TEXT,
+            output_summary TEXT NOT NULL,
+            session_id TEXT,
+            input_row_ids TEXT NOT NULL DEFAULT '[]'
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO executions_v2 (
+            id, output_row_id, kind, code, started_at, ended_at, status,
+            stdout, stderr, error, output_summary, session_id, input_row_ids
+        )
+        SELECT
+            e.id, e.output_row_id, e.kind, e.code, e.started_at, e.ended_at,
+            e.status, e.stdout, e.stderr, e.error, e.output_summary,
+            (SELECT a.session_id FROM artifacts a WHERE a.row_id = e.output_row_id),
+            COALESCE((
+                SELECT json_group_array(l.parent_row_id)
+                FROM lineage l WHERE l.child_row_id = e.output_row_id
+            ), '[]')
+        FROM executions e
+        """
+    )
+    conn.execute("DROP TABLE executions")
+    conn.execute("ALTER TABLE executions_v2 RENAME TO executions")
+    # output_row_id is now the lookup "which run produced this artifact?";
+    # session_id is the lookup behind the GUI's per-session failed-runs
+    # list, which is the only way to see a run that produced nothing.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_executions_output_row_id"
+        " ON executions(output_row_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_executions_session_id ON executions(session_id)"
+    )
+
+
+MIGRATIONS: list[Migration] = [_m1_baseline, _m2_failed_runs_are_executions]
 
 
 def _is_empty(conn: sqlite3.Connection) -> bool:

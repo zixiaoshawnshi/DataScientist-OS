@@ -485,11 +485,13 @@ def search_artifacts(
     The same exclusion applies to the session-start signal
     (see _NOT_PRIOR_WORK), so both routes share one rule.
 
-    A run_sql/run_python call that failed still gets a real row (so its
-    row_id can carry the error/stdout/stderr back to the caller — see
-    mcp_server._execution_result_payload), but that dead, content-less
-    node has no business surfacing as a search result. Excluded here by
-    status, not filtered out at the tool layer, so every caller of
+    A run_sql/run_python call that failed used to still get a real artifact
+    row, purely so its row_id could carry the error back to the caller.
+    It no longer does — a failed run records an execution with a NULL
+    output_row_id and writes no artifact at all (see execution._record_run)
+    — so this filter now exists only for stores that still hold such rows
+    from before that change, and is kept until they have all been seen.
+    Excluded by status, not at the tool layer, so every caller of
     search_artifacts gets this for free.
     """
     if type:
@@ -550,11 +552,12 @@ def get_lineage(
     """`direction="ancestors"` walks parents (what this was built from);
     `direction="descendants"` walks children (what was built from this).
 
-    A failed run_sql/run_python call still gets a real, lineage-linked row
-    (see search_artifacts's docstring for why), but a dead, content-less
-    node is not a real step in anyone's lineage — excluded from the
-    returned list, though traversal still passes through it so a real
-    node chained beyond it (if any) is still reachable."""
+    A failed run_sql/run_python call used to get a real, lineage-linked
+    artifact row (see search_artifacts's docstring for why that stopped
+    being true), but a dead, content-less node is not a real step in
+    anyone's lineage. Rows that old behaviour left behind are still
+    excluded from the returned list, though traversal passes through them
+    so a real node chained beyond one is still reachable."""
     col_from, col_to = (
         ("child_row_id", "parent_row_id") if direction == "ancestors"
         else ("parent_row_id", "child_row_id")
@@ -579,14 +582,31 @@ def get_lineage(
     return result
 
 
-def get_execution(conn: sqlite3.Connection, output_row_id: str) -> dict | None:
-    """The execution record (stdout/stderr/error/output_summary) that
-    produced `output_row_id`, if it was produced by run_sql/run_python.
-    Used to surface diagnostics inline when a run fails."""
-    row = conn.execute(
-        "SELECT * FROM executions WHERE output_row_id = ? ORDER BY started_at DESC LIMIT 1",
-        (output_row_id,),
-    ).fetchone()
+def get_execution(
+    conn: sqlite3.Connection, *, execution_id: str | None = None,
+    output_row_id: str | None = None,
+) -> dict | None:
+    """One execution record (stdout/stderr/error/output_summary), looked up
+    either by its own id or by the artifact it produced.
+
+    The two lookups are not interchangeable since a failed run has no
+    output artifact: given one of a row's id or its output's row_id, this
+    returns the execution that produced it, if there was one. Used to
+    surface diagnostics inline when a run fails — a failure has no
+    artifact payload to read them from, so the response is built from this
+    row instead.
+    """
+    if (execution_id is None) == (output_row_id is None):
+        raise ValueError("pass exactly one of execution_id or output_row_id")
+    if execution_id is not None:
+        row = conn.execute(
+            "SELECT * FROM executions WHERE id = ?", (execution_id,)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM executions WHERE output_row_id = ? ORDER BY started_at DESC LIMIT 1",
+            (output_row_id,),
+        ).fetchone()
     if row is None:
         return None
     return {
