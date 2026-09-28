@@ -1,4 +1,4 @@
-"""The producer profile: the nine tools an analysis agent calls.
+"""The producer profile: the ten tools an analysis agent calls.
 
 `build_producer(config)` is a factory, not a module. Every tool is a closure
 over one `ServerConfig`, so two producers over two stores can exist in one
@@ -9,9 +9,18 @@ store: reads go through `config.db.conn()`, writes take
 passed in.
 
 The tool bodies are unchanged from `dsos/mcp_server.py`, which is the point
-of this WP: same names, same parameters, same responses, same docstrings
-(the docstrings are most of the product — an agent decides what to call from
-them). What changed is where the connection comes from.
+of this WP: same names, same parameters, same responses — the docstrings are
+most of the product, since an agent decides what to call from them, and they
+carry the new lifecycle parameters.
+
+Docstring convention (WP-C2's follow-up, adopted here): every tool's
+docstring opens with ONE unwrapped summary line — a complete sentence on a
+single physical line — and the prose beneath it is hard-wrapped. The
+contract generator renders that first sentence into Doc II's tool table, so
+a docstring that starts mid-sentence forces it into sentence-splitting
+heuristics, and the 7 "e.g."s in the old docstrings each needed an
+abbreviation guard to avoid being cut in half. Line 1 is the whole
+contract; the rest is the manual.
 """
 
 from __future__ import annotations
@@ -48,16 +57,19 @@ def build_producer(config: ServerConfig) -> FastMCP:
 
     @mcp.tool()
     def start_session(question: str) -> dict:
-        """Start a new round of work. Call this once, first, for every new
-        top-level question — before searching, fetching, or running anything.
-        Reuse the returned session_id in every other tool call for this round.
+        """Start a new round of work, and learn what this store already holds.
 
-        The response also reports `prior_work`: what this store already holds
-        from earlier sessions, plus a few candidates that may already cover
-        this question. Read it before you fetch anything. If a candidate fits,
-        run_sql/run_python against its row_id instead of downloading and
-        cleaning the same data again — that is the whole point of the store,
-        and an agent that never looks will redo work that is already done."""
+        Call this once, first, for every new top-level question — before
+        searching, fetching, or running anything. Reuse the returned
+        session_id in every other tool call for this round.
+
+        The response also reports `prior_work`: what this store already
+        holds from earlier sessions, plus a few candidates that may already
+        cover this question. Read it before you fetch anything. If a
+        candidate fits, run_sql/run_python against its row_id instead of
+        downloading and cleaning the same data again — that is the whole
+        point of the store, and an agent that never looks will redo work
+        that is already done."""
         with db.write() as conn:
             session_id = store.start_session(conn, question)
         # The search is deliberately outside the write lock: it embeds and
@@ -69,25 +81,46 @@ def build_producer(config: ServerConfig) -> FastMCP:
 
     @mcp.tool()
     def search_artifacts(
-        query: str, session_id: str, top_k: int = 5, type: str | None = None
+        query: str, session_id: str, top_k: int = 5, type: str | None = None,
+        include_superseded: bool = False, include_exploratory: bool = True,
     ) -> dict:
-        """Search over everything saved so far, across every past session, not
-        just this one — an exact term (a title, a column name) reliably matches
-        even with the fallback embedding model; a vaguer query still finds
-        something via semantic similarity. Call this before fetching new data
-        or rebuilding anything — if a past artifact already covers part of the
-        question (this session's or an earlier one's), reuse it via
-        get_artifact/run_sql/run_python instead of redoing the work.
+        """Search every artifact saved so far, across every past session.
 
-        Workflow skills and templates are not results and are left out unless
-        you pass type="skill" or type="template" for one."""
+        This is the first call for any question, before fetching new data or
+        rebuilding anything. An exact term — a title, a column name —
+        reliably matches even with the fallback embedding model, and a vaguer
+        query still finds something via semantic similarity.
+
+        Each result carries `status` (see below), `created_at`, the current
+        `validation` verdict and, on a superseded row, `superseded_by`. Read
+        them before reusing a row: a superseded row is one something replaced,
+        and a `contradicted` or `stale` validation is one a human or an
+        expired input already called into question.
+
+        Statuses: "exploratory" is the output of a run that nobody has
+        claimed yet (the default, and what a fresh run of yours will be),
+        "result" is a deliberate registration, and "superseded" is a row
+        something replaced. Superseded rows are left out of this search
+        unless you pass include_superseded=True — they are still readable
+        with get_artifact, so nothing is lost, they are just not the answer
+        to "what do I have". Exploratory rows are included by default; pass
+        include_exploratory=False to search only claimed results.
+
+        Workflow skills and templates are not results and are left out
+        unless you pass type="skill" or type="template" for one."""
         hits = store.search_artifacts(
-            db.conn(), query, top_k=top_k, type=type
+            db.conn(), query, top_k=top_k, type=type,
+            include_superseded=include_superseded,
+            include_exploratory=include_exploratory,
         )
+        conn = db.conn()
         results = [
             {
                 "row_id": a.row_id, "type": a.type, "title": a.title,
                 "description": a.description, "score": round(score, 3),
+                "status": a.status, "created_at": a.created_at,
+                "validation": store.validation_status(conn, a.row_id)["current"],
+                "superseded_by": a.superseded_by,
             }
             for a, score in hits
         ]
@@ -95,18 +128,30 @@ def build_producer(config: ServerConfig) -> FastMCP:
 
     @mcp.tool()
     def get_artifact(row_id: str, session_id: str) -> dict:
-        """Fetch an artifact's full metadata and content, by the row_id that
-        save_artifact/run_sql/run_python/search_artifacts gave you — that row_id
-        is the only id you need; there's no separate "artifact_id" to look up.
-        Tabular artifacts (dataset/query/transform) return row_count, columns,
-        and a 10-row preview, not the full table — use run_sql/run_python
-        against this row_id to compute over the full data. `uses` lists what
-        this artifact was built from or embeds (e.g. a narrative's datasets).
+        """Fetch one artifact's full metadata and content, by row_id.
+
+        Use the row_id that save_artifact / run_sql / run_python /
+        search_artifacts gave you — that row_id is the only id you need;
+        there's no separate "artifact_id" to look up.
+
+        Tabular artifacts (dataset/query/transform) return row_count,
+        columns, and a 10-row preview, not the full table — use
+        run_sql/run_python against this row_id to compute over the full data.
+        `uses` lists what this artifact was built from or embeds (e.g. a
+        narrative's datasets).
+
+        The response also carries the artifact's lifecycle: `status`
+        ("exploratory" / "result" / "superseded"), its `caveats` and
+        `confidence` claims, and its `validation` — the current verdict plus
+        the full history with each verdict's basis. A superseded row is
+        still returned in full, with `superseded_by` naming the row that
+        replaced it, because a pinned row_id in a report or a citation has
+        to stay readable and traceable after it stops being current.
 
         Note: run_sql/run_python already return this same preview inline in
-        their own response — call get_artifact only to re-fetch something from
-        an earlier tool call (e.g. a search_artifacts hit), not right after
-        running it yourself.
+        their own response — call get_artifact only to re-fetch something
+        from an earlier tool call (e.g. a search_artifacts hit), not right
+        after running it yourself.
 
         Example: get_artifact(row_id="a1b2c3...", session_id="s1")
         """
@@ -129,10 +174,14 @@ def build_producer(config: ServerConfig) -> FastMCP:
         source: dict | None = None,
         parent_row_ids: list[str] | None = None,
         dedupe: bool = True,
+        status: str = "result",
+        caveats: list[str] | None = None,
+        confidence: list[dict] | None = None,
     ) -> dict:
-        """Register something as a real artifact. A dataset you fetched isn't
-        real to this system — invisible to search, lineage, and reuse for every
-        future question — until you call this.
+        """Register something as a real artifact, so future work can find and reuse it.
+
+        A dataset you fetched isn't real to this system — invisible to search,
+        lineage, and reuse for every future question — until you call this.
 
         Pass exactly one of:
         - content_text: inline text, for markdown/python/sql/json content.
@@ -147,21 +196,43 @@ def build_producer(config: ServerConfig) -> FastMCP:
         matters) — search_artifacts ranks on it, so a vague description makes
         this artifact unreachable to future questions.
 
+        `status` is the lifecycle, and defaults to "result" because calling
+        this tool at all is a claim: you are registering this as something a
+        later question can rely on. Pass "exploratory" when you are parking a
+        working artifact you have not checked yet. (run_sql/run_python
+        default to "exploratory" instead — computed output is a finding until
+        someone claims it. Use mark to promote one of those to a result.)
+
+        `caveats`: up to 5 short strings (200 chars each) naming properties
+        of THIS result a reader would otherwise get wrong — "excludes
+        refunds", "one day of data only", "column renamed upstream". Anything
+        longer than that is not a caveat, it is the analysis: write it as a
+        narrative artifact instead of compressing it into one.
+
+        `confidence`: a list of {claim, level, basis}. `level` is "high",
+        "medium" or "low", and `basis` is REQUIRED and must be non-empty —
+        say what the level rests on (the check you ran, the source, the
+        sample size). A level with no basis is refused rather than stored:
+        it is a label no later reader can check, and a store full of
+        unsupported "high" is worth less than one with no field at all.
+
         For a narrative: write `{{artifact:<row_id>}}` in content_text for each
         dataset/chart/query it discusses. Those row_ids are automatically added
         to this artifact's lineage — no need to also pass parent_row_ids for
         them — and show up as `uses` when this narrative is fetched later.
 
         `source`: freeform, but for a fetched dataset prefer {"url": ...,
-        "fetched_at": ... (ISO-ish timestamp/description of when), "method": ...
-        (how it was fetched, e.g. "WebFetch"/"curl"/"Kaggle API"), "refresh_after":
-        ... (how long this stays fresh, e.g. "7d"/"30d"/"static" — your call, not
-        enforced)} plus whatever else identifies it (e.g. "survey": "Stack
-        Overflow 2024") — this is the only provenance a later session/report has
-        to go on, and the only record of how/when this was retrieved: dsos can't
-        see a fetch you ran with your own tools, only what you put here. Nothing
-        computes staleness automatically — before reusing a dataset, check
-        `fetched_at`/`refresh_after` yourself and decide if it's worth refetching.
+        "fetched_at": ... (an ISO timestamp for when), "method": ... (how it
+        was fetched, e.g. "WebFetch"/"curl"/"Kaggle API"), "refresh_after":
+        ... (how long this stays fresh, e.g. "7d"/"30d"/"static" — your
+        call, not enforced)} plus whatever else identifies it. This is the
+        only provenance a later session/report has to go on, and the only
+        record of how/when this was retrieved: dsos can't see a fetch you ran
+        with your own tools, only what you put here. `refresh_after` is read
+        back: when a dataset's window has passed, anything built from it is
+        reported as `stale` — computed on read from your `fetched_at`, never
+        written, and never overriding a "contradicted" verdict. Use
+        "static" (or leave it out) for data that does not expire.
 
         The response's `input_tables` (on run_sql/run_python) maps each input
         row_id to the name it was bound under — in_1, in_2, ... in the order
@@ -213,7 +284,8 @@ def build_producer(config: ServerConfig) -> FastMCP:
                 row_id = store.save_artifact(
                     conn, type=type, title=title, description=description, content=content,
                     content_format=content_format, session_id=session_id, tags=tags, source=source,
-                    parent_row_ids=parent_row_ids,
+                    parent_row_ids=parent_row_ids, status=status, caveats=caveats,
+                    confidence=confidence,
                 )
             except ValueError as exc:
                 return {"error": str(exc), "artifact_row_ids": []}
@@ -225,21 +297,32 @@ def build_producer(config: ServerConfig) -> FastMCP:
     @mcp.tool()
     def run_sql(
         code: str, session_id: str, title: str, description: str, input_row_ids: list[str],
-        scratch: bool = False,
+        scratch: bool = False, status: str = "exploratory",
     ) -> dict:
-        """Run SQL (DuckDB) against one or more artifacts. Each input row_id is
-        registered as a table named in_1, in_2, ... in the order you list them
-        in input_row_ids — the response's `input_tables` says which row_id got
-        which name. The names are positional, never derived from the title, so
-        two inputs with the same title, a title starting with a digit, and an
-        input you later re-titled all behave the same.
-        The result is returned inline below (row_count,
-        columns, a 10-row preview) — you do NOT need a second call to see it.
-        It's also saved as a new `query` artifact, automatically lineage-linked
-        to every input and recorded — no separate save_artifact call needed.
-        On failure, status="error" and `error`/`stdout`/`stderr` below show why;
-        a failed run produces no artifact, so that response carries an
-        `execution_id` and no `row_id`.
+        """Run SQL (DuckDB) against one or more artifacts, and save the result.
+
+        Each input row_id is registered as a table named in_1, in_2, ... in
+        the order you list them in input_row_ids — the response's
+        `input_tables` says which row_id got which name. The names are
+        positional, never derived from the title, so two inputs with the same
+        title, a title starting with a digit, and an input you later
+        re-titled all behave the same.
+
+        The result is returned inline below (row_count, columns, a 10-row
+        preview) — you do NOT need a second call to see it. It's also saved
+        as a new `query` artifact, automatically lineage-linked to every
+        input and recorded — no separate save_artifact call needed.
+
+        `status` is the saved row's lifecycle: "exploratory" (the default) for
+        a query that is a finding, "result" for one you are asserting as an
+        answer. Computation is exploratory until someone claims it, so leave
+        it alone unless the query IS the answer; to claim a row you saved
+        earlier, call mark(row_id=..., status="result").
+
+        On failure, status="error" and `error`/`stdout`/`stderr` below show
+        why; a failed run produces no artifact, so that response carries an
+        `execution_id` and no `row_id`. (That `status` is the RUN's outcome;
+        the row's lifecycle state, when there is one, is `artifact_status`.)
 
         scratch=True: run and return the result inline but persist nothing —
         no artifact, no lineage, not searchable. For quick checks (row counts,
@@ -275,7 +358,7 @@ def build_producer(config: ServerConfig) -> FastMCP:
         with db.write() as conn:
             outcome = execution.run_sql(
                 conn, code=code, session_id=session_id, title=title, description=description,
-                input_row_ids=input_row_ids, scratch=scratch,
+                input_row_ids=input_row_ids, scratch=scratch, status=status,
             )
             return execution_response(conn, outcome, input_row_ids)
 
@@ -285,27 +368,38 @@ def build_producer(config: ServerConfig) -> FastMCP:
         output_type: str = "transform", scratch: bool = False,
         requirements: list[str] | None = None, code_paths: list[str] | None = None,
         style: str | None = "dsos", python_path: str | None = None,
+        status: str = "exploratory",
     ) -> dict:
-        """Run Python against one or more artifacts. Each input row_id is bound
-        to a variable named in_1, in_2, ... in the order you list them in
-        input_row_ids (the response's `input_tables` says which row_id got which
-        name), and every input is also reachable by id as
-        `inputs["<row_id>"]`; `pd` (pandas) is available. The names are
-        positional, never derived from the title, so two inputs with the same
-        title, a title starting with a digit, and an input you later re-titled
-        all behave the same. Your
-        code MUST assign a `result` variable — a DataFrame, a dict/list (saved
-        as JSON), a string, or for output_type="chart" a matplotlib Figure/Axes
-        (e.g. whatever `plt.gcf()`/`plt.subplots()` gives you — it's rendered to
-        PNG for you) or raw png bytes directly. On a persisted (non-scratch)
-        call the result is returned inline below as an actual rendered image
-        for a chart (not just a text placeholder) — you do NOT need a second
-        call to see it. It's also saved as a new artifact (default
-        type="transform"; pass output_type="chart" for a plot), lineage-linked
-        to every input and recorded automatically. On failure, status="error"
-        and `error`/`stdout`/`stderr` below show the traceback and anything
-        printed before it failed; a failed run produces no artifact, so that
-        response carries an `execution_id` and no `row_id`.
+        """Run Python against one or more artifacts, and save the result.
+
+        Each input row_id is bound to a variable named in_1, in_2, ... in the
+        order you list them in input_row_ids (the response's `input_tables`
+        says which row_id got which name), and every input is also reachable
+        by id as `inputs["<row_id>"]`; `pd` (pandas) is available. The names
+        are positional, never derived from the title, so two inputs with the
+        same title, a title starting with a digit, and an input you later
+        re-titled all behave the same.
+
+        Your code MUST assign a `result` variable — a DataFrame, a dict/list
+        (saved as JSON), a string, or for output_type="chart" a
+        matplotlib Figure/Axes (whatever `plt.gcf()`/`plt.subplots()` gives
+        you — it's rendered to PNG for you) or raw png bytes directly. On a
+        persisted (non-scratch) call the result is returned inline below as
+        an actual rendered image for a chart (not just a text placeholder) —
+        you do NOT need a second call to see it. It's also saved as a new
+        artifact (default type="transform"; pass output_type="chart" for a
+        plot), lineage-linked to every input and recorded automatically.
+
+        `status` is the saved row's lifecycle: "exploratory" (the default) for
+        a transform that is a finding, "result" for one you are asserting as
+        an answer. To claim a row you saved earlier, call
+        mark(row_id=..., status="result").
+
+        On failure, status="error" and `error`/`stdout`/`stderr` below show
+        the traceback and anything printed before it failed; a failed run
+        produces no artifact, so that response carries an `execution_id` and
+        no `row_id`. (That `status` is the RUN's outcome; the row's lifecycle
+        state, when there is one, is `artifact_status`.)
 
         scratch=True: run and return the result inline but persist nothing —
         no artifact, no lineage, not searchable (a chart still comes back as a
@@ -364,17 +458,74 @@ def build_producer(config: ServerConfig) -> FastMCP:
                 conn, code=code, session_id=session_id, title=title, description=description,
                 input_row_ids=input_row_ids, output_type=output_type, scratch=scratch,
                 requirements=requirements, code_paths=code_paths, style=style,
-                python_path=python_path or config.python_path,
+                python_path=python_path or config.python_path, status=status,
             )
             return execution_response(conn, outcome, input_row_ids)
 
     @mcp.tool()
     def get_lineage(row_id: str, session_id: str, direction: str = "ancestors") -> dict:
-        """See what an artifact was built from (direction="ancestors", the
-        default) or what has been built from it (direction="descendants")."""
+        """See what an artifact was built from, or what was built from it.
+
+        direction="ancestors" (the default) lists what this artifact was built
+        from; direction="descendants" lists what has been built from it.
+        """
         arts = store.get_lineage(db.conn(), row_id, direction=direction)
         results = [{"row_id": a.row_id, "type": a.type, "title": a.title} for a in arts]
         return {"results": results, "artifact_row_ids": [row_id, *(a.row_id for a in arts)]}
+
+    @mcp.tool()
+    def mark(
+        row_id: str, session_id: str, status: str | None = None,
+        verdict: str | None = None, basis: str | None = None,
+        superseded_by: str | None = None,
+    ) -> dict:
+        """Move a row along its lifecycle, and/or record a verdict on it.
+
+        Two halves of the same gesture, so they are one tool: this row is now
+        a result (or is now dead), and here is what I know about it and why.
+        Pass at least one of status or verdict; passing both is normal.
+
+        status — the row's lifecycle state. Allowed transitions:
+        exploratory -> result, exploratory -> superseded, result ->
+        superseded. "superseded" is TERMINAL: a row something replaced does
+        not come back, because two current answers to one question is the
+        problem this state exists to prevent. To bring one back, save a new
+        version instead. Registering with save_artifact is itself a claim, so
+        a fresh save_artifact is already a "result" and a run_sql/run_python
+        output starts "exploratory" — this is how you claim an existing row.
+
+        superseded_by — required whenever status="superseded", and must be an
+        existing row_id: the thing that replaced this one. A dead row with
+        nothing said about what replaced it is a deletion with extra steps.
+        A superseded row stays fully readable through get_artifact; it just
+        stops being the answer search_artifacts gives.
+
+        verdict — "confirmed", "contradicted", "stale" or "needs_review",
+        recorded against the row and APPENDED to its validation history: the
+        history is never rewritten, so a later opinion cannot erase what
+        was believed earlier. `basis` is REQUIRED for a verdict, for the
+        same reason a confidence level needs one — say what you checked and
+        against what, because a verdict with no basis is a label no later
+        reader can act on.
+
+        The response reports the row's new status and its current validation
+        verdict, which is DERIVED rather than stored: the latest human
+        verdict if there is one (however late a model speaks afterwards),
+        else the latest model verdict, else "unvalidated" — overridden to
+        "stale" while any dataset it was built from is past its own
+        `refresh_after`. A row already judged "contradicted" stays
+        contradicted; the stale check never softens a known-bad result into
+        a different kind of doubt.
+        """
+        try:
+            with db.write() as conn:
+                result = store.mark(
+                    conn, row_id=row_id, session_id=session_id, status=status,
+                    verdict=verdict, basis=basis, superseded_by=superseded_by,
+                )
+        except ValueError as exc:
+            return {"error": str(exc), "artifact_row_ids": []}
+        return {**result, "artifact_row_ids": [row_id]}
 
     # The consistency layer, back on the tool surface by the maintainer's U1
     # decision (WP-B2R): a shared chart style and a house report layout are the
@@ -384,9 +535,10 @@ def build_producer(config: ServerConfig) -> FastMCP:
 
     @mcp.tool()
     def list_templates(session_id: str, kind: str | None = None) -> dict:
-        """Chart styles and report templates — the consistency layer, built-ins
-        and custom. Chart styles are run_python's style= (default "dsos", the
-        dark house style); report templates are the layout the GUI's report page
+        """List this store's chart styles and report templates, built-in and custom.
+
+        Chart styles are run_python's style= (default "dsos", the dark house
+        style); report templates are the layout the GUI's report page
         (/artifacts/<row_id>/report?template=...) renders a narrative with
         (default "report", the dark house layout). Custom templates made with
         save_template are referenced by row_id or artifact_id — the id is
@@ -435,15 +587,16 @@ def build_producer(config: ServerConfig) -> FastMCP:
         description: str | None = None, tags: list[str] | None = None,
         base: str | None = None,
     ) -> dict:
-        """Create or re-version a template — the customizable half of the
-        consistency layer. Save the look of this workstream once here, and every
-        later session gets it by reference.
+        """Create or re-version a template: the look of this workstream, saved once.
+
+        Every later session then gets it by reference instead of re-deriving
+        the same chart style or report layout.
 
         kind: "chart-style" (matplotlib rcParams text, .mplstyle syntax — used
         via run_python's style=) or "report" (HTML with {{title}}/{{body}}/
         {{published_at}}/{{session_question}} tokens, where {{body}} is where
-        the rendered narrative goes — the layout the GUI's report page renders a
-        narrative with).
+        the rendered narrative goes — the layout the GUI's report page renders
+        a narrative with).
 
         base: an existing template (built-in name or row_id/artifact_id) to
         copy from — customize instead of rewriting from scratch. If you pass

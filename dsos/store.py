@@ -12,7 +12,7 @@ import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +24,57 @@ from dsos.db import blob_dir_for
 # "template": chart styles (.mplstyle text) and report layouts (.html with
 # {{title}}/{{body}} tokens) — the customizable styling layer behind
 # run_python(style=...) and publish_report(template=...). See dsos/templating.py.
-ARTIFACT_TYPES = {"dataset", "query", "transform", "chart", "narrative", "skill", "template"}
+# "decision": a call the workstream made and why (WP-E3's record_decision) —
+# it is an artifact like any other, because the reason a choice was made is
+# the thing a later question needs and cannot recompute.
+ARTIFACT_TYPES = {
+    "dataset", "query", "transform", "chart", "narrative", "decision", "skill", "template",
+}
+
+# The lifecycle (D2/D3), on the artifacts.status column the store already
+# had. `exploratory` is what a run produces — a finding nobody has claimed
+# yet; `result` is what a deliberate registration asserts; `superseded` is
+# the terminal state for a row something replaced, and it is kept rather
+# than deleted so the chain of what replaced what is still readable.
+#
+# The transitions below are the whole rule set. `superseded` maps to nothing
+# on purpose: reviving a row would mean the thing that replaced it might
+# also be replaced later, and two current answers to one question is the
+# failure this state exists to prevent. Reviving means saving a new version.
+STATUS_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "exploratory": ("result", "superseded"),
+    "result": ("superseded",),
+    "superseded": (),
+}
+
+# caveats and confidence are the two fields a model can fill in dishonestly
+# for free, so both are bounded and both demand evidence. caveats is capped
+# at 5 x 200 chars because a caveat that needs more than that is a narrative
+# artifact, not a caveat on this one — and the message says so, because the
+# fix is "write the thing properly", not "work within the limit".
+MAX_CAVEATS = 5
+MAX_CAVEAT_CHARS = 200
+CAVEATS_ERROR = (
+    "caveats are short properties of a result; write a narrative for longer notes"
+)
+CONFIDENCE_LEVELS = ("high", "medium", "low")
+
+# The verdict vocabulary is the schema's CHECK constraint (M3); the table
+# repeats it so a caller can render the options without a DB round trip.
+VERDICTS = ("confirmed", "contradicted", "stale", "needs_review")
+# A `human` verdict outranks a `model` one however late the model speaks —
+# the person who checked the work is the authority on it, and a model that
+# keeps re-asserting its own opinion must not be able to bury that.
+VERDICT_AUTHORITY = ("human", "model")
+
+# "7d"/"12h"/"2w": how long a fetched source stays fresh. Anything else —
+# "static", "when the site changes", a typo — is not an interval this code
+# can measure, so it is treated as "does not expire" rather than guessed at.
+# A dataset with no refresh_after at all is the same case: dsos cannot know
+# when someone else's data goes out of date, and inventing an interval would
+# mark every dataset in a store stale.
+_REFRESH_AFTER_RE = re.compile(r"^(\d+)([hdw])$")
+_REFRESH_UNIT_SECONDS = {"h": 3600, "d": 86_400, "w": 604_800}
 
 # {{artifact:<row_id>}} — how a narrative (or any text artifact) embeds a
 # reference to another artifact. row_id already pins a specific version (a
@@ -84,6 +134,9 @@ class Artifact:
     status: str
     content: Any = None  # populated by get_artifact/search_artifacts on demand
     content_error: str | None = None  # set instead of content if the blob is missing on disk
+    caveats: list[str] | None = None
+    confidence: list[dict] | None = None
+    superseded_by: str | None = None
 
 
 def start_session(conn: sqlite3.Connection, question: str) -> str:
@@ -217,6 +270,67 @@ def prior_work_signal(conn: sqlite3.Connection, question: str, top_k: int = 3) -
             "candidates": candidates, "note": note}
 
 
+def _validated_caveats(caveats: list[str] | None) -> list[str]:
+    """At most MAX_CAVEATS strings of at most MAX_CAVEAT_CHARS each.
+
+    The cap is not a formatting preference, it is the distinction the field
+    exists to draw: a caveat is a property of THIS result that a reader
+    would otherwise get wrong ("excludes refunds", "one day only"). Text
+    that needs more room than that is not a caveat, it is the analysis, and
+    the error message says to write it as a narrative instead of telling the
+    caller to compress — which is the only response that doesn't produce a
+    lossy summary passed off as a caveat.
+    """
+    if caveats is None:
+        return []
+    if not isinstance(caveats, list) or any(not isinstance(c, str) for c in caveats):
+        raise ValueError("caveats must be a list of strings")
+    if len(caveats) > MAX_CAVEATS:
+        raise ValueError(CAVEATS_ERROR)
+    if any(len(c) > MAX_CAVEAT_CHARS for c in caveats):
+        raise ValueError(CAVEATS_ERROR)
+    return [c for c in caveats if c.strip()]
+
+
+def _validated_confidence(confidence: list[dict] | None) -> list[dict]:
+    """[{claim, level, basis}], with `basis` required and non-empty.
+
+    The basis requirement is the whole point of the field. A bare
+    {claim, level} is something a model can emit for any claim at all,
+    always in the confident direction, at no cost — which makes a store full
+    of "high" worth nothing. Requiring the evidence that supports the level
+    is what makes the field carry information: "high" backed by "re-derived
+    from the invoice export" is checkable, and "high" backed by nothing is
+    not accepted at all. Validation is a schema check here rather than a
+    warning, because a warning is something a model learns to ignore.
+    """
+    if confidence is None:
+        return []
+    if not isinstance(confidence, list):
+        raise ValueError("confidence must be a list of {claim, level, basis} entries")
+    checked = []
+    for entry in confidence:
+        if not isinstance(entry, dict):
+            raise ValueError("confidence must be a list of {claim, level, basis} entries")
+        claim = (entry.get("claim") or "").strip()
+        level = (entry.get("level") or "").strip().lower()
+        basis = (entry.get("basis") or "").strip()
+        if not claim:
+            raise ValueError("confidence entries need a claim")
+        if level not in CONFIDENCE_LEVELS:
+            raise ValueError(
+                f"confidence level must be one of {list(CONFIDENCE_LEVELS)}, got {level!r}"
+            )
+        if not basis:
+            raise ValueError(
+                f"confidence entry for {claim!r} has no basis: say what the level rests on "
+                f"(the check that was run, the source, the sample size). A level with no "
+                f"basis is worth nothing to a later reader."
+            )
+        checked.append({"claim": claim, "level": level, "basis": basis})
+    return checked
+
+
 def save_artifact(
     conn: sqlite3.Connection,
     *,
@@ -230,7 +344,9 @@ def save_artifact(
     tags: list[str] | None = None,
     source: dict | None = None,
     parent_row_ids: list[str] | None = None,
-    status: str = "ready",
+    status: str = "result",
+    caveats: list[str] | None = None,
+    confidence: list[dict] | None = None,
 ) -> str:
     """Save a new artifact, or a new version of an existing one.
 
@@ -238,17 +354,36 @@ def save_artifact(
     the only thing search_artifacts has to go on, and reuse quality depends
     on it directly.
 
+    `status` is the lifecycle (D2/D3) and every writer passes it explicitly:
+    'result' here, because registering something deliberately IS the claim,
+    and 'exploratory' for the output of a run_sql/run_python, which is a
+    finding until someone claims it. Nothing falls back to the column's
+    default — the column still says 'ready' so a fresh and a migrated store
+    have identical schemas, and a writer that leaned on it would put 'ready'
+    next to the 'result' its own migrated rows carry. The one place this
+    function's default is the thing that matters is the two words in it.
+
     Any `{{artifact:<row_id>}}` reference found in text `content` (e.g. a
     narrative embedding the datasets/charts it discusses) is automatically
     added to this artifact's lineage, on top of whatever `parent_row_ids`
     was explicitly passed — a narrative doesn't need both. References to a
     row_id that doesn't exist are silently dropped rather than raising, same
     as get_lineage silently skips missing rows elsewhere.
+
+    `caveats` and `confidence` are validated here, at save time, and raise
+    ValueError — see _validated_caveats and _validated_confidence for why
+    each of them is bounded.
     """
     if type not in ARTIFACT_TYPES:
         raise ValueError(f"unknown artifact type {type!r}, expected one of {ARTIFACT_TYPES}")
     if not description or not description.strip():
         raise ValueError("save_artifact requires a real description, not a filename")
+    if status not in STATUS_TRANSITIONS:
+        raise ValueError(
+            f"status must be one of {list(STATUS_TRANSITIONS)}, got {status!r}"
+        )
+    caveats = _validated_caveats(caveats)
+    confidence = _validated_confidence(confidence)
 
     tags = tags or []
     is_new = artifact_id is None
@@ -288,14 +423,16 @@ def save_artifact(
         INSERT INTO artifacts (
             row_id, artifact_id, version, type, title, description, tags,
             content_ref, content_format, content_hash, source, embedding,
-            created_at, session_id, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            created_at, session_id, status, caveats, confidence
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             row_id, artifact_id, version, type, title, description, json.dumps(tags),
             content_ref, content_format, content_hash, json.dumps(source) if source else None,
             vector.astype(np.float32).tobytes(),
             _now(), session_id, status,
+            json.dumps(caveats) if caveats else None,
+            json.dumps(confidence) if confidence else None,
         ),
     )
     conn.execute(
@@ -394,6 +531,8 @@ def _row_to_artifact(row: sqlite3.Row, *, load_content: bool) -> Artifact:
         content_format=row["content_format"],
         source=json.loads(row["source"]) if row["source"] else None,
         created_at=row["created_at"], session_id=row["session_id"], status=row["status"],
+        caveats=_json_column(row, "caveats"), confidence=_json_column(row, "confidence"),
+        superseded_by=row["superseded_by"],
     )
     if load_content:
         try:
@@ -410,6 +549,242 @@ def _row_to_artifact(row: sqlite3.Row, *, load_content: bool) -> Artifact:
             # time, ...) shouldn't 500 every caller either.
             art.content_error = f"content blob is not valid UTF-8 (corrupt on disk): {art.content_ref}"
     return art
+
+
+def _json_column(row: sqlite3.Row, name: str) -> Any:
+    """A JSON text column as the Python value it holds, or None.
+
+    Null is the normal case for both of these (most artifacts have no
+    caveats and no confidence), and a row written by a build that predates
+    the column has no value to parse at all. Neither is an error, so this
+    never raises on missing data — a malformed value would, and rightly,
+    because that is corruption rather than absence.
+    """
+    raw = row[name] if name in row.keys() else None
+    return json.loads(raw) if raw else None
+
+
+def _parse_iso(ts: str) -> datetime | None:
+    """An ISO timestamp as an aware datetime, or None if it isn't one.
+
+    `source.fetched_at` is freeform by design (save_artifact's docstring
+    says "ISO-ish timestamp/description of when"), so the store really
+    does hold values like "sometime last month". Those are not parseable,
+    and treating them as errors would make an ordinary dataset unreadable;
+    the caller falls back to created_at instead.
+    """
+    if not isinstance(ts, str) or not ts.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts.strip())
+    except ValueError:
+        return None
+    # A naive timestamp is assumed UTC: every timestamp dsos itself writes
+    # is aware, so a naive one came from a human's source dict, and the
+    # store's own clock is the only reference available for it.
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _expired_sources(conn: sqlite3.Connection, row_id: str) -> list[str]:
+    """Human-readable reasons `row_id`'s inputs have outlived their
+    refresh_after, one per expired ancestor dataset (plus the row itself if
+    it is a dataset — its own source is what it was built from).
+
+    The dataset's clock starts at source.fetched_at when that parses as ISO
+    and at the dataset's created_at otherwise, which is the honest fallback:
+    a dataset registered three days ago with no parseable fetch time is
+    three days old as far as anything here can tell. `static` — and any
+    refresh_after that is not a `^\d+[hdw]$` interval — never expires.
+
+    Computed on read and never written (D11): a source that goes stale does
+    not stop being what it was, and a scheduled sweep would have to be
+    correct about wall-clock time and about datasets nobody ever touches
+    again. Both cases — no source at all, and a source that says nothing
+    about freshness — mean "not known to be expired", which is the default
+    for a store where most datasets never declared a refresh window.
+    """
+    rows = conn.execute(
+        """
+        WITH RECURSIVE anc(row_id) AS (
+            SELECT ? UNION SELECT l.parent_row_id FROM lineage l
+            JOIN anc ON l.child_row_id = anc.row_id
+        )
+        SELECT a.row_id, a.title, a.created_at, a.source
+        FROM artifacts a JOIN anc ON a.row_id = anc.row_id
+        WHERE a.type = 'dataset'
+        """,
+        (row_id,),
+    ).fetchall()
+    now = datetime.now(timezone.utc)
+    reasons = []
+    for row in rows:
+        try:
+            source = json.loads(row["source"]) if row["source"] else None
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(source, dict):
+            continue
+        match = _REFRESH_AFTER_RE.match(str(source.get("refresh_after") or ""))
+        if not match:
+            continue
+        since = _parse_iso(source.get("fetched_at")) or _parse_iso(row["created_at"])
+        if since is None:
+            continue
+        window = timedelta(
+            seconds=int(match.group(1)) * _REFRESH_UNIT_SECONDS[match.group(2)]
+        )
+        if now - since > window:
+            reasons.append(
+                f"{row['title']!r} was fetched over {source.get('refresh_after')} ago "
+                f"and is past its refresh_after"
+            )
+    return reasons
+
+
+def validation_status(conn: sqlite3.Connection, row_id: str) -> dict:
+    """The current validation verdict for one artifact, and the whole
+    ledger behind it: {current, history, stale_reason?}.
+
+    `current` is derived, never stored, and derived in a specific order:
+
+    - the latest `human` verdict if there is one, else the latest `model`
+      one, else 'unvalidated'. A person's check outranks a model's however
+      late the model speaks afterwards — a model re-asserting its own
+      opinion must not be able to overwrite the fact that someone looked.
+    - then the derived stale check (D11), which promotes 'confirmed' and
+      'unvalidated' to 'stale' while the inputs are past their refresh
+      window. It does NOT promote 'contradicted': something already known
+      to be wrong is not improved into a different kind of doubt, and
+      silently downgrading a known-bad result to "stale" would be the one
+      case where the automation is confidently wrong.
+
+    `history` is the append-only ledger itself, newest first, with every
+    entry's basis. It is part of the return value because a verdict
+    without its reasoning is a label, and a reader who disagrees with the
+    label needs the reasoning to say so. `stale_reason` is present only
+    when the derived check fired, and names the expired dataset.
+
+    The table has BEFORE UPDATE / BEFORE DELETE triggers aborting on it, so
+    a verdict can only ever be added — which is what makes "a human verdict
+    beats a later model verdict" representable at all.
+    """
+    rows = conn.execute(
+        """
+        SELECT id, verdict, by, session_id, at, basis FROM validations
+        WHERE row_id = ? ORDER BY at DESC, rowid DESC
+        """,
+        (row_id,),
+    ).fetchall()
+    history = [dict(r) for r in rows]
+    current = "unvalidated"
+    for authority in VERDICT_AUTHORITY:
+        latest = next((h for h in history if h["by"] == authority), None)
+        if latest is not None:
+            current = latest["verdict"]
+            break
+    stale_reason = None
+    if current != "contradicted":
+        reasons = _expired_sources(conn, row_id)
+        if reasons:
+            current, stale_reason = "stale", "; ".join(reasons)
+    result = {"current": current, "history": history}
+    if stale_reason:
+        result["stale_reason"] = stale_reason
+    return result
+
+
+def mark(
+    conn: sqlite3.Connection, *, row_id: str, session_id: str, status: str | None = None,
+    verdict: str | None = None, basis: str | None = None,
+    superseded_by: str | None = None,
+) -> dict:
+    """Move one artifact along its lifecycle, and/or append a validation.
+
+    One tool rather than two, because the two are the same gesture seen
+    from two sides: this row is now a result (or is now dead), and here is
+    what I know about it and why. Both may be passed in one call.
+
+    The status rules are STATUS_TRANSITIONS, and the error for an illegal
+    one names every allowed transition — a model that guessed wrong is
+    corrected by this message alone, without a second failed call to work
+    out what it did wrong. 'superseded' is terminal and says so; the way
+    back is a new version, which is a different row rather than a
+    resurrected one.
+
+    `superseded_by` is required for a superseded status (a row that is
+    dead with nothing said about what replaced it is just a deletion with
+    extra steps) and must name a row that exists, so the chain is walkable
+    from either end.
+
+    A `verdict` is appended with by='model' and requires a `basis`, for the
+    same reason a confidence level does: an unsupported verdict is a label
+    a later reader cannot act on. Returns the row's new state and its
+    freshly derived validation.
+    """
+    if status is None and verdict is None:
+        raise ValueError(
+            "mark needs at least one of status or verdict — pass the new status, a verdict, "
+            "or both."
+        )
+    row = conn.execute(
+        "SELECT status, title FROM artifacts WHERE row_id = ?", (row_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"no artifact with row_id {row_id!r}")
+
+    if status is not None:
+        current = row["status"]
+        allowed = STATUS_TRANSITIONS.get(current, ())
+        if status not in allowed:
+            raise ValueError(
+                f"cannot mark {row_id} {current} -> {status}. Allowed transitions: "
+                + "; ".join(
+                    f"{a} -> {b}" for a, targets in STATUS_TRANSITIONS.items() for b in targets
+                )
+                + (". superseded is terminal — to bring this back, save a new version."
+                   if current == "superseded" else ".")
+            )
+        if status == "superseded":
+            if not superseded_by:
+                raise ValueError(
+                    "marking a row superseded requires superseded_by — the row_id of what "
+                    "replaced it, so the chain stays walkable."
+                )
+            if superseded_by == row_id:
+                raise ValueError("superseded_by must be a different row — an artifact cannot replace itself")
+            if conn.execute(
+                "SELECT 1 FROM artifacts WHERE row_id = ?", (superseded_by,)
+            ).fetchone() is None:
+                raise ValueError(f"superseded_by {superseded_by!r} is not an existing row_id")
+
+    if verdict is not None:
+        if verdict not in VERDICTS:
+            raise ValueError(f"verdict must be one of {list(VERDICTS)}, got {verdict!r}")
+        if not basis or not basis.strip():
+            raise ValueError(
+                "a verdict requires a basis — what was checked, and against what. A verdict "
+                "with no basis is a label a later reader cannot act on."
+            )
+        conn.execute(
+            """
+            INSERT INTO validations (id, row_id, verdict, by, session_id, at, basis)
+            VALUES (?, ?, ?, 'model', ?, ?, ?)
+            """,
+            (_new_id(), row_id, verdict, session_id, _now(), basis),
+        )
+
+    if status is not None:
+        conn.execute(
+            "UPDATE artifacts SET status = ?, superseded_by = ? WHERE row_id = ?",
+            (status, superseded_by, row_id),
+        )
+    conn.commit()
+    return {
+        "row_id": row_id,
+        "status": row["status"] if status is None else status,
+        "superseded_by": superseded_by,
+        "validation": validation_status(conn, row_id),
+    }
 
 
 def get_artifact(
@@ -458,8 +833,34 @@ def _fts_query(text: str) -> str:
     return " AND ".join(f"{w}*" for w in re.findall(r"\w+", text))
 
 
+def _lifecycle_sql(*, include_superseded: bool, include_exploratory: bool) -> str:
+    """The `a.status` predicate search_artifacts applies, as a SQL fragment
+    (ANDed onto both its keyword and its semantic branch).
+
+    Superseded rows are hidden by default (D7): they were marked as
+    replaced by a specific row, so leaving them in would mean a search
+    answers with something a human already retired. They are hidden, not
+    deleted — include_superseded=True returns them, and get_artifact reads
+    them regardless, which is the whole point of keeping them.
+
+    Exploratory rows are INCLUDED by default, and that is a deliberate
+    interim state rather than an oversight. A run's output is a finding
+    nobody has claimed yet, and today most artifacts in a store are
+    exploratory, so hiding them now would empty every result set. WP-G1
+    flips this default at cutover, once the population is mostly results.
+    """
+    if include_superseded:
+        clause = ""
+    else:
+        clause = " AND a.status != 'superseded'"
+    if not include_exploratory:
+        clause += " AND a.status != 'exploratory'"
+    return clause
+
+
 def search_artifacts(
     conn: sqlite3.Connection, query: str, *, top_k: int = 5, type: str | None = None,
+    include_superseded: bool = False, include_exploratory: bool = True,
 ) -> list[tuple[Artifact, float]]:
     """Keyword-first, semantic fallback — so an exact term (a title, a
     column name) reliably wins, while a query with no literal overlap still
@@ -498,6 +899,9 @@ def search_artifacts(
         type_where, type_params = "a.type = ?", [type]
     else:
         type_where, type_params = _NOT_TYPED_SQL, list(_NOT_PRIOR_WORK)
+    lifecycle_sql = _lifecycle_sql(
+        include_superseded=include_superseded, include_exploratory=include_exploratory
+    )
 
     ordered: list[Artifact] = []
     scores: list[float] = []
@@ -511,7 +915,7 @@ def search_artifacts(
                 SELECT a.* FROM artifacts_fts
                 JOIN artifacts a ON a.row_id = artifacts_fts.row_id
                 {_LATEST_VERSION_JOIN}
-                WHERE artifacts_fts MATCH ? AND {type_where} AND a.status != 'error'
+                WHERE artifacts_fts MATCH ? AND {type_where} AND a.status != 'error'{lifecycle_sql}
                 ORDER BY a.created_at DESC, bm25(artifacts_fts)
                 LIMIT ?
                 """,
@@ -528,7 +932,7 @@ def search_artifacts(
     if len(ordered) < top_k:
         rows = conn.execute(
             f"SELECT a.* FROM artifacts a {_LATEST_VERSION_JOIN} "
-            f"WHERE {type_where} AND a.status != 'error'",
+            f"WHERE {type_where} AND a.status != 'error'{lifecycle_sql}",
             type_params,
         ).fetchall()
         q_vec = embeddings.embed(query)

@@ -90,7 +90,25 @@ def artifact_payload(conn: sqlite3.Connection, art: store.Artifact) -> dict:
         "description": art.description,
         "content_format": art.content_format,
         "source": art.source,
+        # The lifecycle (D2/D3) and everything a reader needs to judge the
+        # row rather than just re-read it: where it sits in the lifecycle,
+        # what its author flagged, how confident they said they were and
+        # on what basis, and what has been validated against it. An
+        # exploratory row and a result carrying a "contradicted" verdict
+        # are very different things to reuse, and until the payload says so
+        # an agent cannot tell them apart — search ranking does not carry
+        # either.
+        "status": art.status,
+        "caveats": art.caveats or [],
+        "confidence": art.confidence or [],
+        "validation": store.validation_status(conn, art.row_id),
     }
+    if art.superseded_by:
+        # Only on a superseded row: the row that replaced this one. Kept in
+        # the payload (and not only in search's) so a caller holding a
+        # pinned row_id — a report embedding it, a reused citation — can
+        # follow the chain forward instead of silently quoting a dead row.
+        base["superseded_by"] = art.superseded_by
     uses = store.get_lineage(conn, art.row_id, direction="ancestors")
     if uses:
         # What this artifact was built from / embeds — a narrative's
@@ -152,7 +170,14 @@ def execution_payload(
     art = store.get_artifact_by_row_id(conn, outcome.row_id, load_content=True)
     payload = {
         **artifact_payload(conn, art),
-        "status": art.status,
+        # The run's OWN outcome, not the artifact's lifecycle state: this
+        # field has meant ok/error since a run first reported itself, and
+        # twenty-odd call sites (and every failure branch a model reads)
+        # branch on it. The lifecycle state of the row the run just saved is
+        # the payload's own `status`, echoed under its own name below so
+        # the two can't be confused for one field.
+        "status": outcome.status,
+        "artifact_status": art.status,
         "input_tables": input_tables,
         "artifact_row_ids": [outcome.row_id, *input_row_ids],
     }

@@ -174,15 +174,16 @@ Every tool definition costs tokens on every turn, for every agent that loads it,
 <!-- contract:producer -->
 | tool | params | summary |
 |---|---|---|
-| `get_artifact` | `row_id*`: string, `session_id*`: string | Fetch an artifact's full metadata and content, by the row_id that save_artifact/run_sql/run_python/search_artifacts gave you — that row_id is the only id you need; there's no separate "artifact_id" to look up. |
-| `get_lineage` | `row_id*`: string, `session_id*`: string, `direction`: string | See what an artifact was built from (direction="ancestors", the default) or what has been built from it (direction="descendants"). |
-| `list_templates` | `session_id*`: string, `kind`: string \| null | Chart styles and report templates — the consistency layer, built-ins and custom. |
-| `run_python` | `code*`: string, `session_id*`: string, `title*`: string, `description*`: string, `input_row_ids*`: list[string], `output_type`: string, `scratch`: boolean, `requirements`: list[string] \| null, `code_paths`: list[string] \| null, `style`: string \| null, `python_path`: string \| null | Run Python against one or more artifacts. |
-| `run_sql` | `code*`: string, `session_id*`: string, `title*`: string, `description*`: string, `input_row_ids*`: list[string], `scratch`: boolean | Run SQL (DuckDB) against one or more artifacts. |
-| `save_artifact` | `type*`: string, `title*`: string, `description*`: string, `content_format*`: string, `session_id*`: string, `content_text`: string \| null, `content_path`: string \| null, `tags`: list[string] \| null, `source`: object \| null, `parent_row_ids`: list[string] \| null, `dedupe`: boolean | Register something as a real artifact. |
-| `save_template` | `session_id*`: string, `kind*`: string, `content`: string \| null, `artifact_id`: string \| null, `title`: string \| null, `description`: string \| null, `tags`: list[string] \| null, `base`: string \| null | Create or re-version a template — the customizable half of the consistency layer. |
-| `search_artifacts` | `query*`: string, `session_id*`: string, `top_k`: integer, `type`: string \| null | Search over everything saved so far, across every past session, not just this one — an exact term (a title, a column name) reliably matches even with the fallback embedding model; a vaguer query still finds something… |
-| `start_session` | `question*`: string | Start a new round of work. |
+| `get_artifact` | `row_id*`: string, `session_id*`: string | Fetch one artifact's full metadata and content, by row_id. |
+| `get_lineage` | `row_id*`: string, `session_id*`: string, `direction`: string | See what an artifact was built from, or what was built from it. |
+| `list_templates` | `session_id*`: string, `kind`: string \| null | List this store's chart styles and report templates, built-in and custom. |
+| `mark` | `row_id*`: string, `session_id*`: string, `status`: string \| null, `verdict`: string \| null, `basis`: string \| null, `superseded_by`: string \| null | Move a row along its lifecycle, and/or record a verdict on it. |
+| `run_python` | `code*`: string, `session_id*`: string, `title*`: string, `description*`: string, `input_row_ids*`: list[string], `output_type`: string, `scratch`: boolean, `requirements`: list[string] \| null, `code_paths`: list[string] \| null, `style`: string \| null, `python_path`: string \| null, `status`: string | Run Python against one or more artifacts, and save the result. |
+| `run_sql` | `code*`: string, `session_id*`: string, `title*`: string, `description*`: string, `input_row_ids*`: list[string], `scratch`: boolean, `status`: string | Run SQL (DuckDB) against one or more artifacts, and save the result. |
+| `save_artifact` | `type*`: string, `title*`: string, `description*`: string, `content_format*`: string, `session_id*`: string, `content_text`: string \| null, `content_path`: string \| null, `tags`: list[string] \| null, `source`: object \| null, `parent_row_ids`: list[string] \| null, `dedupe`: boolean, `status`: string, `caveats`: list[string] \| null, `confidence`: list[object] \| null | Register something as a real artifact, so future work can find and reuse it. |
+| `save_template` | `session_id*`: string, `kind*`: string, `content`: string \| null, `artifact_id`: string \| null, `title`: string \| null, `description`: string \| null, `tags`: list[string] \| null, `base`: string \| null | Create or re-version a template: the look of this workstream, saved once. |
+| `search_artifacts` | `query*`: string, `session_id*`: string, `top_k`: integer, `type`: string \| null, `include_superseded`: boolean, `include_exploratory`: boolean | Search every artifact saved so far, across every past session. |
+| `start_session` | `question*`: string | Start a new round of work, and learn what this store already holds. |
 <!-- /contract:producer -->
 
 **consumer** — called by the PM agent and other non-analysis agents. The table is empty until the consumer's tools are registered; the registry is the source of truth, so it fills in on the next regeneration rather than by an edit here.
