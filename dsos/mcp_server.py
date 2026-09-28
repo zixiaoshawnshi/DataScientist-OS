@@ -77,7 +77,151 @@ def __getattr__(name: str):
 
 
 if __name__ == "__main__":
-    # Through __getattr__, not a bare `mcp`: a module-level __getattr__ is
-    # consulted for attribute access on the module, not for a global name
-    # lookup inside its own body, so a bare `mcp.run()` here is a NameError.
-    __getattr__("mcp").run()
+    # WP-D2. Everything below the guard rather than beside it, because this WP
+    # owns `__main__` and nothing else in this file: the module-level surface
+    # (DB_PATH, DEFAULT_PYTHON_PATH, the lazy `mcp`) is WP-C1's and its tests'
+    # and stays exactly as it is. What changes is only what running the module
+    # *means*. Until WP-D1 it meant "be the server"; now the daemon is the
+    # server, and this process is a stdio-to-HTTP proxy pointed at it, which is
+    # the only thing an MCP client that speaks stdio can be handed.
+    import argparse
+    import json
+    import urllib.error
+    import urllib.request
+    from pathlib import Path
+
+    from fastmcp import Client
+    from fastmcp.server import create_proxy
+
+    URL_ENV = "DSOS_URL"
+    TOKEN_ENV = "DSOS_TOKEN"
+    PROFILES = ("producer", "consumer")
+
+    def _healthz_answers(base_url: str, timeout: float = 2.0) -> bool:
+        """Is that daemon actually up? Not merely recorded in daemon.json.
+
+        A manifest is a claim, and a claim outlives the process that made it:
+        a killed daemon, a reboot, a port taken by something else. Asking
+        /healthz is the same check the daemon itself makes before refusing to
+        start a second one over the same store, which keeps "the shim says no"
+        and "the daemon says no" from ever disagreeing.
+        """
+        try:
+            with urllib.request.urlopen(f"{base_url}/healthz", timeout=timeout) as response:
+                return response.status == 200
+        except (urllib.error.URLError, OSError, ValueError):
+            return False
+
+    def _manifest_base_url(db_dir: Path) -> str | None:
+        """The running daemon's base URL, from the file it wrote beside the store.
+
+        Same reader the daemon's own "one daemon per store" check uses, and for
+        the same reason: the file next to the store is the answer to "who owns
+        this store", and a shim that invented a second way to ask would be a
+        second answer.
+        """
+        path = db_dir / "daemon.json"
+        if not path.exists():
+            return None
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        base_url = record.get("base_url")
+        return base_url if isinstance(base_url, str) and base_url else None
+
+    def _no_daemon(db_path: Path) -> int:
+        """The one failure a new user hits first, said the one useful way.
+
+        It names the store (so it is obvious which of several DSOS_DB_PATH
+        values is the problem) and the exact command, built from the
+        interpreter actually running this shim rather than a hardcoded
+        `python` — which, in a venv, is very often the wrong one.
+        """
+        print(
+            f"dsos daemon not running for {db_path}. "
+            f"Start it: {sys.executable} -m dsos.daemon",
+            file=sys.stderr,
+        )
+        return 1
+
+    def _token_file_token(db_dir: Path) -> str:
+        """The token the daemon wrote beside the store, or "" if it never did."""
+        path = db_dir / "daemon.token"
+        if not path.exists():
+            return ""
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    def main(argv: list[str] | None = None) -> int:
+        parser = argparse.ArgumentParser(
+            prog="python -m dsos.mcp_server",
+            description=(
+                "stdio shim for the dsos daemon: forwards one profile to the "
+                "daemon serving DSOS_DB_PATH."
+            ),
+        )
+        parser.add_argument(
+            "--profile", choices=PROFILES, default="producer",
+            help="which daemon endpoint to expose (default: producer)",
+        )
+        args = parser.parse_args(argv)
+
+        # The same lookup dsos.daemon does, deliberately: a client and its
+        # daemon have to agree on which store is meant without the user saying
+        # it twice, and this is also what the failure message names.
+        db_path = Path(os.environ.get("DSOS_DB_PATH", "data/store.db")).resolve()
+        db_dir = db_path.parent
+
+        base_url = os.environ.get(URL_ENV) or _manifest_base_url(db_dir)
+        if not base_url:
+            return _no_daemon(db_path)
+        if not _healthz_answers(base_url):
+            # A manifest left by a daemon that is gone, or a DSOS_URL that
+            # points somewhere else. Both are the same thing to the user, and
+            # the same command fixes both.
+            return _no_daemon(db_path)
+
+        token = os.environ.get(TOKEN_ENV) or _token_file_token(db_dir)
+        if not token:
+            # The daemon always runs a StaticTokenVerifier, so a proxy without
+            # one gets a 401 on every call — and a proxy reports a failed
+            # backend call as an empty tool list rather than as an error, which
+            # reads to an agent as "this server has no tools". Refusing here,
+            # with the two ways to fix it, is the difference between a five
+            # second fix and an afternoon.
+            print(
+                f"dsos daemon at {base_url} needs a bearer token. Set {TOKEN_ENV}, "
+                f"or start the daemon so it writes {db_dir / 'daemon.token'} "
+                f"next to the store.",
+                file=sys.stderr,
+            )
+            return 1
+
+        # The trailing slash is the addressable URL. The daemon mounts the MCP
+        # app with path="/", so Starlette answers /mcp/producer with a 307 to
+        # /mcp/producer/ — before the auth check even runs. A client that
+        # follows the redirect is fine either way; one that does not looks
+        # broken. The daemon's own start-up banner prints this form, and so
+        # does AGENTS.md.
+        url = f"{base_url.rstrip('/')}/mcp/{args.profile}/"
+
+        # A Client, not create_proxy(url, auth=token). The kwarg on
+        # create_proxy lands on the *front* server — it would make the shim
+        # demand a bearer token from the MCP client, which is backwards, and
+        # leave the daemon rejecting the proxy. create_proxy also accepts a
+        # disconnected Client, and a Client is where the transport's
+        # credentials belong; its factory clones one per request, so each
+        # proxied call gets its own backend session.
+        proxy = create_proxy(Client(url, auth=token), name=f"dsos-{args.profile}")
+        # `proxy` is a local, so this is an ordinary name lookup — unlike the
+        # bare `mcp.run()` this replaces, which was a NameError because a
+        # module-level __getattr__ is not consulted for global names inside the
+        # module body. Nothing here touches `mcp`, and so nothing here opens
+        # the store: the shim has no business owning one.
+        proxy.run(transport="stdio")
+        return 0
+
+    sys.exit(main())
