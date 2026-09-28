@@ -11,6 +11,8 @@
     <option value="{{ t }}" {% if type == t %}selected{% endif %}>{{ t }}</option>
     {% endfor %}
   </select>
+  <label class="muted"><input type="checkbox" name="include" value="exploratory"
+    {% if include == "exploratory" %}checked{% endif %}> include exploratory</label>
   <button type="submit">Filter</button>
 </form>
 {% if artifacts %}

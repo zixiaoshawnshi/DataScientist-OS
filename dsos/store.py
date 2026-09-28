@@ -231,10 +231,16 @@ def prior_work_signal(conn: sqlite3.Connection, question: str, top_k: int = 3) -
     check, not a claim that it fits.
     """
     placeholders = ",".join("?" * len(_NOT_PRIOR_WORK))
+    # Exploratory rows are excluded (WP-G1): a finding nobody has claimed is
+    # not prior work a session can reuse — it is the same landfill the search
+    # default now hides. Counting them would advertise a history the store
+    # does not have, and the candidate list below asks search for results
+    # only for the same reason.
     counts = {
         r["type"]: r["n"]
         for r in conn.execute(
-            f"SELECT type, COUNT(*) AS n FROM artifacts WHERE type NOT IN ({placeholders}) "
+            f"SELECT type, COUNT(*) AS n FROM artifacts "
+            f"WHERE type NOT IN ({placeholders}) AND status != 'exploratory' "
             f"GROUP BY type",
             _NOT_PRIOR_WORK,
         )
@@ -248,7 +254,9 @@ def prior_work_signal(conn: sqlite3.Connection, question: str, top_k: int = 3) -
         }
 
     candidates = []
-    for art, score in search_artifacts(conn, question, top_k=top_k * 2):
+    for art, score in search_artifacts(
+        conn, question, top_k=top_k * 2, include_exploratory=False
+    ):
         if art.type in _NOT_PRIOR_WORK:
             continue
         candidates.append({
@@ -1101,11 +1109,12 @@ def _lifecycle_sql(*, include_superseded: bool, include_exploratory: bool) -> st
     deleted — include_superseded=True returns them, and get_artifact reads
     them regardless, which is the whole point of keeping them.
 
-    Exploratory rows are INCLUDED by default, and that is a deliberate
-    interim state rather than an oversight. A run's output is a finding
-    nobody has claimed yet, and today most artifacts in a store are
-    exploratory, so hiding them now would empty every result set. WP-G1
-    flips this default at cutover, once the population is mostly results.
+    Exploratory rows are HIDDEN by default (WP-G1 cutover). A run's output
+    is a finding nobody has claimed yet, and showing every finding to every
+    agent is what made the store read as the landfill Doc II warns about.
+    The default was flipped at cutover, once the population was mostly
+    results; a caller that genuinely wants unclaimed findings passes
+    include_exploratory=True explicitly rather than leaning on the default.
     """
     if include_superseded:
         clause = ""
@@ -1118,7 +1127,7 @@ def _lifecycle_sql(*, include_superseded: bool, include_exploratory: bool) -> st
 
 def search_artifacts(
     conn: sqlite3.Connection, query: str, *, top_k: int = 5, type: str | None = None,
-    include_superseded: bool = False, include_exploratory: bool = True,
+    include_superseded: bool = False, include_exploratory: bool = False,
 ) -> list[tuple[Artifact, float]]:
     """Keyword-first, semantic fallback — so an exact term (a title, a
     column name) reliably wins, while a query with no literal overlap still
@@ -1143,6 +1152,11 @@ def search_artifacts(
     skill library on first use they were most of what any search returned.
     The same exclusion applies to the session-start signal
     (see _NOT_PRIOR_WORK), so both routes share one rule.
+
+    Lifecycle rows are filtered by default too: superseded ones (something
+    replaced them) and, since the cutover (WP-G1), exploratory ones (a
+    finding nobody has claimed is a lead, not the answer to "what do I
+    have"). `include_superseded`/`include_exploratory` return each again.
 
     A run_sql/run_python call that failed used to still get a real artifact
     row, purely so its row_id could carry the error back to the caller.

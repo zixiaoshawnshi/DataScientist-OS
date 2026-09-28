@@ -91,6 +91,13 @@ def build_producer(config: ServerConfig) -> FastMCP:
         stale on its own if you stop."""
         try:
             with db.write() as conn:
+                # The abandon sweep first (WP-G1): a question nobody has
+                # touched for DSOS_ABANDON_DAYS is finished, not in flight,
+                # and a question_id claimed against one that is already
+                # abandoned should fail as it would for any finished
+                # question. It is one indexed UPDATE, and it never touches a
+                # live claim (see spine.sweep_abandoned).
+                spine.sweep_abandoned(conn)
                 # The claim is checked BEFORE the session row is created, so
                 # a refused claim leaves nothing behind — no empty session in
                 # the GUI, and nothing for a later tool call to be logged
@@ -210,7 +217,7 @@ def build_producer(config: ServerConfig) -> FastMCP:
     @mcp.tool()
     def search_artifacts(
         query: str, session_id: str, top_k: int = 5, type: str | None = None,
-        include_superseded: bool = False, include_exploratory: bool = True,
+        include_superseded: bool = False, include_exploratory: bool = False,
     ) -> dict:
         """Search every artifact saved so far, across every past session.
 
@@ -226,13 +233,15 @@ def build_producer(config: ServerConfig) -> FastMCP:
         expired input already called into question.
 
         Statuses: "exploratory" is the output of a run that nobody has
-        claimed yet (the default, and what a fresh run of yours will be),
-        "result" is a deliberate registration, and "superseded" is a row
-        something replaced. Superseded rows are left out of this search
-        unless you pass include_superseded=True — they are still readable
-        with get_artifact, so nothing is lost, they are just not the answer
-        to "what do I have". Exploratory rows are included by default; pass
-        include_exploratory=False to search only claimed results.
+        claimed yet (what a fresh run of yours will be), "result" is a
+        deliberate registration, and "superseded" is a row something
+        replaced. Superseded rows are left out of this search unless you
+        pass include_superseded=True — they are still readable with
+        get_artifact, so nothing is lost, they are just not the answer to
+        "what do I have". Exploratory rows are left out by default too: an
+        unclaimed finding is a lead, not a result, so pass
+        include_exploratory=True to search them. This is why a run of your
+        own is invisible until you claim it with mark(status="result").
 
         Workflow skills and templates are not results and are left out
         unless you pass type="skill" or type="template" for one."""

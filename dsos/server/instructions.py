@@ -47,9 +47,14 @@ inline, and no artifact, lineage or searchable row is written. Charts: \
 output_type="chart" — styled with the dark house style by default, or \
 pick another with style= (list_templates for the built-ins and this store's \
 custom ones).
-5. Answer using the computed output, citing the row_ids you used. If a \
-check you ran in scratch mode turns out to be worth keeping, re-run it \
-with scratch=False.
+5. A run's row is exploratory until you claim it — and exploratory rows \
+are hidden from search, so nobody will find it. If the output is your \
+answer, pass status="result" on the run, or call \
+mark(row_id=..., status="result") after it; then \
+close_question(question_id, status="answered", artifact_row_id=<that row>). \
+Answer using the computed output, citing the row_ids you used. If a check \
+you ran in scratch mode turns out to be worth keeping, re-run it with \
+scratch=False.
 6. Once you know how this workstream should look, save it once: \
 save_template(kind="chart-style" | "report") with the content, or base= an \
 existing template to edit a copy of it. list_templates lists the built-ins \

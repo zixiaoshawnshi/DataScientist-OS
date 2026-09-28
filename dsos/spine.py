@@ -73,6 +73,12 @@ DEFAULT_LEASE_MINUTES = 30.0
 # next call, whatever this module did at import time.
 BOARD_ENV = "DSOS_DISABLE_BOARD"
 
+# How long a question may sit with no activity before the sweep inside
+# start_session abandons it. Read per call for the same reason the lease
+# TTL is: a test and an operator both need to change it on a live server.
+ABANDON_DAYS_ENV = "DSOS_ABANDON_DAYS"
+DEFAULT_ABANDON_DAYS = 14.0
+
 # Questions this board is willing to show. `abandoned` is the one status
 # that never appears: a question nobody finished and nobody holds is not
 # information, it is noise on the one screen an agent reads before it
@@ -227,6 +233,67 @@ def _last_activity(conn: sqlite3.Connection, question: sqlite3.Row) -> datetime 
             if called is not None:
                 stamps.append(called)
     return max(stamps) if stamps else None
+
+
+def abandon_days() -> float:
+    """The abandon window, from `DSOS_ABANDON_DAYS` on every call. Like the
+    lease TTL, an unset, unparseable or non-positive value falls back to the
+    default rather than making every question instantly abandonable."""
+    raw = os.environ.get(ABANDON_DAYS_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_ABANDON_DAYS
+    try:
+        days = float(raw)
+    except ValueError:
+        return DEFAULT_ABANDON_DAYS
+    return days if days > 0 else DEFAULT_ABANDON_DAYS
+
+
+def sweep_abandoned(conn: sqlite3.Connection) -> int:
+    """Abandon questions nobody has touched for `DSOS_ABANDON_DAYS`, and
+    return how many were swept. Runs lazily inside every `start_session`
+    (WP-G1) — there is no background job, because the daemon already wakes
+    on every session start and a timer that runs when nothing is happening
+    is a process nobody asked for.
+
+    One UPDATE, not a Python loop over the question table: this is on the
+    session-start hot path, and the `questions(status)` index (M3) keeps
+    the candidate set to the open/in-progress rows.
+
+    Activity is `max(created_at, claimed_at, the CLAIMANT's latest tool
+    call)` — not any tool call by anyone. A question claimed by an agent
+    that is still working is live even if its last action was minutes ago,
+    and a call by some *other* session must not silently renew it.
+
+    The lease is evaluated in the same statement, which is what keeps the
+    two thresholds from contradicting each other: a question whose claim is
+    still live is never swept, whatever `DSOS_ABANDON_DAYS` says. The
+    default relationship already implies this (14 days >> 30 minutes), but
+    an operator who sets the abandon window below the lease must still not
+    have in-flight work cancelled underneath the agent holding it.
+    """
+    lease_cutoff = (_now() - timedelta(minutes=lease_minutes())).isoformat()
+    abandon_cutoff = (_now() - timedelta(days=abandon_days())).isoformat()
+    cursor = conn.execute(
+        """
+        UPDATE questions
+        SET status = 'abandoned', closed_at = ?, claimed_by = NULL, claimed_at = NULL
+        WHERE status IN ('open', 'in_progress')
+          AND max(created_at,
+                  COALESCE(claimed_at, created_at),
+                  COALESCE((SELECT MAX(ts) FROM tool_calls
+                            WHERE session_id = questions.claimed_by), created_at)) < ?
+          AND (
+            claimed_by IS NULL
+            OR max(COALESCE(claimed_at, created_at),
+                   COALESCE((SELECT MAX(ts) FROM tool_calls
+                             WHERE session_id = questions.claimed_by), created_at)) <= ?
+          )
+        """,
+        (store._now(), abandon_cutoff, lease_cutoff),
+    )
+    conn.commit()
+    return cursor.rowcount
 
 
 def lease_state(conn: sqlite3.Connection, question: sqlite3.Row) -> dict:

@@ -92,6 +92,7 @@ def create_gui_router(db: Database) -> APIRouter:
         type: str | None = None,
         session_id: str | None = None,
         q: str | None = None,
+        include: str | None = None,
     ):
         """`q` calls search_artifacts directly, so gallery search and agent
         search share one index (see design doc, GUI routes).
@@ -102,22 +103,33 @@ def create_gui_router(db: Database) -> APIRouter:
         make the same gallery answer two different questions depending on
         whether you typed. The agent-facing default is the opposite call —
         a search for "what do I have" should not answer with a row a human
-        already retired (D7)."""
+        already retired (D7).
+
+        Exploratory rows are the one lifecycle state the gallery DOES hide
+        by default (WP-G1), on both paths, unless `?include=exploratory`
+        asks for them. Unclaimed findings are the landfill the cutover
+        exists to clear, and a browse of "what does this store hold" should
+        answer with results on either path."""
+        include_exploratory = include == "exploratory"
         if q:
             hits = store.search_artifacts(
-                db.conn(), q, top_k=50, type=type, include_superseded=True
+                db.conn(), q, top_k=50, type=type, include_superseded=True,
+                include_exploratory=include_exploratory,
             )
             artifacts = [a for a, _score in hits]
             if session_id:
                 artifacts = [a for a in artifacts if a.session_id == session_id]
         else:
             artifacts = store.list_artifacts(db.conn(), type=type, session_id=session_id)
+            if not include_exploratory:
+                artifacts = [a for a in artifacts if a.status != "exploratory"]
         return templates.TemplateResponse(
             request,
             "artifacts_gallery.html",
             {
                 "artifacts": artifacts, "types": ARTIFACT_TYPES,
                 "type": type or "", "session_id": session_id or "", "q": q or "",
+                "include": include or "",
             },
         )
 
