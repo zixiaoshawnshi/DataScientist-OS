@@ -86,7 +86,7 @@ The wave table below is a **schedule, not a claim that every cell is safe to par
 | 4 | C2 · D1 · E2 | **Amended — originally "C2 · D1 · E2, disjoint files".** They are not: D1 owns `dsos/gui.py` (refactoring it into `create_gui_router(db)`) and E2 owns `dsos/gui.py` + `templates/artifact_detail.html`. **D1 and E2 must be sequential, in that order** (D1 creates the router seam E2 then adds display code to). C2 is genuinely disjoint from both and runs alongside whichever is going. |
 | 5 | D2 · E3 | Disjoint (`mcp_server.py __main__` + `AGENTS.md` + `README.md` vs `spine.py` + `producer.py`). |
 | 6 | F1 | |
-| 7 | G1 · H2 · H3 | G1 owns `gui.py`; H2/H3 are `benchmark/`-only. Genuinely disjoint. |
+| 7 | G1 · H2 — **then H3** | **Amended — originally "G1 · H2 · H3, genuinely disjoint".** Only G1 was checked against the H WPs; H2 and H3 were not checked against *each other*. Both must extend the same four benchmark files (`arms.json`, `metrics.py`, `report.py`, `runner.mjs`), because both add a condition and a metric. So H2 and H3 are sequential, and the final wave is 2-wide: **G1 ∥ (H2 → H3)**, with the two H WPs as one sequential lane. |
 
 **Measured against the cutover.** WP-G1 flips the exploratory default. WP-H2 and WP-H3 therefore run *after* cutover, against a store whose `search_artifacts` hides exploratory rows and whose `questions` sweep has run. This is intentional: the parallel-arm duplicate-work measurement (H3) is only meaningful if it sees what a producer actually sees. If either arm must run earlier, record the mismatch explicitly in `benchmark/README.md` rather than presenting a pre-cutover number as a post-cutover one.
 
@@ -614,6 +614,17 @@ Whatever is chosen, the decision belongs before **WP-F1**, whose `ask` tool exis
 Found by E3, which introduced it: its first `start_session` left the `sessions` UPDATE uncommitted. The process-wide `RLock` is released when the tool returns, but the SQLite transaction on that thread's connection is **not**, so a RESERVED lock stayed on the file and every *other* thread's write then failed with `database is locked` after the busy timeout. The first tool call in the process died.
 
 This is a general hazard, not an E3 bug: `Database.write()` gives mutual exclusion, not a transaction boundary. **Every write path must `commit()` inside the block** — the store functions already do their own `commit()`, which is why most call sites are safe, but any tool that writes directly must not assume the context manager ended the transaction. Worth a line in `db.py`'s `write()` docstring, which currently implies more than it delivers.
+
+### U7 — the consumer warning embeds a raw Python dict repr
+
+Verified end-to-end on the merged branch. The warning is present and unmissable, which was the requirement — but its text appends the validation history as a Python repr:
+
+```
+this result was later CONTRADICTED — do not quote it without reading why:
+[{'id': 'bbbd1a8f1eb849d8b347f5542506f8b8', 'v...
+```
+
+For the one profile whose entire purpose is a non-technical reader deciding whether to trust a number, a dict repr is the wrong register. It should name the verdict and the basis in a sentence. **Small and cosmetic, not correctness** — recorded rather than fixed, because `consumer.py` has no owner now and it is not worth a worker round-trip on its own. Fold it into whoever next touches `consumer.py`, or into a polish pass before the demo.
 
 The FTS AND-prefix rule lives in `dsos/store.py:_fts_query`, a private function. `search_artifacts` uses it internally, and since **WP-E3** the question board uses it too, across a module boundary: `dsos/spine.py` imports `store._fts_query`.
 
