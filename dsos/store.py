@@ -616,6 +616,35 @@ def get_execution(
     }
 
 
+def failed_executions(
+    conn: sqlite3.Connection, session_id: str, limit: int = 20
+) -> list[dict]:
+    """One session's failed runs, newest first — the GUI's session-detail
+    list, and the only way to see a run that produced nothing.
+
+    A failed run has no artifact to navigate from, which is exactly why it
+    needs a listing: `get_execution` finds a run by its id or by the row it
+    produced, and a run that produced nothing has neither a row to be found
+    from nor a page to be found from. The `executions.session_id` column
+    added by WP-B3's M2 is what makes it possible at all.
+
+    This lived as a bare `conn.execute` inside the GUI route, which was
+    correct under the WP that wrote it (that WP's store.py ownership was
+    `get_execution` only) and is wrong now that the GUI is a mounted router
+    over the daemon's shared Database: SQL in a route is a connection
+    outside the store layer, and store.py is the layer the GUI already reads.
+    """
+    rows = conn.execute(
+        """
+        SELECT kind, error, ended_at FROM executions
+        WHERE session_id = ? AND status = 'error'
+        ORDER BY ended_at DESC LIMIT ?
+        """,
+        (session_id, limit),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def log_tool_call(
     conn: sqlite3.Connection, session_id: str, tool_name: str, args: dict,
     result_summary: str, artifact_row_ids: list[str],
