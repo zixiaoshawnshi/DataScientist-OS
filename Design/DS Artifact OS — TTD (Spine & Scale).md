@@ -593,6 +593,22 @@ WP-B3 needed the session-detail page to list that session's failed executions. I
 
 Whatever is chosen, the decision belongs before **WP-F1**, whose `ask` tool exists specifically to put a consumer's question where a producer will see it.
 
+### WP-E3R — Board recall (decided: option 1, OR-ranked; runs BEFORE F1)
+
+**Owns:** `dsos/spine.py` (`related_questions` and any new private helper), `tests/spine_smoke_test.py` (extend). Nothing else.
+
+**Decision: option 1.** The maintainer said "ok let's go" after the recommendation, and the alternative blocks F1's acceptance test, so it proceeds on the recommendation — as a single self-contained, revertible commit in case the stricter matcher is preferred after all.
+
+- Switch the FTS path to an **OR'd match over content terms**, ranked by how many distinct content terms a candidate shares (not bm25, which is not comparable across documents of different lengths).
+- **Strip a stopword set first.** Without it, OR over a full sentence matches nearly everything and the ranking does all the work.
+- **Keep the existing status bands** — live `in_progress`, then `open`, then `answered`. Ranking refines *within* a band and must not reorder them: a finished question with a perfect score still sorts below live work, because stopping duplicate work now is the point.
+- **Keep the exact-normalised-text backstop** and the `sqlite3.OperationalError` guard. Both do work the OR path does not.
+- **Keep `exclude_id` and the `DSOS_DISABLE_BOARD` short-circuit byte-identical** — H3's control condition depends on the two conditions differing only in whether the board returns rows.
+
+**The precision test is the one that keeps this honest:** a genuinely unrelated question (`what is the median price per carat by cut?` against a stored `is red really the q3 leader?`) must return **zero** hits. If loosening the matcher makes that flaky, the matcher is too loose.
+
+**Do not import `store._fts_query` for this** — the OR path needs a different query shape anyway, and `_fts_query` is U4. Do not touch the lease functions.
+
 ### U6 — `with db.write()` serialises writers but does not COMMIT them
 
 Found by E3, which introduced it: its first `start_session` left the `sessions` UPDATE uncommitted. The process-wide `RLock` is released when the tool returns, but the SQLite transaction on that thread's connection is **not**, so a RESERVED lock stayed on the file and every *other* thread's write then failed with `database is locked` after the busy timeout. The first tool call in the process died.
