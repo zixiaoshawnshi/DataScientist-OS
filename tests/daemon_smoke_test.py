@@ -92,6 +92,7 @@ FAILURES: list[str] = []
 EXPECTED_PRODUCER_TOOLS = {
     "start_session", "search_artifacts", "get_artifact", "save_artifact",
     "run_sql", "run_python", "get_lineage", "mark", "list_templates", "save_template",
+    "close_question", "record_decision",
 }
 
 CLIENTS = 2
@@ -234,7 +235,7 @@ async def mcp_scenario() -> list[dict]:
         tools = await producer.list_tools()
     names = sorted(t.name for t in tools)
     check(
-        "an authenticated HTTP client lists the 10 producer tools at /mcp/producer",
+        "an authenticated HTTP client lists the 12 producer tools at /mcp/producer",
         set(names) == EXPECTED_PRODUCER_TOOLS,
         f"{len(names)} tools: {', '.join(names)}",
     )

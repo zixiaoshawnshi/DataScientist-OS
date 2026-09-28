@@ -4,7 +4,8 @@ with a connection in it (WP-C1).
 Before this WP, `dsos/mcp_server.py` was the whole of layer 2: it built a
 `FastMCP`, opened a store connection at import time against whatever
 `DSOS_DB_PATH` happened to say, and registered nine tools that all closed
-over that one connection (ten since WP-E2 added `mark`). Two consequences,
+over that one connection (ten since WP-E2 added `mark`, twelve since WP-E3
+added close_question and record_decision). Two consequences,
 both of which the next three WPs
 (D1's daemon, F1's consumer, E2's lifecycle) had to build on:
 
@@ -180,8 +181,8 @@ async def _two_producers_two_stores() -> list[str]:
         producer_b = build_producer(config_b)
 
         tools_a = await producer_a.list_tools()
-        if len(tools_a) != 10:
-            problems.append(f"producer A exposes {len(tools_a)} tools, not 10")
+        if len(tools_a) != 12:
+            problems.append(f"producer A exposes {len(tools_a)} tools, not 12")
         # Zero tools until WP-F1 adds the four; asserted here because a
         # consumer that accidentally inherited the producer's registrations
         # would be invisible in every other test.

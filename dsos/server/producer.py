@@ -1,4 +1,4 @@
-"""The producer profile: the ten tools an analysis agent calls.
+"""The producer profile: the twelve tools an analysis agent calls.
 
 `build_producer(config)` is a factory, not a module. Every tool is a closure
 over one `ServerConfig`, so two producers over two stores can exist in one
@@ -9,9 +9,9 @@ store: reads go through `config.db.conn()`, writes take
 passed in.
 
 The tool bodies are unchanged from `dsos/mcp_server.py`, which is the point
-of this WP: same names, same parameters, same responses — the docstrings are
-most of the product, since an agent decides what to call from them, and they
-carry the new lifecycle parameters.
+of that WP: same names, same parameters, same responses — the docstrings
+are most of the product, since an agent decides what to call from them,
+and they carry the lifecycle parameters and the spine's question tools.
 
 Docstring convention (WP-C2's follow-up, adopted here): every tool's
 docstring opens with ONE unwrapped summary line — a complete sentence on a
@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from fastmcp import FastMCP
 
-from dsos import execution, ingest, present, store, templating
+from dsos import execution, ingest, present, spine, store, templating
 from dsos.server.common import (
     PRODUCER_NAME,
     ServerConfig,
@@ -56,7 +56,7 @@ def build_producer(config: ServerConfig) -> FastMCP:
         return present.artifact_payload(db.conn(), art)
 
     @mcp.tool()
-    def start_session(question: str) -> dict:
+    def start_session(question: str, question_id: str | None = None) -> dict:
         """Start a new round of work, and learn what this store already holds.
 
         Call this once, first, for every new top-level question — before
@@ -69,15 +69,143 @@ def build_producer(config: ServerConfig) -> FastMCP:
         candidate fits, run_sql/run_python against its row_id instead of
         downloading and cleaning the same data again — that is the whole
         point of the store, and an agent that never looks will redo work
-        that is already done."""
-        with db.write() as conn:
-            session_id = store.start_session(conn, question)
-        # The search is deliberately outside the write lock: it embeds and
-        # ranks, which is slow, and the lock exists to order writers.
+        that is already done.
+
+        `related_questions` is the coordination board: the OTHER questions in
+        this store that match what you asked — someone's work in flight (with
+        a live lease, so you can see it is actually being touched), questions
+        asked and waiting, and questions already answered, each with the row
+        that answered it. Read it as a duplicate-work warning: an in_progress
+        entry with a live lease means somebody is on this right now, so use
+        their row or pick a different question rather than repeating the work.
+        An answered entry with an artifact_row_id is the best outcome — that
+        answer already exists, so reuse it instead of computing it again.
+
+        Pass `question_id` (one this store reported, e.g. from a consumer's
+        ask, or from related_questions) to CLAIM that question instead of
+        starting a new one — you are working on existing work rather than
+        opening a new line. The claim fails if another session currently
+        holds it, with its last activity time, so you can either go and use
+        the related work or wait for the lease to lapse. A claim needs no
+        maintenance: it stays live while you keep calling tools, and goes
+        stale on its own if you stop."""
+        try:
+            with db.write() as conn:
+                # The claim is checked BEFORE the session row is created, so
+                # a refused claim leaves nothing behind — no empty session in
+                # the GUI, and nothing for a later tool call to be logged
+                # against. claim_question re-checks it, which is the
+                # invariant every caller gets for free; the second
+                # evaluation costs nothing because the write lock is held.
+                if question_id is not None:
+                    spine.check_claimable(conn, question_id)
+                session_id = store.start_session(conn, question)
+                if question_id is None:
+                    # A question nobody else has asked: the session both
+                    # asked it and holds the claim, so the board immediately
+                    # says who is on it.
+                    question_id = spine.create_question(
+                        conn, question=question, status="in_progress",
+                        asked_by=session_id, claimed_by=session_id,
+                    )
+                else:
+                    spine.claim_question(conn, question_id, session_id=session_id)
+                conn.execute(
+                    "UPDATE sessions SET question_id = ? WHERE id = ?",
+                    (question_id, session_id),
+                )
+                # Committed here rather than left to the caller: the write
+                # lock is a process-wide Python lock, but the SQLite
+                # transaction on this thread's connection is not released
+                # when the tool returns it to the pool. An uncommitted write
+                # here would keep a RESERVED lock on the file and lock out
+                # every OTHER thread's write.
+                conn.commit()
+        except ValueError as exc:
+            return {"error": str(exc), "artifact_row_ids": []}
+        # Both reads are deliberately outside the write lock: they rank and
+        # walk the question table, and the lock exists to order writers.
         return {
             "session_id": session_id,
+            "question_id": question_id,
             **store.prior_work_signal(db.conn(), question),
+            "related_questions": spine.related_questions(
+                db.conn(), question, exclude_id=question_id
+            ),
         }
+
+    @mcp.tool()
+    def close_question(
+        session_id: str, question_id: str, status: str,
+        artifact_row_id: str | None = None, note: str | None = None,
+    ) -> dict:
+        """Close the question you have been working on, and say what answered it.
+
+        status is "answered" or "abandoned". "answered" REQUIRES
+        artifact_row_id: the result row that answers the question, which the
+        board then hands to every later session that asks the same thing. An
+        exploratory row is refused — a question closed against a finding
+        nobody claimed is a claim nobody made, and the board would repeat it
+        to everyone. Claim the row first with mark(row_id=..., status="result")
+        if it really is the answer. "abandoned" is for work you are stopping
+        without an answer, and releases the question for someone else to
+        claim.
+
+        Closing clears the claim and records the time, so the question stops
+        reading as in-flight. You do not have to hold the claim to close it:
+        a finished question is a fact about the store, not a permission.
+
+        `note` is returned in the response and recorded in your tool-call
+        trace; it is not stored on the question, so put anything that must
+        outlive this round into the answer row itself.
+        """
+        try:
+            with db.write() as conn:
+                result = spine.close_question(
+                    conn, session_id=session_id, question_id=question_id, status=status,
+                    artifact_row_id=artifact_row_id, note=note,
+                )
+        except ValueError as exc:
+            return {"error": str(exc), "artifact_row_ids": []}
+        return {**result, "artifact_row_ids": [result["artifact_row_id"]] if result.get(
+            "artifact_row_id") else []}
+
+    @mcp.tool()
+    def record_decision(
+        session_id: str, decision: str, rationale: str, evidence_row_ids: list[str],
+        revisit_if: str | None = None, question_id: str | None = None,
+    ) -> dict:
+        """Record a call you made and why, linked to the evidence it rests on.
+
+        Use this when you decided something — a method, a definition, a
+        reading, a threshold — that a later question would otherwise redo or
+        silently contradict. A decision is saved as an artifact, so search
+        finds it and get_lineage answers "what was this based on":
+        evidence_row_ids becomes its lineage.
+
+        evidence_row_ids is REQUIRED and every row in it must exist. A
+        decision is the one artifact whose whole value is that something
+        else backs it, so a decision with no evidence is refused rather than
+        stored.
+
+        rationale is the reason, in a sentence or two — what the call rests
+        on, not a restatement of the call. revisit_if is the condition that
+        would reopen it ("if the season table is refetched with q4 in it");
+        leave it out if nothing would.
+
+        Pass question_id to also close that question as answered by this
+        decision — the decision is written first, so the question can never
+        point at a row that does not exist.
+        """
+        try:
+            with db.write() as conn:
+                return spine.record_decision(
+                    conn, session_id=session_id, decision=decision, rationale=rationale,
+                    evidence_row_ids=evidence_row_ids, revisit_if=revisit_if,
+                    question_id=question_id,
+                )
+        except ValueError as exc:
+            return {"error": str(exc), "artifact_row_ids": []}
 
     @mcp.tool()
     def search_artifacts(
