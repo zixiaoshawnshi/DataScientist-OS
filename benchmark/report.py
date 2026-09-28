@@ -31,7 +31,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 RESULTS = HERE / "results"
 sys.path.insert(0, str(HERE))
 from metrics import (MANIFEST_NAME, REMOTE_FETCH_RE, arm_of, arm_spec,  # noqa: E402
-                     is_file_arm, load_arms, manifest_metrics, uses_manifest)
+                     claims_metrics, exploratory_noise_metrics, is_file_arm,
+                     load_arms, manifest_metrics, uses_manifest)
 
 
 def discover_conditions():
@@ -47,7 +48,8 @@ def discover_conditions():
     return sorted(found, key=lambda c: (arm_spec(c).get("order", 99), c))
 
 
-FINDABILITY_TOOLS = {"search_artifacts", "list_skills", "list_templates",
+# `list_skills` is gone from the product (WP-B2); `list_templates` remains.
+FINDABILITY_TOOLS = {"search_artifacts", "list_templates",
                      "find", "ls", "grep", "tree"}
 FINDABILITY_PATTERNS = ("ls", "dir", "grep", "rg", "find", "glob", "tree")
 # A path that names a file rather than a directory, so directory navigation
@@ -324,12 +326,56 @@ def write_report_md(report, conditions):
               "## Models", ""]
     for cond in conditions:
         lines.append(f"- `{cond}`: {', '.join(report['models'][cond]) or '(not recorded)'}")
+    if report.get("consumer"):
+        lines += ["", "## Consumer arm (claims)", "",
+                  "| arm | claims | verdicts correct | cited the right row | "
+                  "bad backing (target 0) | refuted by a repudiated row | tokens |",
+                  "|---|---|---|---|---|---|---|"]
+        for cond, m in report["consumer"].items():
+            toks = (m.get("tokens_in") or 0) + (m.get("tokens_out") or 0)
+            lines.append(
+                f"| {cond} | {m['claims']} | {m['verdict_correct']} | "
+                f"{m['cited_support']} | {m['bad_backing']} | "
+                f"{m['refuted_by_bad_row']} | {toks:,} |")
+        lines += ["", "`bad backing` counts a claim marked *supported* with a "
+                      "superseded, contradicted or stale row — the number the "
+                      "consumer arm is built to drive to zero. `refuted by a "
+                      "repudiated row` is the healthy case: the agent named the "
+                      "bad row as the reason to reject the claim. The files ceiling "
+                      "has no rows to cite, so both are `none` by construction."]
+    if report.get("exploratory_noise"):
+        noise = report["exploratory_noise"]["store"]
+        lines += ["", "## Exploratory noise", "",
+                  f"Store-wide: {noise['exploratory']} of {noise['artifacts']} "
+                  f"artifacts are exploratory "
+                  f"({'n/a' if noise['exploratory_fraction'] is None else format(noise['exploratory_fraction'], '.1%')}).",
+                  "",
+                  "| session | artifacts | exploratory | fraction | searches | "
+                  "searches returning exploratory | searches only exploratory |",
+                  "|---|---|---|---|---|---|---|"]
+        for sid, s in report["exploratory_noise"]["sessions"].items():
+            frac = s.get("exploratory_fraction")
+            lines.append(
+                f"| {sid[:12]} | {s.get('artifacts', 0)} | {s.get('exploratory', 0)} | "
+                f"{'n/a' if frac is None else format(frac, '.1%')} | {s.get('searches', 0)} | "
+                f"{s.get('searches_returning_exploratory', 0)} | "
+                f"{s.get('searches_only_exploratory', 0)} |")
+        lines += ["", "`searches only exploratory` are calls whose every hit was "
+                      "exploratory — these return nothing once WP-G1 hides the "
+                      "default. A near-zero exploratory fraction is a finding about "
+                      "the design, not a failed measurement."]
     lines.append("")
     (RESULTS / "report.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def main():
-    conditions = discover_conditions()
+    discovered = discover_conditions()
+    # The claims arms answer a claims fixture, not the chain tables, so they are
+    # scored on their own axis (verdicts, citations) and kept out of the
+    # chain-derived three-way table — putting a verdict count next to an
+    # accuracy would be comparing two different tasks.
+    claims_arms = [c for c in discovered if arm_spec(c).get("mode") == "claims"]
+    conditions = [c for c in discovered if c not in claims_arms]
     answers = {c: rounds_of(load_json(RESULTS / f"answers_{c}.json")) for c in conditions}
     # score.py keys conditions by the answers filename stem: "answers_file"/"answers_dsos".
     raw_scores = load_json(RESULTS / "scores.json")
@@ -431,6 +477,20 @@ def main():
 
     report["three_way"] = build_three_way(answers, scores, report, conditions)
 
+    # The consumer arm: did the PM tell a backed claim from a refuted one, and
+    # did it cite a row the store has since repudiated?
+    report["consumer"] = {}
+    for cond in claims_arms:
+        p = RESULTS / f"answers_{cond}.json"
+        if p.exists() and (RESULTS / "claims.json").exists():
+            report["consumer"][cond] = claims_metrics(cond, RESULTS)
+
+    # Exploratory noise: how much of the dsos store is a finding nobody claimed,
+    # and would hiding it change what a search returns.
+    report["exploratory_noise"] = (
+        exploratory_noise_metrics(HERE / "store.db") if (HERE / "store.db").exists()
+        else {})
+
     (RESULTS / "report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n",
                                          encoding="utf-8")
 
@@ -491,6 +551,24 @@ def main():
     print("\n== models seen per arm ==")
     for cond in conditions:
         print(f"  {cond:16s} {report['models'][cond] or '(not recorded — run predates model capture)'}")
+    if report.get("consumer"):
+        print("\n== Consumer arm (claims) ==")
+        print(f"{'arm':16s} {'claims':>6s} {'correct':>8s} {'cited':>6s} {'bad backing':>12s} {'tokens':>8s}")
+        for cond, m in report["consumer"].items():
+            toks = (m.get("tokens_in") or 0) + (m.get("tokens_out") or 0)
+            print(f"{cond:16s} {m['claims']:>6d} {m['verdict_correct']:>8d} "
+                  f"{m['cited_support']:>6d} {m['bad_backing']:>10d} {toks:>8,d}")
+    if report.get("exploratory_noise"):
+        noise = report["exploratory_noise"]["store"]
+        frac = noise["exploratory_fraction"]
+        print("\n== Exploratory noise ==")
+        print(f"  {noise['exploratory']} of {noise['artifacts']} artifacts exploratory "
+              f"({'n/a' if frac is None else format(frac, '.1%')})")
+        for sid, s in report["exploratory_noise"]["sessions"].items():
+            if s.get("searches"):
+                print(f"  {sid[:12]}  searches={s['searches']} "
+                      f"returning-exploratory={s['searches_returning_exploratory']} "
+                      f"only-exploratory={s['searches_only_exploratory']}")
     write_report_md(report, conditions)
     print("\nWrote results/report.json and results/report.md")
 

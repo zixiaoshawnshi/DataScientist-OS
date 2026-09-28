@@ -6,6 +6,11 @@ store.db
 store.db-shm
 store.db-wal
 blobs/
+# The consumer arm's store lives in its own dir so its daemon does not collide
+# with the chain store's; daemon.json/token are written there by dsos.daemon.
+consumer/
+daemon.json
+daemon.token
 
 # Recorded runs, transcripts, scores — everything except the example template
 results/*

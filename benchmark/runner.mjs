@@ -84,6 +84,8 @@ function parseArgs(argv) {
     else if (a === "--keep-raw") out.keepRaw = true;
     else if (a === "--no-file-tools") out.noFileTools = true;
     else if (a === "--manifest") out.manifest = argv[++i];
+    else if (a === "--claims") out.claims = argv[++i];
+    else if (a === "--store") out.store = argv[++i];
     else if (a === "--label") out.label = argv[++i];
     else if (a === "--model") out.model = argv[++i];
     else if (a === "--timeout-min") out.timeoutMs = Number(argv[++i]) * 60 * 1000;
@@ -448,6 +450,119 @@ function dsosToolExtension(client) {
   };
 }
 
+// The claims fixture (build_claims.py): a list of statements a PM agent has
+// to back or refute, each with the gold verdict and the rows a correct answer
+// may cite or must never cite. Read by both claims arms; the shape is one
+// entry per claim, so the two arms adjudicate exactly the same list.
+function loadClaims(path) {
+  return JSON.parse(readFileSync(path, "utf8"));
+}
+
+// The consumer arm's whole prompt. The PM has no data access, so the only
+// route is the consumer tools; the output contract is fixed so metrics.py can
+// parse a verdict per claim without guessing which message held the answer.
+function claimsPrompt(claims, { store, files }) {
+  const access = store
+    ? "You have a read-only evidence store for past analysis results. Use " +
+      "find_evidence to locate results about a claim, then get_claim or cite on " +
+      "the row you rely on. You cannot compute anything — you have no data."
+    : ("You have the raw data files for these analyses in your working directory " +
+       "(see MANIFEST.md), and file tools. You have no evidence store and no " +
+       "record of which results were later corrected.");
+  const route = store
+    ? "Back each claim with the row_id of the store row that supports or refutes it."
+    : "You cannot cite store rows; use the word none where a row_id is asked for.";
+  const lines = claims.map(
+    (c) => `${c.id}. ${c.claim}`).join("\n");
+  return [
+    "You are a PM reviewing claims a colleague wrote about past analysis results.",
+    access,
+    "",
+    "For each numbered claim decide whether the evidence backs it (supported) or",
+    "refutes it (refuted). " + route,
+    "",
+    "A claim that rests on a result later superseded, contradicted or gone stale is",
+    "refuted — do not back it with that row.",
+    "",
+    "End your reply with exactly one line per claim, in this format, and nothing",
+    "after them:",
+    "@claim[<id>:supported:<row_id>]",
+    "@claim[<id>:refuted:<row_id>]",
+    "<row_id> is the full row id you relied on, or none if you found no row.",
+    "",
+    "Claims:",
+    lines,
+  ].join("\n");
+}
+
+// One claims run for one arm. The store arm speaks MCP to /mcp/consumer; the
+// files ceiling gets built-in tools over the prepared workspace. Both record
+// the same answer shape the chain arms do, under a synthetic `claims::R1` key,
+// so report.py reads them without a second code path.
+async function runClaims(args, ARM, LABEL) {
+  const fixture = loadClaims(args.claims ?? join(HERE, "results", "claims.json"));
+  const storePath = args.store ?? join(HERE, "consumer", "store.db");
+  const usesStore = ARM.tools === "consumer";
+  const workspace = usesStore
+    ? join(tmpdir(), "dsos-bench", LABEL, "claims")
+    : join(HERE, "results", "consumer_workspace");
+  mkdirSync(workspace, { recursive: true });
+  const prompt = claimsPrompt(fixture.claims, { store: usesStore, files: !usesStore });
+  console.log(`\n=== claims::R1 [${args.condition}] prompt ${prompt.length} chars (store=${usesStore}) ===`);
+
+  let client = null, loader = null, extraTools = [];
+  if (usesStore) {
+    const logDir = join(HERE, "results", "transcripts", "consumer_server");
+    mkdirSync(logDir, { recursive: true });
+    client = new StdioMcpClient({
+      command: VENV_PY,
+      args: ["-m", "dsos.mcp_server", "--profile", "consumer"],
+      env: { DSOS_DB_PATH: storePath, DSOS_PYTHON_PATH: VENV_PY },
+      stderrPath: join(logDir, "claims_R1.stderr.log"),
+    });
+    await client.start();
+    extraTools = client.tools.map((t) => t.name);
+    console.log(`consumer server up: ${extraTools.length} tools registered`);
+    loader = new DefaultResourceLoader({
+      cwd: workspace, agentDir: getAgentDir(),
+      extensionFactories: [dsosToolExtension(client)],
+    });
+    await loader.reload();
+  }
+
+  const tools = [...(usesStore ? [] : BUILTIN_TOOLS), ...extraTools];
+  const sessionOpts = {
+    cwd: workspace, tools, sessionManager: SessionManager.inMemory(workspace),
+    ...(loader ? { resourceLoader: loader } : {}),
+  };
+  if (args.model) sessionOpts.model = args.model;
+  const { session } = await createAgentSession(sessionOpts);
+
+  const t0 = Date.now();
+  let aborted = false;
+  const timer = setTimeout(() => { aborted = true; session.abort(); }, args.timeoutMs ?? ROUND_TIMEOUT_MS);
+  try { await session.prompt(prompt); }
+  catch (e) { console.error(`  prompt error: ${e.message}`); }
+  finally { clearTimeout(timer); }
+
+  const messages = session.messages ?? [];
+  const usage = sumUsage(messages);
+  const answer = lastAssistantText(messages);
+  const dur = Math.round((Date.now() - t0) / 1000);
+  const usedModel = session.model?.id ?? session.model ?? null;
+  session.dispose();
+  client?.stop();
+
+  mergeAnswers(LABEL, "claims::R1", {
+    answer_text: answer, answer_text_tagged: lastTaggedText(messages),
+    tokens_in: usage.input, tokens_out: usage.output, duration_s: dur,
+    tool_calls: usage.toolCalls, cost_usd: usage.cost, aborted, model: usedModel,
+    claims_file: args.claims ?? null,
+  });
+  console.log(`  ${dur}s  in=${usage.input} out=${usage.output} tools=${usage.toolCalls}`);
+  console.log(`  answer: ${answer.slice(0, 300).replace(/\n/g, " ")}`);
+}
+
 // -------------------------------------------------------------------- main
 
 const args = parseArgs(process.argv.slice(2));
@@ -457,15 +572,24 @@ const MANIFEST = args.manifest ?? join(HERE, "manifest.json");
 // --label additionally keeps a manifest (e.g. the depth chains) from clobbering
 // another experiment's answers_*.json.
 const LABEL = args.label ?? (args.keepRaw ? `${args.condition}_keepraw` : args.condition);
+
+const { createAgentSession, SessionManager, DefaultResourceLoader, getAgentDir } =
+  await import(SDK_URL);
+
+// The claims arms are one run against one fixture, not a table x rounds loop,
+// and they take neither the breadth manifest nor the chain rounds.
+if (ARM.mode === "claims") {
+  await runClaims(args, ARM, LABEL);
+  console.log("\nbatch done");
+  process.exit(0);
+}
+
 const manifest = loadManifest(MANIFEST);
 const tables = manifest.tables.filter((t) => args.allTables || args.tables.includes(t.file_name));
 if (!tables.length) { console.error("no matching tables in manifest"); process.exit(2); }
 if (args.resetStore && existsSync(BENCH_STORE)) {
   rmSync(BENCH_STORE); console.log(`reset ${BENCH_STORE}`);
 }
-
-const { createAgentSession, SessionManager, DefaultResourceLoader, getAgentDir } =
-  await import(SDK_URL);
 
 console.log(`condition=${args.condition}${args.hideRaw ? " (raw removed after R1: store is the only path)" : ""} label=${LABEL} tables=${tables.map((t) => t.file_name).join(", ")} rounds=${args.rounds.join(",")} model=${args.model ?? "default"}`);
 

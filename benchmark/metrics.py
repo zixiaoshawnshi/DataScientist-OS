@@ -44,7 +44,11 @@ import re
 import sqlite3
 import sys
 
-FINDABILITY_TOOLS = {"search_artifacts", "list_skills", "list_templates"}
+# Tools that count as locating prior work. `list_skills` used to sit here but
+# the tool is gone from the product (WP-B2); a removed tool can never appear in
+# a transcript, so keeping it was dead weight that misled the findability
+# numbers. `list_templates` came back (maintainer decision U1) and stays.
+FINDABILITY_TOOLS = {"search_artifacts", "list_templates"}
 FINDABILITY_PATTERNS = ("ls", "dir", "grep", "rg", "find", "glob", "tree")
 # A pull from the network, not a reuse. Several chain tables have public
 # copies, so a file-less arm can bypass its own workspace entirely; the
@@ -343,6 +347,152 @@ def file_metrics(transcript_path: pathlib.Path, manifest_path: pathlib.Path) -> 
     if not touched_raw and len(events) > 0:
         stats["unknown_table"] = "(no raw table touched in this run)"
     return stats
+
+
+# --------------------------------------------------------- consumer claims
+
+# The consumer arm's output contract: one line per claim, `@claim[id:verdict:row]`.
+# A row is a 32-char hex id (or `none`). Parsed here rather than by score.py
+# because this is a verdict, not a numeric answer, and the gold is the fixture.
+CLAIM_RE = re.compile(
+    r"@claim\[\s*(\d+)\s*:\s*(supported|refuted)\s*:\s*([0-9a-fA-F]{6,}|none)\s*\]",
+    re.IGNORECASE,
+)
+
+
+def claims_metrics(label: str, results: pathlib.Path | None = None,
+                   claims_path: pathlib.Path | None = None) -> dict:
+    """Score the consumer arm: did the PM back or refute each claim, and with
+    which row?
+
+    Three numbers, each answering a different question the spec asks:
+      - verdict_correct: could the agent tell a backed claim from a refuted one?
+      - cited_support:   did it cite the row that supports or refutes the claim?
+      - bad_backing:     did it *support* a claim with a superseded, contradicted
+                         or stale row — a citation used as evidence for a claim
+                         that the row does not actually back. Target 0.
+
+    A claim that is refuted *by* a repudiated row is the healthy case, not the
+    error: "row X is contradicted, so I do not back this" cites X on purpose.
+    So the target-0 count is restricted to citations used as support; the count
+    of refutations that name a repudiated row is reported separately, because
+    it is evidence the agent did the discrimination the arm exists to test.
+    A definition chosen after seeing the numbers is not a measurement, so this
+    is fixed here, before the run.
+
+    The gold verdict and the rows live in the fixture (results/claims.json),
+    built by build_claims.py. A citation is matched against the full row_id, so
+    an agent that copies 8 characters instead of the whole id scores as
+    unresolved rather than as correct-by-accident.
+    """
+    root = results or RESULTS
+    fixture = json.loads((claims_path or root / "claims.json").read_text(encoding="utf-8"))
+    answers = json.loads((root / f"answers_{label}.json").read_text(encoding="utf-8"))
+    rec = answers.get("claims::R1", {})
+    text = rec.get("answer_text_tagged") or rec.get("answer_text") or ""
+    parsed = {int(m.group(1)): (m.group(2).lower(), m.group(3).lower())
+              for m in CLAIM_RE.finditer(text)}
+
+    verdict_correct = cited_support = bad_backing = refuted_by_bad = unresolved = 0
+    per_claim = []
+    for claim in fixture["claims"]:
+        cid = claim["id"]
+        got = parsed.get(cid)
+        support = (claim.get("support_row_id") or "").lower()
+        forbidden = {r.lower() for r in (claim.get("forbidden_row_ids") or [])}
+        if got is None:
+            unresolved += 1
+            per_claim.append({"id": cid, "verdict": None, "cited": None,
+                              "correct": False, "bad_backing": False})
+            continue
+        verdict, cited = got
+        verdict_correct += verdict == claim["verdict"]
+        cited_support += bool(support) and cited == support
+        bad = cited != "none" and cited in forbidden and verdict == "supported"
+        refuted_with_bad = cited != "none" and cited in forbidden and verdict == "refuted"
+        bad_backing += bad
+        refuted_by_bad += refuted_with_bad
+        per_claim.append({"id": cid, "verdict": verdict, "cited": cited,
+                          "correct": verdict == claim["verdict"],
+                          "bad_backing": bad,
+                          "refuted_by_bad_row": refuted_with_bad})
+    return {
+        "claims": len(fixture["claims"]),
+        "verdict_correct": verdict_correct,
+        "cited_support": cited_support,
+        "bad_backing": bad_backing,
+        "refuted_by_bad_row": refuted_by_bad,
+        "unresolved": unresolved,
+        "correct_fraction": (verdict_correct / len(fixture["claims"]))
+        if fixture["claims"] else None,
+        "tokens_in": rec.get("tokens_in"),
+        "tokens_out": rec.get("tokens_out"),
+        "tool_calls": rec.get("tool_calls"),
+        "model": rec.get("model"),
+        "per_claim": per_claim,
+    }
+
+
+# ---------------------------------------------------- exploratory noise
+
+def exploratory_noise_metrics(db_path: pathlib.Path) -> dict:
+    """How much of the store is exploratory, and would hiding it change what an
+    agent sees?
+
+    Doc II open question 1: does `status='exploratory'` survive contact with an
+    agent, or does everything get marked `result` because that is the path of
+    least resistance? This turns the assumption WP-G1's default flip rests on
+    into a number. It is a finding about the design either way — a near-zero
+    fraction is not a failed measurement.
+
+    The store records each search_artifacts call's hits (`artifact_row_ids`),
+    so the post-flip question is answerable without re-running the queries:
+      - searches_returning_exploratory: a call whose hits included any
+        exploratory row — the searches whose result set the flip shrinks.
+      - searches_only_exploratory: a call whose every hit was exploratory —
+        these return nothing at all once the default hides them.
+    """
+    total = _rows(db_path, "SELECT COUNT(*) FROM artifacts")[0][0]
+    exploratory = _rows(db_path,
+                        "SELECT COUNT(*) FROM artifacts WHERE status = 'exploratory'")[0][0]
+    status_by_row = {r[0]: r[1] for r in
+                     _rows(db_path, "SELECT row_id, status FROM artifacts")}
+    sessions: dict[str, dict] = {}
+    for sid, created in _rows(db_path, """
+            SELECT session_id, COUNT(*) FROM artifacts GROUP BY session_id"""):
+        sessions[sid] = {"artifacts": created, "exploratory": 0,
+                         "searches": 0, "searches_returning_exploratory": 0,
+                         "searches_only_exploratory": 0}
+    for sid, cnt in _rows(db_path, """
+            SELECT session_id, COUNT(*) FROM artifacts
+            WHERE status = 'exploratory' GROUP BY session_id"""):
+        sessions.setdefault(sid, {}).setdefault("artifacts", 0)
+        sessions[sid]["exploratory"] = cnt
+    for sid, row_ids_json in _rows(db_path, """
+            SELECT session_id, artifact_row_ids FROM tool_calls
+            WHERE tool_name LIKE '%search_artifacts%'"""):
+        s = sessions.setdefault(sid, {"artifacts": 0, "exploratory": 0,
+                                      "searches": 0,
+                                      "searches_returning_exploratory": 0,
+                                      "searches_only_exploratory": 0})
+        hits = json.loads(row_ids_json or "[]")
+        s["searches"] += 1
+        flags = [status_by_row.get(r) for r in hits]
+        if any(f == "exploratory" for f in flags):
+            s["searches_returning_exploratory"] += 1
+        if hits and all(f == "exploratory" for f in flags):
+            s["searches_only_exploratory"] += 1
+    for s in sessions.values():
+        n = s.get("artifacts") or 0
+        s["exploratory_fraction"] = (s.get("exploratory", 0) / n) if n else None
+    return {
+        "store": {
+            "artifacts": total,
+            "exploratory": exploratory,
+            "exploratory_fraction": (exploratory / total) if total else None,
+        },
+        "sessions": sessions,
+    }
 
 
 def main() -> None:

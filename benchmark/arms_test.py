@@ -35,10 +35,12 @@ def check(label, ok, detail=""):
         FAILURES.append(label)
 
 
-ARMS = ("file", "file_manifest", "dsos")
+ARMS = ("file", "file_manifest", "dsos", "consumer", "consumer_files")
 # The run labels the three-way fixture writes results under: an experiment
 # name in front, the arm behind it.
 FIXTURE_LABELS = ("chain_file", "chain_file_manifest", "chain_dsos")
+# The claims arms answer the fixture, not the chain tables.
+CLAIMS_ARMS = ("consumer", "consumer_files")
 
 
 # ------------------------------------------------------- 1. the arm registry
@@ -58,6 +60,29 @@ def test_registry():
           arms["file"].get("raw_csv_policy") == "keep")
     check("only file_manifest is scored from a manifest",
           [a for a, s in arms.items() if s.get("manifest")] == ["file_manifest"])
+    check("the two claims arms carry mode=claims",
+          [a for a, s in arms.items() if s.get("mode") == "claims"] == list(CLAIMS_ARMS),
+          f"got {[a for a, s in arms.items() if s.get('mode') == 'claims']}")
+    check("the consumer arm is store-only (consumer tools)",
+          arms["consumer"].get("tools") == "consumer")
+    check("the files ceiling gets builtin tools, not consumer tools",
+          arms["consumer_files"].get("tools") == "builtin")
+    check("the claims arms sit after the chain arms in the table order",
+          arms["consumer"].get("order", 0) > arms["dsos"].get("order", 0)
+          and arms["consumer_files"].get("order", 0) > arms["consumer"].get("order", 0))
+
+
+def test_findability_tools():
+    print("== FINDABILITY_TOOLS (U2) ==")
+    # list_skills is gone from the product; counting it is dead weight that would
+    # mislead anyone reading the findability numbers. list_templates came back.
+    check("metrics no longer counts the removed list_skills tool",
+          "list_skills" not in metrics.FINDABILITY_TOOLS,
+          f"got {sorted(metrics.FINDABILITY_TOOLS)}")
+    check("metrics still counts list_templates", "list_templates" in metrics.FINDABILITY_TOOLS)
+    check("report no longer counts list_skills",
+          "list_skills" not in report.FINDABILITY_TOOLS,
+          f"got {sorted(report.FINDABILITY_TOOLS)}")
 
 
 def test_arm_of():
@@ -67,7 +92,9 @@ def test_arm_of():
                         ("chain_file", "file"),
                         ("chain_dsos", "dsos"),
                         ("chain_file_manifest", "file_manifest"),
-                        ("file_keepraw", "file")]:
+                        ("file_keepraw", "file"),
+                        ("claims_consumer", "consumer"),
+                        ("claims_consumer_files", "consumer_files")]:
         check(f"arm_of({label!r}) == {want!r}", metrics.arm_of(label) == want,
               f"got {metrics.arm_of(label)!r}")
     check("an unknown label resolves to no arm", metrics.arm_of("nonsense") is None)
@@ -198,13 +225,13 @@ def _make_fixture(root):
     con = sqlite3.connect(root / "store.db")
     con.executescript("""
         CREATE TABLE sessions (id TEXT PRIMARY KEY, question TEXT, started_at TEXT);
-        CREATE TABLE artifacts (row_id TEXT PRIMARY KEY, session_id TEXT, type TEXT, title TEXT);
+        CREATE TABLE artifacts (row_id TEXT PRIMARY KEY, session_id TEXT, type TEXT, title TEXT, status TEXT);
         CREATE TABLE tool_calls (session_id TEXT, tool_name TEXT, artifact_row_ids TEXT);
     """)
     con.execute("INSERT INTO sessions VALUES ('s1','q1','2026-01-01')")
     con.execute("INSERT INTO sessions VALUES ('s2','q2','2026-01-02')")
-    con.execute("INSERT INTO artifacts VALUES ('a1','s1','transform','clean')")
-    con.execute("INSERT INTO artifacts VALUES ('a2','s2','dataset','d.csv')")
+    con.execute("INSERT INTO artifacts VALUES ('a1','s1','transform','clean','result')")
+    con.execute("INSERT INTO artifacts VALUES ('a2','s2','dataset','d.csv','exploratory')")
     con.execute("INSERT INTO tool_calls VALUES ('s2','search_artifacts','[]')")
     con.execute("INSERT INTO tool_calls VALUES ('s2','get_artifact','[\"a1\", \"a2\"]')")
     con.commit()
@@ -297,9 +324,87 @@ def test_scoring():
           json.dumps(legacy))
 
 
+def test_claims_metrics():
+    print("== consumer claims scoring ==")
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        root = pathlib.Path(td)
+        r1, r2, r3, bad, bad2 = "a" * 8, "b" * 8, "d" * 8, "c" * 8, "e" * 8
+        fixture = {"claims": [
+            {"id": 1, "verdict": "supported", "claim": "x",
+             "support_row_id": r1, "forbidden_row_ids": []},
+            {"id": 2, "verdict": "refuted", "claim": "y",
+             "support_row_id": r2, "forbidden_row_ids": [bad]},
+            {"id": 3, "verdict": "supported", "claim": "z",
+             "support_row_id": r3, "forbidden_row_ids": [bad2]},
+        ]}
+        (root / "claims.json").write_text(json.dumps(fixture), encoding="utf-8")
+        # A refutation that names the repudiated row (healthy) and a support
+        # that leans on a repudiated row (the target-0 error).
+        answer = (f"@claim[1:supported:{r1}]\n"
+                  f"@claim[2:refuted:{bad}]\n"
+                  f"@claim[3:supported:{bad2}]\n")
+        (root / "answers_consumer.json").write_text(json.dumps({
+            "claims::R1": {"answer_text": answer, "tokens_in": 100, "tokens_out": 20,
+                            "tool_calls": 3, "model": "fake/model"}}), encoding="utf-8")
+        m = metrics.claims_metrics("consumer", root)
+    check("every claim is scored", m["claims"] == 3, json.dumps(m))
+    check("all three verdicts are correct", m["verdict_correct"] == 3, json.dumps(m))
+    check("the correct support row is credited", m["cited_support"] == 1, json.dumps(m))
+    check("supporting a claim with a repudiated row is bad backing (target 0)",
+          m["bad_backing"] == 1, json.dumps(m))
+    check("a refutation that names the repudiated row is not a bad citation",
+          m["refuted_by_bad_row"] == 1, json.dumps(m))
+    check("tokens are carried through", m["tokens_in"] == 100, json.dumps(m))
+    # A missing verdict line is unresolved, not silently correct.
+    with tempfile.TemporaryDirectory() as td:
+        root = pathlib.Path(td)
+        (root / "claims.json").write_text(json.dumps(fixture), encoding="utf-8")
+        (root / "answers_consumer.json").write_text(json.dumps({
+            "claims::R1": {"answer_text": "@claim[1:supported:none]"}}), encoding="utf-8")
+        partial = metrics.claims_metrics("consumer", root)
+    check("a claim with no verdict line is unresolved, not silently correct",
+          partial["unresolved"] == 2 and partial["per_claim"][1]["correct"] is False,
+          json.dumps(partial))
+
+
+def test_exploratory_noise():
+    print("== exploratory noise ==")
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        db = pathlib.Path(td) / "store.db"
+        con = sqlite3.connect(db)
+        con.executescript("""
+            CREATE TABLE artifacts (row_id TEXT PRIMARY KEY, session_id TEXT,
+                                    type TEXT, title TEXT, status TEXT);
+            CREATE TABLE tool_calls (session_id TEXT, tool_name TEXT,
+                                     artifact_row_ids TEXT);
+        """)
+        for rid, status in (("e1", "exploratory"), ("e2", "exploratory"),
+                            ("r1", "result"), ("r2", "result")):
+            con.execute("INSERT INTO artifacts VALUES (?,?,?,?,?)",
+                        (rid, "s1", "query", rid, status))
+        # One search that saw an exploratory row among results, one that only
+        # saw exploratory rows (returns nothing post-flip), one that saw none.
+        con.execute("INSERT INTO tool_calls VALUES ('s1','search_artifacts','[\"e1\",\"r1\"]')")
+        con.execute("INSERT INTO tool_calls VALUES ('s1','search_artifacts','[\"e2\"]')")
+        con.execute("INSERT INTO tool_calls VALUES ('s1','search_artifacts','[\"r1\"]')")
+        con.commit()
+        con.close()
+        n = metrics.exploratory_noise_metrics(db)
+    check("the exploratory fraction is measured",
+          n["store"]["exploratory_fraction"] == 0.5, json.dumps(n["store"]))
+    s = n["sessions"]["s1"]
+    check("searches returning an exploratory row are counted",
+          s["searches_returning_exploratory"] == 2, json.dumps(s))
+    check("searches whose only hits were exploratory would return nothing post-flip",
+          s["searches_only_exploratory"] == 1, json.dumps(s))
+
+
 def main():
-    for t in (test_registry, test_arm_of, test_runner_reads_registry, test_parse_manifest,
-              test_manifest_metrics, test_three_way_report, test_scoring):
+    for t in (test_registry, test_findability_tools, test_arm_of, test_runner_reads_registry,
+              test_parse_manifest, test_manifest_metrics, test_three_way_report,
+              test_claims_metrics, test_exploratory_noise, test_scoring):
         print()
         t()
     print()
