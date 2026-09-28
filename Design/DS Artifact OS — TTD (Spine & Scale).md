@@ -632,6 +632,18 @@ That is a deliberate wart, approved during E3's execution rather than discovered
 
 **Whoever is next in `store.py` for another reason should promote it** — a rename to `fts_match` with the underscore dropped, updating both call sites. It is a two-line mechanical change. Until then the import carries a comment saying it is deliberate.
 
+### U8 — the abandon sweep has no index for its correlated subquery
+
+Found by WP-G1, which built `spine.sweep_abandoned`. The sweep runs inside every `start_session`, so it is on the hot path, and its activity test is:
+
+```sql
+MAX(ts) FROM tool_calls WHERE session_id = questions.claimed_by
+```
+
+`tool_calls.session_id` has **no index**. The candidate set is bounded by the indexed `questions(status)` filter (M3), so this is not a full scan of `tool_calls` — but it is one correlated scan per open question, and a store with many open questions pays that on every session start.
+
+**Fix: add an index on `tool_calls(session_id)` as a new migration (M4).** It needs `db.py`, which WP-G1 did not own, so it was flagged rather than done. Note this is the same index the claim lease's activity read wants (`lease_state` does the same correlated lookup), so it pays for two features, not one.
+
 ## Out of scope for this TTD
 
 - Skills and templates as shareable bundles across users (author, version, origin, SKILL.md-compatible export).
