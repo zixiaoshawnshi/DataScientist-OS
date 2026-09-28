@@ -70,8 +70,12 @@ def main() -> None:
     assert any(a.row_id == dataset_row for a in ancestors), "lineage should link query -> dataset"
     print(f"[ok] lineage resolved: {[a.title for a in ancestors]}")
 
-    hits = search_artifacts(conn, "how do I find and register a new dataset?", top_k=3)
-    print("[ok] search_artifacts('how do I find and register a new dataset?') ->")
+    # type="skill": search no longer returns skills/templates unless the
+    # caller asks for that type (WP-B2) — the cold-start retrieval this
+    # asserts is now an explicit request for skills.
+    hits = search_artifacts(conn, "how do I find and register a new dataset?",
+                            top_k=3, type="skill")
+    print("[ok] search_artifacts('how do I find and register a new dataset?', type='skill') ->")
     for art, score in hits:
         print(f"      {score:.3f}  {art.type:10s}  {art.title}")
     assert hits[0][0].row_id == skill_row_id, "discovery skill should rank first for a discovery query"

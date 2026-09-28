@@ -22,7 +22,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware
 
-from dsos import execution, present, publish, seed, store, templating, update_check
+from dsos import execution, present, store, update_check
 from dsos.db import connect
 
 DB_PATH = os.environ.get("DSOS_DB_PATH", "data/store.db")
@@ -56,27 +56,24 @@ a number this server actually computed.
 Workflow, in order:
 1. start_session(question) — first call, for every new question.
 2. search_artifacts — check for reusable prior work before fetching anything new.
-3. list_skills — common workflow skills (exploratory analysis, charting, \
-statistics, modeling, reporting). Read the relevant one with get_artifact and \
-follow it, so analysis stays consistent across sessions; customize or add \
-your own with save_skill.
-4. If nothing reusable: find and download real public data with your own \
+3. If nothing reusable: find and download real public data with your own \
 tools, then save_artifact to register it (type="dataset", with source). An \
 unregistered dataset is invisible to search, lineage, and every future question.
-5. run_sql / run_python against the registered artifacts to compute the \
+4. run_sql / run_python against the registered artifacts to compute the \
 actual answer — never eyeball or summarize the raw data yourself. Your \
 inputs are bound positionally: the first row_id in input_row_ids is \
 `in_1`, the second `in_2`, and so on (in Python, `inputs["<row_id>"]` \
 reaches one by id). Each response echoes that mapping in `input_tables`. \
 Their result is returned inline in the same response (a preview, row_count, \
 columns) — do not call get_artifact right after just to see what you \
-produced; it's already there. Charts: output_type="chart" — styled with \
-the dark house style by default; style= picks another (list_templates).
-6. Answer using the computed output, citing the row_ids you used.
-7. If asked for a shareable writeup: save_artifact(type="narrative", ...) \
-with {{artifact:row_id}} embeds for what it discusses, then publish_report \
-to render it to one self-contained local .html file — template= picks the \
-layout (dark house style by default; list_templates for options).
+produced; it's already there. Pass scratch=True for a quick check (a row \
+count, a schema poke) that should cost nothing: the result comes back \
+inline, and no artifact, lineage or searchable row is written. Charts: \
+output_type="chart" — styled with the dark house style by default, or \
+pick another with style=.
+5. Answer using the computed output, citing the row_ids you used. If a \
+check you ran in scratch mode turns out to be worth keeping, re-run it \
+with scratch=False.
 
 Every tool that returns an artifact — save_artifact, run_sql, run_python, \
 search_artifacts — gives you a row_id. That row_id is the only id you need \
@@ -165,7 +162,10 @@ def search_artifacts(
     something via semantic similarity. Call this before fetching new data
     or rebuilding anything — if a past artifact already covers part of the
     question (this session's or an earlier one's), reuse it via
-    get_artifact/run_sql/run_python instead of redoing the work."""
+    get_artifact/run_sql/run_python instead of redoing the work.
+
+    Workflow skills and templates are not results and are left out unless
+    you pass type="skill" or type="template" for one."""
     hits = store.search_artifacts(conn, query, top_k=top_k, type=type)
     results = [
         {
@@ -321,63 +321,6 @@ def _ingest_path(path: str, type: str, content_format: str) -> tuple:
     return df, "parquet"
 
 
-@mcp.tool()
-def list_skills(session_id: str) -> dict:
-    """The skill library: common workflow skills — dataset discovery,
-    exploratory analysis, charting, statistics, modeling, reporting — plus
-    any skills saved in past sessions. Read one with get_artifact(row_id)
-    and follow the relevant one so analysis stays consistent across
-    sessions; search_artifacts finds them by content too. Customize or add
-    your own with save_skill.
-    """
-    arts = store.list_artifacts(conn, type="skill")
-    skills = [
-        {
-            "artifact_id": a.artifact_id, "row_id": a.row_id, "version": a.version,
-            "title": a.title, "description": a.description, "tags": a.tags,
-            "seeded": a.artifact_id in seed.SKILL_IDS,
-        }
-        for a in arts
-    ]
-    return {"skills": skills, "artifact_row_ids": [a.row_id for a in arts]}
-
-
-@mcp.tool()
-def save_skill(
-    session_id: str, title: str, description: str, content: str,
-    artifact_id: str | None = None, tags: list[str] | None = None,
-) -> dict:
-    """Create a new skill or a new version of an existing one — how this
-    system learns the workflows that worked. An edited skill keeps its
-    artifact_id, so references keep resolving, old versions stay readable
-    (get_artifact by row_id), and re-seeding never overwrites your edit.
-
-    - New skill: omit artifact_id (one is derived from the title).
-    - Edit an existing one: pass its artifact_id from list_skills — the
-      edit becomes the new version.
-
-    `content` is markdown instructions, same shape as the seeded skills.
-    `description` is what search ranks on — one real sentence, written for
-    the next session that needs it.
-    """
-    try:
-        if artifact_id is None:
-            artifact_id = "skill-" + store.safe_table_name(title)
-        final_tags = ["skill"] + [t for t in (tags or []) if t != "skill"]
-        row_id = store.save_artifact(
-            conn, artifact_id=artifact_id, type="skill", title=title,
-            description=description, content=content, content_format="markdown",
-            tags=final_tags, session_id=session_id,
-        )
-    except ValueError as exc:
-        return {"error": str(exc), "artifact_row_ids": []}
-    art = store.get_artifact_by_row_id(conn, row_id, load_content=False)
-    return {
-        "row_id": row_id, "artifact_id": artifact_id, "version": art.version,
-        "artifact_row_ids": [row_id],
-    }
-
-
 def _execution_result_payload(row_id: str, input_row_ids: list[str]) -> dict | object:
     """Shared by run_sql/run_python: always inline the result (or, on
     failure, the diagnostics) — never make the agent make a second call
@@ -440,9 +383,9 @@ def run_sql(
     scratch=True: run and return the result inline but persist nothing —
     no artifact, no lineage, not searchable. For quick checks (row counts,
     schema pokes) where an artifact would be noise. The run still appears
-    in the session's tool-call trace. The response's scratch_id lets you
-    promote it later via promote_scratch(scratch_id=...) without
-    re-running the query, if it turns out you do want to keep it after all.
+    in the session's tool-call trace. A scratch run is not stored anywhere
+    to promote from: if the result turns out to be worth keeping, re-run
+    it with scratch=False.
 
     On failure, the error includes each registered input as
     `in_k "<title>" (columns)`, so a column/table typo is fixable from the
@@ -495,10 +438,9 @@ def run_python(
     text placeholder in scratch mode, not a rendered image — drop scratch
     once you're iterating on plot styling, to see it rendered). For rapid
     iteration (check a correlation, test an idea) where an artifact would
-    be noise. The run still appears in the session's tool-call trace. The
-    response's scratch_id lets you promote it later via
-    promote_scratch(scratch_id=...) without re-running the code, once the
-    idea works and it's worth keeping.
+    be noise. The run still appears in the session's tool-call trace. A
+    scratch run is not stored anywhere to promote from: once the idea
+    works, re-run it with scratch=False so it is saved as a real artifact.
 
     Your code runs against python_path (below) — usually your own analysis
     Python, so whatever's already installed there just works. requirements=
@@ -519,9 +461,9 @@ def run_python(
     "report" (the same look sized for charts embedded in published reports
     — use it for charts a narrative will embed), "minimal" (bare light
     style), a custom chart-style template's row_id/artifact_id, or None for
-    raw matplotlib defaults. Style never leaks between runs. See what
-    exists with list_templates(kind="chart-style"); make your own with
-    save_template.
+    raw matplotlib defaults. Style never leaks between runs. An unknown
+    name fails this one call, listing the built-ins and the custom
+    chart-style templates in this store.
 
     python_path: overrides the server default for THIS call only — e.g.
     point it at a specific repo's .venv interpreter to run against that
@@ -546,39 +488,6 @@ def run_python(
 
 
 @mcp.tool()
-def promote_scratch(scratch_id: str, session_id: str, title: str, description: str) -> dict:
-    """Persist a previous scratch=True run_sql/run_python call (by the
-    scratch_id its response returned) as a real artifact — without
-    re-running the code. The "spike, then keep it" shortcut: iterate freely
-    with scratch=True, then promote the one that worked instead of copying
-    its code into a fresh scratch=False call.
-
-    `title`/`description` name the artifact now that it's staying — they
-    don't have to match whatever the scratch call was originally titled.
-
-    The cache this reads from is in-memory and per server process: it does
-    not survive a restart, and only holds a bounded number of recent
-    scratch runs. If scratch_id isn't found (aged out, wrong id, or already
-    promoted), you'll get an error telling you to re-run with scratch=False.
-
-    Example: promote_scratch(
-        scratch_id="<scratch_id from a run_sql/run_python response>",
-        session_id="s1", title="High scorers",
-        description="Teams scoring above 10.",
-    )
-    """
-    try:
-        row_id = execution.promote_scratch(
-            conn, scratch_id=scratch_id, session_id=session_id,
-            title=title, description=description,
-        )
-    except ValueError as exc:
-        return {"error": str(exc), "artifact_row_ids": []}
-    input_row_ids = [a.row_id for a in store.get_lineage(conn, row_id, direction="ancestors")]
-    return _execution_result_payload(row_id, input_row_ids)
-
-
-@mcp.tool()
 def get_lineage(row_id: str, session_id: str, direction: str = "ancestors") -> dict:
     """See what an artifact was built from (direction="ancestors", the
     default) or what has been built from it (direction="descendants")."""
@@ -586,181 +495,6 @@ def get_lineage(row_id: str, session_id: str, direction: str = "ancestors") -> d
     results = [{"row_id": a.row_id, "type": a.type, "title": a.title} for a in arts]
     return {"results": results, "artifact_row_ids": [row_id, *(a.row_id for a in arts)]}
 
-
-@mcp.tool()
-def list_templates(session_id: str, kind: str | None = None) -> dict:
-    """Chart styles and report templates — the consistency layer, built-ins
-    and custom. Chart styles are run_python's style= (default "dsos", the
-    dark house style); report templates are publish_report's template=
-    (default "report", the dark house layout). Custom templates made with
-    save_template are referenced by row_id or artifact_id — the id is
-    stable across version edits. kind="chart-style" or "report" to list
-    one kind.
-    """
-    if kind is not None and kind not in templating.TEMPLATE_KINDS:
-        return {
-            "error": f"kind must be one of {sorted(templating.TEMPLATE_KINDS)}, got {kind!r}",
-            "artifact_row_ids": [],
-        }
-    customs = store.list_artifacts(conn, type="template")
-
-    def _custom(kind_tag: str) -> list[dict]:
-        return [
-            {
-                "artifact_id": a.artifact_id, "row_id": a.row_id, "version": a.version,
-                "title": a.title, "description": a.description, "tags": a.tags,
-            }
-            for a in customs if kind_tag in a.tags
-        ]
-
-    result: dict = {"artifact_row_ids": [a.row_id for a in customs]}
-    if kind in (None, templating.CHART_STYLE_KIND):
-        result["chart_styles"] = {
-            "builtins": [
-                {"name": n, "description": d}
-                for n, d in sorted(templating.CHART_STYLE_BUILTINS.items())
-            ],
-            "custom": _custom(templating.CHART_STYLE_KIND),
-        }
-    if kind in (None, templating.REPORT_KIND):
-        result["report_templates"] = {
-            "builtins": [
-                {"name": n, "description": d}
-                for n, d in sorted(templating.REPORT_TEMPLATE_BUILTINS.items())
-            ],
-            "custom": _custom(templating.REPORT_KIND),
-        }
-    return result
-
-
-@mcp.tool()
-def save_template(
-    session_id: str, kind: str, content: str | None = None,
-    artifact_id: str | None = None, title: str | None = None,
-    description: str | None = None, tags: list[str] | None = None,
-    base: str | None = None,
-) -> dict:
-    """Create or re-version a template — the customizable half of the
-    consistency layer.
-
-    kind: "chart-style" (matplotlib rcParams text, .mplstyle syntax — used
-    via run_python's style=) or "report" (HTML with {{title}}/{{body}}/
-    {{published_at}}/{{session_question}} tokens, where {{body}} is where
-    the rendered narrative goes — used via publish_report's template=).
-
-    base: an existing template (built-in name or row_id/artifact_id) to
-    copy from — customize instead of rewriting from scratch. If you pass
-    no content, the base's text becomes your starting point; the base is
-    recorded in the new template's source either way.
-
-    content: the template text (required unless base provides it).
-    Validated at SAVE time, not first use — an unparsable .mplstyle or a
-    report template without {{body}} fails here in one call.
-
-    artifact_id: the stable id to re-version later — an edit becomes a new
-    version with the same id, so references keep resolving. Omit to derive
-    one from the title. title/description are what search ranks on — give
-    them real ones.
-    """
-    try:
-        if kind not in templating.TEMPLATE_KINDS:
-            raise ValueError(
-                f"kind must be one of {sorted(templating.TEMPLATE_KINDS)}, got {kind!r}"
-            )
-        if base is not None:
-            base_text = templating.base_template_content(conn, kind, base)
-            if content is None:
-                content = base_text
-        if not content or not content.strip():
-            raise ValueError(
-                "content is required — pass content, or base to copy an existing template"
-            )
-        if kind == templating.CHART_STYLE_KIND:
-            templating.validate_chart_style_text(content, DEFAULT_PYTHON_PATH)
-        else:
-            templating.validate_report_template_text(content)
-
-        if artifact_id is None:
-            artifact_id = f"{kind}-" + store.safe_table_name(title or "custom")
-        if title is None:
-            title = f"Custom {kind} template" + (f" (based on {base})" if base else "")
-        if description is None:
-            description = (
-                f"Custom {kind} template for consistent styling"
-                + (f", customized from {base!r}." if base else ".")
-            )
-        final_tags = templating.template_tags(kind) + [
-            t for t in (tags or []) if t not in ("template", kind)
-        ]
-        row_id = store.save_artifact(
-            conn, artifact_id=artifact_id, type="template", title=title,
-            description=description, content=content,
-            content_format=(
-                "mplstyle" if kind == templating.CHART_STYLE_KIND else "html"
-            ),
-            tags=final_tags, session_id=session_id,
-            source={"base": base} if base else None,
-        )
-    except (ValueError, OSError) as exc:
-        return {"error": str(exc), "artifact_row_ids": []}
-    art = store.get_artifact_by_row_id(conn, row_id, load_content=False)
-    return {
-        "row_id": row_id, "artifact_id": artifact_id, "version": art.version,
-        "kind": kind, "artifact_row_ids": [row_id],
-    }
-
-
-@mcp.tool()
-def publish_report(
-    row_id: str, session_id: str, dry_run: bool = False, template: str = "report",
-) -> dict:
-    """Render a narrative artifact and everything its {{artifact:...}}
-    embeds reference — datasets/queries/transforms as HTML tables, charts as
-    inlined images — into one self-contained local .html file. This is the
-    seam where a finished report leaves this working layer (see the
-    discovery skill and save_artifact for how things get INTO it).
-
-    row_id must be a narrative artifact (save_artifact it first if you
-    haven't). This does not create a new artifact row itself — a rendered
-    export isn't a versioned analysis artifact.
-
-    dry_run=True: resolve every {{artifact:...}} embed and report on it
-    (row_id, type, title, and whether it actually resolved) without writing
-    the HTML file — check that nothing is missing or stale before spending
-    a real publish. `broken_row_ids` lists any embed that didn't resolve
-    (a typo, or a row_id from a different session/store); fix those in the
-    narrative's content (save_artifact a new version) before publishing
-    for real.
-
-    template: the HTML layout (the consistency layer) — "report" (the dark
-    house layout, the default), "default" (the original plain light look),
-    "minimal" (bare HTML), or a custom report-template artifact's
-    row_id/artifact_id (make one with save_template(kind="report")).
-
-    Example: publish_report(row_id="<narrative row_id>", session_id="s1")
-    """
-    try:
-        if dry_run:
-            result = publish.preview_report(conn, row_id)
-        else:
-            result = publish.publish_report(conn, row_id, template=template)
-    except ValueError as exc:
-        return {"error": str(exc), "artifact_row_ids": []}
-    return result
-
-
-def _ensure_seeded() -> None:
-    """The skill library must exist before any agent connects — idempotent:
-    a skill that's been edited via save_skill (a new version, same
-    artifact_id) is never re-seeded over, so customization survives
-    restarts and re-inits."""
-    if all(store.get_artifact(conn, sid, load_content=False) for sid in seed.SKILL_IDS):
-        return
-    bootstrap = store.start_session(conn, "bootstrap: seed skill library")
-    seed.seed_library(conn, session_id=bootstrap)
-
-
-_ensure_seeded()
 
 if __name__ == "__main__":
     mcp.run()

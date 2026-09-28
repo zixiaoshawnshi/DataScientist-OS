@@ -146,10 +146,17 @@ def find_by_content_hash(
     return row["row_id"] if row else None
 
 
-# Types that don't count as "prior work" for the session-start signal.
-# Seeded skills are present in every store from first use, so counting them
-# would make a brand-new store look like it already has a history.
-_NOT_PRIOR_WORK = ("skill",)
+# The consistency layer: skills teach workflow, templates carry styling.
+# They are real artifacts — get_artifact, lineage and templating resolution
+# all work on them — but they are not work products, so they are held out
+# of search (unless type= names one) and out of the session-start signal.
+# Counting them as "prior work" would make a store that holds nothing but
+# instructions look like it has a history.
+_NOT_PRIOR_WORK = ("skill", "template")
+
+# The same exclusion as a SQL fragment, for search_artifacts' "no type was
+# asked for" branch — one list, one rule, two spellings of it.
+_NOT_TYPED_SQL = "a.type NOT IN ({})".format(",".join("?" * len(_NOT_PRIOR_WORK)))
 
 
 def prior_work_signal(conn: sqlite3.Connection, question: str, top_k: int = 3) -> dict:
@@ -471,6 +478,13 @@ def search_artifacts(
     but it's a real, cheap signal that recency and "current" correlate
     far more often than not, with no schema change required.
 
+    Skills and templates (the consistency layer) are excluded unless the
+    caller passes `type="skill"`/`"template"`: they are instructions and
+    styling, not results, and in a store where the server used to seed a
+    skill library on first use they were most of what any search returned.
+    The same exclusion applies to the session-start signal
+    (see _NOT_PRIOR_WORK), so both routes share one rule.
+
     A run_sql/run_python call that failed still gets a real row (so its
     row_id can carry the error/stdout/stderr back to the caller — see
     mcp_server._execution_result_payload), but that dead, content-less
@@ -478,8 +492,10 @@ def search_artifacts(
     status, not filtered out at the tool layer, so every caller of
     search_artifacts gets this for free.
     """
-    type_clause = " AND a.type = ? AND a.status != 'error'" if type else " AND a.status != 'error'"
-    type_params = [type] if type else []
+    if type:
+        type_where, type_params = "a.type = ?", [type]
+    else:
+        type_where, type_params = _NOT_TYPED_SQL, list(_NOT_PRIOR_WORK)
 
     ordered: list[Artifact] = []
     scores: list[float] = []
@@ -493,7 +509,7 @@ def search_artifacts(
                 SELECT a.* FROM artifacts_fts
                 JOIN artifacts a ON a.row_id = artifacts_fts.row_id
                 {_LATEST_VERSION_JOIN}
-                WHERE artifacts_fts MATCH ?{type_clause}
+                WHERE artifacts_fts MATCH ? AND {type_where} AND a.status != 'error'
                 ORDER BY a.created_at DESC, bm25(artifacts_fts)
                 LIMIT ?
                 """,
@@ -510,7 +526,7 @@ def search_artifacts(
     if len(ordered) < top_k:
         rows = conn.execute(
             f"SELECT a.* FROM artifacts a {_LATEST_VERSION_JOIN} "
-            + ("WHERE a.type = ? AND a.status != 'error'" if type else "WHERE a.status != 'error'"),
+            f"WHERE {type_where} AND a.status != 'error'",
             type_params,
         ).fetchall()
         q_vec = embeddings.embed(query)

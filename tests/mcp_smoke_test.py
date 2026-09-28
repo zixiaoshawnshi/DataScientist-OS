@@ -57,9 +57,12 @@ async def main() -> None:
         r = await client.call_tool(
             "search_artifacts", {"query": "how do I find and register data?", "session_id": s1}
         )
-        assert r.data["results"], "search should find the seeded discovery skill"
-        assert r.data["results"][0]["type"] == "skill"
-        print(f"[ok] search_artifacts (over the wire) -> {r.data['results'][0]['title']}")
+        assert r.data["results"] == [], (
+            "nothing is seeded into a fresh store any more (WP-B2), and the "
+            "consistency layer is no longer a search result, so an empty "
+            "store must search empty"
+        )
+        print("[ok] search_artifacts (over the wire) on a fresh store -> no results, no seed library")
 
         with tempfile.TemporaryDirectory() as tmp:
             csv_path = Path(tmp) / "toy.csv"
@@ -275,8 +278,8 @@ async def main() -> None:
         )
         print("[ok] run_python over the wire -> stdout surfaced on success (feedback #10)")
 
-        # --- round 6: chart auto-render, scratch promotion, publish dry-run
-        # (feedback #1, #2, #3, #4, #7) ---
+        # --- round 6: chart auto-render, scratch has nothing to promote
+        # (feedback #1, #2, #3, #7) ---
         r = await client.call_tool("run_python", {
             "code": (
                 "import matplotlib.pyplot as plt\n"
@@ -300,42 +303,23 @@ async def main() -> None:
 
         r = await client.call_tool("run_sql", {
             "code": "SELECT COUNT(*) AS n FROM in_1",
-            "session_id": s2, "title": "Scratch to promote",
-            "description": "A scratch run worth keeping after all.",
+            "session_id": s2, "title": "Scratch to re-run",
+            "description": "A scratch run that turns out to be worth keeping.",
             "input_row_ids": [dataset_row], "scratch": True,
         })
         assert r.data["status"] == "ok", r.data
-        scratch_id = r.data.get("scratch_id")
-        assert scratch_id, "a scratch run should return a scratch_id (feedback #4)"
+        assert "scratch_id" not in r.data, (
+            "a scratch run is not promotable any more (WP-B2) — nothing is "
+            "cached for it, so the response must not hand back an id"
+        )
         assert r.data.get("input_tables") == {dataset_row: "in_1"}
-        print(f"[ok] scratch run_sql -> scratch_id {scratch_id}, input_tables inlined")
-
-        r = await client.call_tool("promote_scratch", {
-            "scratch_id": scratch_id, "session_id": s2,
-            "title": "Row count", "description": "Promoted from a scratch check.",
-        })
-        assert "error" not in r.data, r.data
-        promoted_row = r.data["row_id"]
-        assert r.data["row_count"] == 1, r.data
-        print(f"[ok] promote_scratch persisted the cached scratch run without re-running it -> {promoted_row}")
-
         r = await client.call_tool(
-            "search_artifacts", {"query": "Row count", "session_id": s2}
+            "search_artifacts", {"query": "Scratch to re-run", "session_id": s2}
         )
-        assert any(h["row_id"] == promoted_row for h in r.data["results"]), (
-            "a promoted scratch run must become a real, searchable artifact"
+        assert not any(h["title"] == "Scratch to re-run" for h in r.data["results"]), (
+            "a scratch run leaves nothing behind to promote"
         )
-        print("[ok] promoted artifact is searchable, unlike the scratch run it came from")
-
-        r = await client.call_tool("promote_scratch", {
-            "scratch_id": scratch_id, "session_id": s2,
-            "title": "Row count again", "description": "Re-promoting an already-consumed id.",
-        })
-        assert "error" in r.data and "no cached scratch run" in r.data["error"], (
-            "promoting an already-consumed (or unknown) scratch_id should fail clearly, "
-            "not silently re-run or duplicate"
-        )
-        print("[ok] promote_scratch on a consumed/unknown scratch_id fails clearly")
+        print("[ok] scratch run_sql -> no scratch_id and nothing persisted to re-run from")
 
         r = await client.call_tool("save_artifact", {
             "type": "narrative", "title": "Preview Report", "session_id": s2,
@@ -347,17 +331,18 @@ async def main() -> None:
             ),
         })
         preview_narrative_row = r.data["row_id"]
-        r = await client.call_tool("publish_report", {
-            "row_id": preview_narrative_row, "session_id": s2, "dry_run": True,
-        })
-        assert "error" not in r.data, r.data
-        assert "path" not in r.data, "dry_run must not write an HTML file"
-        assert any(e["row_id"] == dataset_row and e["resolved"] for e in r.data["embeds"]), r.data
-        assert "not-a-real-row-id" in r.data["broken_row_ids"], (
+        # publish_report is no longer an MCP tool (WP-B2); the renderer
+        # behind it is library code and is driven directly from here.
+        from dsos import publish as publish_mod
+        from dsos.mcp_server import conn as mcp_conn
+        preview = publish_mod.preview_report(mcp_conn, preview_narrative_row)
+        assert "path" not in preview, "dry_run must not write an HTML file"
+        assert any(e["row_id"] == dataset_row and e["resolved"] for e in preview["embeds"]), preview
+        assert "not-a-real-row-id" in preview["broken_row_ids"], (
             "dry_run should flag an embed that doesn't resolve (feedback #3, #7)"
         )
-        print(f"[ok] publish_report(dry_run=True) reports resolved/broken embeds without writing a file: "
-              f"broken={r.data['broken_row_ids']}")
+        print(f"[ok] publish.preview_report reports resolved/broken embeds without writing a file: "
+              f"broken={preview['broken_row_ids']}")
 
         r = await client.call_tool("save_artifact", {
             "type": "narrative", "title": "Real Report", "session_id": s2,
@@ -366,14 +351,11 @@ async def main() -> None:
             "content_text": f"See {{{{artifact:{dataset_row}}}}} for details.",
         })
         real_narrative_row = r.data["row_id"]
-        r = await client.call_tool("publish_report", {
-            "row_id": real_narrative_row, "session_id": s2,
-        })
-        assert "error" not in r.data, r.data
-        assert any(e["row_id"] == dataset_row and e["resolved"] for e in r.data["embeds"]), (
+        published = publish_mod.publish_report(mcp_conn, real_narrative_row)
+        assert any(e["row_id"] == dataset_row and e["resolved"] for e in published["embeds"]), (
             "a real publish should also report which artifacts it embedded (feedback #3)"
         )
-        print("[ok] publish_report (real) reports its resolved embeds alongside the file path")
+        print("[ok] publish.publish_report reports its resolved embeds alongside the file path")
 
         r = await client.call_tool("save_artifact", {
             "type": "narrative", "title": "Huge Report", "session_id": s2,

@@ -7,10 +7,11 @@ called search_artifacts zero times across ten reuse rounds and re-fetched
 data it had already registered. The response now reports what the store
 already holds plus candidate artifacts.
 
-Covers: the empty-store message, counts that exclude seeded skills (a
-brand-new store is seeded with 7 skills and must still read as empty),
-by_type breakdown, keyword vs semantic match labelling, and the caveat
-that travels with weak candidates.
+Covers: the empty-store message, counts that exclude the consistency layer
+(workflow skills and templates are not work products, so a store holding
+only those must still read as empty), by_type breakdown, keyword vs
+semantic match labelling, and the caveat that travels with weak
+candidates.
 
 Run: .venv/Scripts/python.exe tests/prior_work_smoke_test.py
 """
@@ -44,9 +45,10 @@ def check(label: str, ok: bool, detail: str = "") -> None:
 
 async def main() -> None:
     async with Client(mcp) as client:
-        # First call: the server seeds its skill library on first use. A
-        # store holding only those skills must still report zero prior work,
-        # or every fresh session looks like it has a history.
+        # First call: the store is empty — nothing is seeded on first use
+        # any more (WP-B2 dropped the import-time skill library), and even
+        # if a store does hold skills they aren't "prior work": a store of
+        # instructions must not look like it has a history.
         first = (await client.call_tool(
             "start_session", {"question": "what makes a hackathon project win?"})).data
         s1 = first["session_id"]
@@ -55,7 +57,7 @@ async def main() -> None:
               f"count={first['prior_work']['artifact_count']}")
         check("empty store says so plainly",
               "first session" in first["note"], first["note"][:60])
-        check("seeded skills are not counted as prior work",
+        check("skills and templates are not counted as prior work",
               "skill" not in first["prior_work"]["by_type"])
         check("empty store has no candidates", first["candidates"] == [])
 
@@ -115,7 +117,12 @@ async def main() -> None:
                   "start_session" in str(exc) and "unknown session_id" in str(exc),
                   str(exc)[:90])
 
-        after = (await client.call_tool("list_skills", {"session_id": second["session_id"]})).data
+        # list_skills is gone from the tool surface (WP-B2), so this is
+        # the library path it wrapped: the skill library is still there
+        # (dsos/seed.py), it is just not a tool an agent registers.
+        from dsos import seed as seed_mod
+        from dsos.db import connect
+        after = seed_mod.seed_library(connect(os.environ["DSOS_DB_PATH"]), session_id=second["session_id"])
         check("valid session still works after a rejection", bool(after))
 
     shutil.rmtree(Path(os.environ["DSOS_DB_PATH"]).parent, ignore_errors=True)
