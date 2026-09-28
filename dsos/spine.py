@@ -48,21 +48,18 @@ from typing import Any
 
 from dsos import store
 
-# A private cross-module import, and deliberately so (TTD U4). The
-# AND-prefix FTS rule is one rule with two callers now — artifact search
-# inside store.py, and this board — and copying it here would give the
-# codebase two spellings of it, which is the exact drift this project keeps
-# paying to undo: tune the rule in store.py and the board would silently
-# keep the old behaviour. The tidier end state is promoting it to a public
-# `fts_match`, but store.py is owned by four WPs and this is not one of
-# them, so it is recorded as U4 and promoted by whoever is next in that file
-# for another reason. Two lines, both call sites.
-# `store._new_id` / `store._now` are borrowed the same way, and for the
-# same reason: the question table's ids and timestamps have to be the same
-# shape the rest of the store's rows use, and duplicating a uuid4 and an
-# isoformat to get a "different" id generator would be a store whose two
-# halves cannot be reasoned about together.
-_fts_query = store._fts_query
+# `store._new_id` / `store._now` are borrowed privately, and deliberately:
+# the question table's ids and timestamps have to be the same shape the
+# rest of the store's rows use, and duplicating a uuid4 and an isoformat to
+# get a "different" id generator would be a store whose two halves cannot
+# be reasoned about together.
+#
+# The AND-prefix FTS rule is deliberately NOT borrowed. It is right for
+# `search_artifacts` and wrong for this board — see `_board_fts_query` and
+# the docstring on `related_questions` for the argument, because that
+# argument is the reason and a future reader needs it more than the rule.
+# TTD U4 is about promoting that rule out of store.py for artifact search,
+# which now has one caller again; nothing here depends on how that lands.
 
 # How long a claim survives without activity. Read per call, never at import:
 # a test (and an operator) must be able to change it on a live server, and
@@ -81,6 +78,41 @@ BOARD_ENV = "DSOS_DISABLE_BOARD"
 # information, it is noise on the one screen an agent reads before it
 # starts working.
 _BOARD_STATUSES = ("in_progress", "open", "answered")
+
+# Question words, filler and pronouns, dropped before the board builds a
+# query. A question is a sentence, so most of its tokens are scaffolding —
+# and an OR'd match over scaffolding matches nearly every row on the board,
+# which would leave the ranking to do all the work and turn "related" into
+# "any question with a preposition in it".
+#
+# Short and English-only on purpose. It is not a general-purpose stopword
+# list and must not grow into one: a word that looks like filler here is
+# often the whole question in an analysis store, and "most" is the obvious
+# example — dropped, `which team scored the most on q3` matches every team
+# scoring question equally well. Negation is kept for the same reason
+# (`not` stays a content word), and each addition has to earn its place by
+# being scaffolding in a question sentence.
+_BOARD_STOPWORDS = frozenset({
+    "a", "about", "actually", "all", "also", "am", "an", "and", "any", "are",
+    "as", "at", "be", "been", "being", "both", "but", "by", "can", "could",
+    "did", "do", "does", "each", "for", "from", "had", "has", "have", "he",
+    "her", "here", "his", "how", "i", "if", "in", "into", "is", "it", "just",
+    "me", "my", "of", "on", "or", "our", "she", "should", "so", "some", "than",
+    "that", "the", "their", "there", "these", "they", "this", "those", "to",
+    "up", "very", "was", "we", "were", "what", "when", "where", "which",
+    "while", "who", "why", "will", "with", "would", "you",
+})
+
+# How many rows the keyword pass pulls back before Python ranks them. The
+# AND'd rule this replaced could only return a handful of rows, so a small
+# multiple of `limit` was enough. An OR'd match returns every question that
+# shares a single content word, and bm25 is now only a pre-filter for the
+# ranking — so the window has to be wide enough for that ranking to have
+# something to choose from, or it would discard exactly the well-matched
+# rows it exists to promote. Affordable regardless: the window is bounded
+# and a question is a row per top-level question, not per artifact.
+_BOARD_CANDIDATE_FLOOR = 32
+_BOARD_CANDIDATE_FACTOR = 8
 
 _CLOSABLE = ("answered", "abandoned")
 
@@ -142,6 +174,40 @@ def normalise_question_text(text: str) -> str:
     above is about.
     """
     return re.sub(r"\s+", " ", (text or "").strip().lower()).rstrip("?").strip()
+
+
+def _content_terms(text: str) -> list[str]:
+    """The words of a question that could tell it apart from another one:
+    the same tokenisation `store._fts_query` uses, minus the question words
+    and filler in `_BOARD_STOPWORDS`. Duplicates are left in — the caller
+    that counts shared terms wants a set, and the one that builds a MATCH
+    expression wants them all."""
+    return [t for t in re.findall(r"\w+", (text or "").lower()) if t not in _BOARD_STOPWORDS]
+
+
+def _board_fts_query(text: str) -> str:
+    """The board's MATCH expression: every content word OR'd in, each as a
+    prefix match so `migrat` still finds `migrates`.
+
+    Built here rather than borrowed from `store._fts_query`, and it is not
+    the same rule: that one ANDs every word, which for artifact titles is
+    right and for questions means a paraphrase of the question in flight
+    matches nothing at all (TTD U5). Each term is quoted, which
+    `_fts_query` does not do — a question is free prose and can contain
+    FTS5's own keywords, so an unquoted `NEAR` or `OR` in a question about
+    a team's nearest rivals would be a syntax error the guard below
+    swallows into a silently worse board. A quoted term with a trailing `*`
+    is the same prefix match, just not read as syntax.
+
+    Empty for text that is nothing but stopwords, which skips the keyword
+    pass entirely and leaves the exact-text backstop to answer alone.
+    """
+    return " OR ".join(f'"{term}"*' for term in _content_terms(text))
+
+
+def _board_candidate_window(limit: int) -> int:
+    """How many candidate rows the keyword pass fetches for this `limit`."""
+    return max(limit * _BOARD_CANDIDATE_FACTOR, _BOARD_CANDIDATE_FLOOR)
 
 
 def _last_activity(conn: sqlite3.Connection, question: sqlite3.Row) -> datetime | None:
@@ -293,22 +359,50 @@ def related_questions(
 ) -> list[dict]:
     """What else is in flight, waiting, or already answered, for this text.
 
+    **Recall beats precision here, and that is the whole design of the
+    matcher.** A spurious related question costs an agent one glance at a
+    row it can dismiss. A missed one means two agents run the same analysis
+    and neither knows of the other — the exact failure this board exists to
+    prevent, and the duplicate-work rate benchmark arm H3 is instrumented to
+    measure. So the keyword path OR's the content words instead of AND'ing
+    them, and a paraphrase of a question already on the board reaches it.
+
+    The inverse is true of `search_artifacts`, which is why it still ANDs
+    (`store._fts_query`): artifact titles are short and keyword-like, and
+    search has a semantic fallback behind it, so precision buys something and
+    recall does not have to. Questions are long sentences with no semantic
+    fallback, and AND over two differently-phrased sentences almost never
+    holds — "which player leads q3?" against a stored "is red really the q3
+    leader?" shares one content word, which under AND matched nothing.
+    **Do not "fix" the OR back to AND: that is the defect, not the defect's
+    absence.** (TTD U5.)
+
     Two matching paths, and they are not redundant:
 
-    - `questions_fts` via the same AND-prefix rule artifact search uses. It
-      is the only path that sees `hypothesis`, and the only one that ranks.
+    - `questions_fts`, OR'd over content words and ranked below. It is the
+      only path that sees `hypothesis`.
     - exact match on the normalised text. It is the backstop for questions
       FTS cannot see at all: a row written before this search table existed,
       or by anything that inserted into `questions` without its FTS row, is
-      invisible to the JOIN and would otherwise never be reported. The
-      comparison is a scan of the question table in Python because SQLite
-      has no case-folding or whitespace-collapsing function, which is
-      affordable precisely because a question is a row per top-level
+      invisible to the JOIN and would otherwise never be reported. It is
+      also the tie-winner inside a band, so the one question that is
+      literally the same one is never crowded out by its own neighbours.
+      The comparison is a scan of the question table in Python because
+      SQLite has no case-folding or whitespace-collapsing function, which
+      is affordable precisely because a question is a row per top-level
       question, not per artifact.
 
-    Ordered live in-progress, then open, then answered; within a band, the
-    exact text match first and then the most recent. `exclude_id` is the
-    caller's own question, which the board must never tell them about.
+    Ranking is by how many DISTINCT content words a candidate shares, not
+    by bm25: bm25 over short documents is not comparable across documents
+    of different lengths, and "shares the most words with me" is the thing
+    the board actually means. bm25 still orders the SQL fetch, purely as a
+    cheap pre-filter over a deliberately wide candidate window.
+
+    Ordered live in-progress, then open, then answered, and the ranking
+    refines WITHIN a band rather than across them: a finished question that
+    matches every word still sorts below live work, because the board's
+    job is to stop duplicate work *now*. `exclude_id` is the caller's own
+    question, which the board must never tell them about.
     """
     if not board_enabled():
         return []
@@ -316,9 +410,10 @@ def related_questions(
     wanted = normalise_question_text(text)
     if not wanted or limit == 0:
         return []
+    wanted_terms = set(_content_terms(wanted))
 
     candidates: dict[str, sqlite3.Row] = {}
-    fts_query = _fts_query(text)
+    fts_query = _board_fts_query(wanted)
     if fts_query:
         try:
             rows = conn.execute(
@@ -329,12 +424,13 @@ def related_questions(
                   AND q.status IN ({','.join('?' * len(_BOARD_STATUSES))})
                 ORDER BY bm25(questions_fts) LIMIT ?
                 """,
-                (fts_query, *_BOARD_STATUSES, limit * 4),
+                (fts_query, *_BOARD_STATUSES, _board_candidate_window(limit)),
             ).fetchall()
         except sqlite3.OperationalError:
             # Same guard as search_artifacts: raw question text can produce
             # FTS syntax the parser rejects, and the normalised pass below
-            # still stands.
+            # still stands. `_board_fts_query` quotes its terms to make this
+            # hard to trigger, not impossible.
             rows = []
         for row in rows:
             if row["id"] != exclude_id:
@@ -355,22 +451,37 @@ def related_questions(
     if not candidates:
         return []
 
-    # Exact-text matches rank first inside a band, so the one question that
-    # is literally the same one is never crowded out by its own neighbours.
-    exact = {
-        qid for qid, row in candidates.items()
-        if normalise_question_text(row["question"]) == wanted
-    }
+    # What each candidate is worth to the caller: the exact-text flag, which
+    # outranks the shared-word count inside a band, and the count itself —
+    # DISTINCT content words shared, over the question and the hypothesis
+    # together, because the hypothesis is indexed like the question and is
+    # often where the substance is. A candidate sharing nothing and not
+    # matching exactly is dropped: the FTS tokenizer and `_content_terms`
+    # agree in practice, and a row we share no word with is not one we can
+    # say anything useful about.
+    scored: list[tuple[str, sqlite3.Row, bool, int]] = []
+    for qid, row in candidates.items():
+        exact = normalise_question_text(row["question"]) == wanted
+        shared = len(wanted_terms & set(
+            _content_terms(f"{row['question']} {row['hypothesis'] or ''}")
+        ))
+        if exact or shared:
+            scored.append((qid, row, exact, shared))
+
+    if not scored:
+        return []
+
     # One lease evaluation per candidate, reused for the ranking and for the
     # expires_at the board reports — the lease is derived, so it costs a
     # query, and computing it twice per row would double that for no gain.
-    leases = {qid: lease_state(conn, row) for qid, row in candidates.items()}
+    leases = {qid: lease_state(conn, row) for qid, row, _, _ in scored}
     ordered = sorted(
-        candidates.values(),
-        key=lambda r: (
-            _board_rank(r, leases[r["id"]]["live"]),
-            0 if r["id"] in exact else 1,
-            -(_as_utc(r["created_at"]) or _now()).timestamp(),
+        scored,
+        key=lambda item: (
+            _board_rank(item[1], leases[item[0]]["live"]),
+            0 if item[2] else 1,
+            -item[3],
+            -(_as_utc(item[1]["created_at"]) or _now()).timestamp(),
         ),
     )[:limit]
     return [
@@ -382,7 +493,7 @@ def related_questions(
             "lease_expires_at": leases[r["id"]]["expires_at"] if r["claimed_by"] else None,
             "artifact_row_id": r["artifact_row_id"],
         }
-        for r in ordered
+        for _, r, _, _ in ordered
     ]
 
 
