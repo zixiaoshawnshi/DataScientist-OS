@@ -261,7 +261,53 @@ The arms live in `arms.json`, which `runner.mjs`, `metrics.py` and `report.py`
 all read: one entry decides which conditions exist, whether the raw CSV
 survives R1 (`raw_csv_policy`), and which side holds the arm's record
 (`scored_from`: a transcript or the store). Adding an arm is one entry —
-WP-H2's consumer arm and WP-H3's parallel arm are meant to land there.
+both the consumer arm and the parallel arm landed as single entries plus
+their metric, which is what the registry was built for.
+
+### The parallel arm, and the null it measured
+
+*(write-up completed by the integrator: WP-H3's worker ran both conditions and
+regenerated the report, then hit its runtime ceiling before writing this
+section. The numbers below are from `results/runs_parallel_board.json` and
+`results/runs_parallel_noboard.json`, which are untracked by design.)*
+
+Two producer agents run concurrently through **one daemon**, on overlapping
+questions. The measure is duplicate work: registrations by the second agent B
+whose `content_hash` or normalised title matches one of the first agent A's.
+`rate` = duplicates / B's registrations.
+
+The two conditions differ in **nothing but** `DSOS_DISABLE_BOARD` on the
+daemon — same questions, same order, same model. No other control was varied,
+because a duplicate-work comparison across uncontrolled arms measures the
+controls rather than the board.
+
+| arm | pair | A regs | B regs | B duplicates | rate |
+|---|---|---|---|---|---|
+| `parallel_board` | census_missing | 3 | 1 | 0 | 0% |
+| `parallel_board` | diamonds_clean | 3 | 3 | 1 | 33% |
+| `parallel_board` | vgsales_totals | 1 | 4 | 0 | 0% |
+| `parallel_board` | **all** | | 8 | 1 | **12%** |
+| `parallel_noboard` | census_missing | 2 | 3 | 0 | 0% |
+| `parallel_noboard` | diamonds_clean | 3 | 3 | 1 | 33% |
+| `parallel_noboard` | vgsales_totals | 1 | 4 | 0 | 0% |
+| `parallel_noboard` | **all** | | 10 | 1 | **10%** |
+
+**The board did not reduce duplicate work: 12% with it, 10% without.** That is
+one duplicate in each condition, so the difference is not a signal — it is the
+same single collision, moved. Report this as the null it is. Doc II's open
+question about whether the coordination board earns its keep now has a number
+instead of an assumption, and the number does not support the board at this n.
+
+What would make it answerable: more pairs (n=3 questions cannot separate 12%
+from 10%), and a harder overlap — these pairs may simply not have been
+contentious enough for two agents to collide. A null at n=3 is not evidence
+the board is useless; it is evidence this run cannot tell.
+
+One thing the arm does establish: the board is *readable* when it is on. That
+depends on WP-E3R's paraphrase matching — before it, `related_questions` only
+matched identical phrasing, so a second agent's differently-worded question
+would have surfaced nothing and the board could not have worked at all. Any
+future attempt to re-tighten that matcher should be measured against this arm.
 
 The dsos arm removes the raw CSV after R1 **by default**, because that is
 dsos's intended workflow (register once, then rely on the store) and
