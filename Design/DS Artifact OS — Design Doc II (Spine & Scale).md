@@ -193,6 +193,10 @@ Every tool definition costs tokens on every turn, for every agent that loads it,
 <!-- contract:consumer -->
 | tool | params | summary |
 |---|---|---|
+| `ask` | `question*`: string, `context`: string \| null | Put a question this store cannot answer to an analysis agent, and return its id. |
+| `cite` | `row_id*`: string | Turn a result into a reference you can paste into a document, with its standing attached. |
+| `find_evidence` | `claim*`: string, `top_k`: integer | Find the stated results in this store that speak to a claim, with the numbers behind them. |
+| `get_claim` | `row_id*`: string | Get one result in full: what it says, how well it is backed, and how it was computed. |
 <!-- /contract:consumer -->
 
 The consumer tools are designed against the PM agent:

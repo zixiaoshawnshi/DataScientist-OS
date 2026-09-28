@@ -20,8 +20,9 @@ Covered here:
 1. An MCP request with no Authorization header is rejected with 401, and the
    same request with the token from `<db dir>/daemon.token` is not. That also
    proves the token file is where the spec says it is.
-2. An authenticated fastmcp.Client over HTTP lists the ten producer tools at
-   /mcp/producer and zero tools at /mcp/consumer (WP-F1 adds four).
+2. An authenticated fastmcp.Client over HTTP lists the twelve producer tools
+   at /mcp/producer and the four consumer tools at /mcp/consumer, and the
+   consumer list is disjoint from the producer's.
 3. Two concurrent authenticated clients doing 20 save_artifact calls each
    produce 40 distinct rows, 40 FTS rows, and no error anywhere — see the
    note on serialisation below.
@@ -94,6 +95,9 @@ EXPECTED_PRODUCER_TOOLS = {
     "run_sql", "run_python", "get_lineage", "mark", "list_templates", "save_template",
     "close_question", "record_decision",
 }
+# The consumer surface (D6's four: WP-F1). Duplicated on the same terms as
+# the producer's list above.
+EXPECTED_CONSUMER_TOOLS = {"find_evidence", "get_claim", "cite", "ask"}
 
 CLIENTS = 2
 SAVES_PER_CLIENT = 20
@@ -242,10 +246,16 @@ async def mcp_scenario() -> list[dict]:
 
     async with Client(consumer_url, auth=DAEMON_TOKEN, timeout=180) as consumer:
         consumer_tools = await consumer.list_tools()
+    consumer_names = sorted(t.name for t in consumer_tools)
     check(
-        "the consumer profile is mounted and has no tools until WP-F1",
-        consumer_tools == [],
-        f"{len(consumer_tools)} tools: {', '.join(sorted(t.name for t in consumer_tools))}",
+        "the consumer profile is mounted and serves its four evidence tools",
+        set(consumer_names) == EXPECTED_CONSUMER_TOOLS,
+        f"{len(consumer_names)} tools: {', '.join(consumer_names)}",
+    )
+    check(
+        "the consumer endpoint serves none of the producer's tools",
+        not set(consumer_names) & set(names),
+        f"{sorted(set(consumer_names) & set(names))}",
     )
 
     began = time.perf_counter()

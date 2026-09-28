@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import re
 import sqlite3
 import uuid
@@ -785,6 +786,263 @@ def mark(
         "superseded_by": superseded_by,
         "validation": validation_status(conn, row_id),
     }
+
+
+# How the consumer profile is told a question was answered, and what a claim
+# was built from. Both are reads the consumer tools need and nothing else
+# does, so they live here rather than in a sibling module's private SQL.
+#
+# `questions.artifact_row_id` is the authoritative link — it is what
+# close_question writes, so it survives an artifact whose creating session has
+# since been one of many. The session's own `question` column is the fallback
+# for a row registered by a producer that never opened a question, and it is
+# the ONLY provenance a save_artifact outside any question has.
+def answered_question(conn: sqlite3.Connection, row_id: str) -> str | None:
+    """The question this artifact answered, by either route, or None.
+
+    The question row first (the question this row was registered as *the
+    answer to*), then the creating session's question. A row saved with no
+    question anywhere behind it has no stated question, and None says so
+    rather than inventing one.
+    """
+    row = conn.execute(
+        "SELECT question FROM questions WHERE artifact_row_id = ? "
+        "ORDER BY closed_at DESC, created_at DESC LIMIT 1",
+        (row_id,),
+    ).fetchone()
+    if row is not None and row["question"]:
+        return row["question"]
+    row = conn.execute(
+        "SELECT s.question AS question FROM artifacts a "
+        "JOIN sessions s ON s.id = a.session_id WHERE a.row_id = ?",
+        (row_id,),
+    ).fetchone()
+    return row["question"] if row is not None and row["question"] else None
+
+
+def derivation_steps(conn: sqlite3.Connection, row_id: str) -> list[dict]:
+    """`row_id` and its ancestors, roots first, each with its inputs and the
+    code that produced it.
+
+    Ordered topologically rather than by the BFS `get_lineage` returns, and
+    that ordering is the point: a PM reading a derivation needs to see the
+    dataset before the transform built on it, and a breadth-first walk from
+    the claim puts the claim's direct inputs first and its grandparents last
+    — the exact reverse of how the number was made. Kahn's algorithm over
+    the ancestor subgraph, ties broken by created_at so the order is stable.
+
+    `code` is the execution that produced the step, when there was one. A
+    hand-registered dataset has none, and that is provenance rather than a
+    gap: the key is present and None, so a reader can tell "registered by
+    hand" from "the code is missing from the record". The code is returned
+    whole — a PM is being told how a number was computed, and truncating it
+    would be exactly the kind of quiet softening this profile exists to
+    avoid.
+    """
+    rows = conn.execute(
+        """WITH RECURSIVE anc(row_id) AS (
+               SELECT ?
+               UNION
+               SELECT l.parent_row_id FROM lineage l JOIN anc ON l.child_row_id = anc.row_id
+           )
+           SELECT a.* FROM artifacts a JOIN anc ON a.row_id = anc.row_id""",
+        (row_id,),
+    ).fetchall()
+    by_id = {r["row_id"]: r for r in rows}
+    parents: dict[str, set[str]] = {rid: set() for rid in by_id}
+    for rid in by_id:
+        for edge in conn.execute(
+            "SELECT parent_row_id FROM lineage WHERE child_row_id = ?", (rid,)
+        ).fetchall():
+            if edge["parent_row_id"] in by_id:
+                parents[rid].add(edge["parent_row_id"])
+
+    ordered: list[dict] = []
+    placed: set[str] = set()
+    # Roots first: a step is emitted only once every one of its inputs inside
+    # this subgraph has been. A cycle would leave nodes unemitted; lineage is
+    # a DAG by construction (a row can only be saved after the rows it
+    # references exist), so this terminates.
+    ready = sorted(
+        (rid for rid, ps in parents.items() if not ps),
+        key=lambda rid: (by_id[rid]["created_at"], rid),
+    )
+    while ready:
+        rid = ready.pop(0)
+        if rid in placed:
+            continue
+        placed.add(rid)
+        row = by_id[rid]
+        execution = get_execution(conn, output_row_id=rid)
+        ordered.append({
+            "row_id": rid,
+            "type": row["type"],
+            "title": row["title"],
+            "source": json.loads(row["source"]) if row["source"] else None,
+            "kind": execution["kind"] if execution else None,
+            "code": execution["code"] if execution else None,
+        })
+        for child, ps in parents.items():
+            if rid in ps:
+                ps.discard(rid)
+                if not ps and child not in placed:
+                    ready.append(child)
+        ready.sort(key=lambda r: (by_id[r]["created_at"], r))
+    return ordered
+
+
+# How low an embedding similarity may be and still be called evidence.
+#
+# Read from the environment on every call rather than at import, for the
+# reason `spine.lease_minutes` reads its TTL there: a value cached at import
+# is a constant of whichever process imported first, and this one is a
+# calibration against whichever embedder is installed.
+#
+# The default is calibrated against the real model (all-MiniLM-L6-v2), where
+# a paraphrase of a stored finding scores around 0.6-0.7 and an unrelated
+# sentence scores near 0. It is NOT calibrated against the crc32 hash
+# fallback dsos/embeddings.py uses when sentence-transformers is absent, whose
+# similarities are not comparable to MiniLM's — so on a store embedded under
+# the fallback this number means less than it does on a store with the extra
+# installed. It is a floor for the semantic branch only; a keyword hit scores
+# the 1.0 sentinel and is never dropped by it, which is what keeps a claim
+# phrased in the words of a stored title findable on either backend.
+EVIDENCE_FLOOR_ENV = "DSOS_EVIDENCE_FLOOR"
+DEFAULT_EVIDENCE_FLOOR = 0.35
+
+# What a consumer is allowed to be shown evidence FOR. A dataset is a source
+# rather than a finding — it is what a claim was built from, which is what
+# get_claim's derivation reports — and skill/template are the consistency
+# layer, not results. Same exclusion as `_NOT_PRIOR_WORK` and for the same
+# reason, which is why it is spelled as a tuple of types rather than a
+# complement: this list is what a finding IS, and a new type should have to
+# be argued in rather than silently included.
+EVIDENCE_TYPES = ("query", "transform", "chart", "narrative", "decision")
+
+
+def evidence_floor() -> float:
+    """The semantic-similarity floor, from `DSOS_EVIDENCE_FLOOR` on every
+    call. An unset, unparseable or out-of-range value falls back to the
+    default: a typo in an env var must not silently turn off the floor (every
+    semantic hit, however unrelated) or invert it (no semantic hit ever)."""
+    raw = os.environ.get(EVIDENCE_FLOOR_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_EVIDENCE_FLOOR
+    try:
+        floor = float(raw)
+    except ValueError:
+        return DEFAULT_EVIDENCE_FLOOR
+    return floor if 0.0 <= floor <= 1.0 else DEFAULT_EVIDENCE_FLOOR
+
+
+def find_evidence(
+    conn: sqlite3.Connection, claim: str, *, top_k: int = 5,
+) -> list[tuple[Artifact, float, str]]:
+    """The stated results that speak to `claim`, as (artifact, score, match).
+
+    The consumer profile's search, and it is deliberately NOT
+    `search_artifacts` with different flags, because "what should I believe"
+    and "what have we got" are different questions with different tolerances:
+
+    - only the LATEST version of each logical artifact, `status='result'`, and
+      a type in `EVIDENCE_TYPES`. An exploratory row is a finding nobody has
+      claimed and a superseded one is a finding something replaced; showing
+      either to somebody deciding whether to back a number would be answering
+      a different question than the one they asked. They are not hidden from
+      the store — `get_claim` still reads them, with a warning.
+    - ranked exactly as `search_artifacts` ranks (keyword first on the 1.0
+      sentinel, embedding cosine as the fallback, newest first among ties),
+      so the two profiles cannot rank the same store two different ways.
+    - but the SEMANTIC branch is floored. A reader with no data and no
+      tolerance for a wrong number is worse served by a 0.1-cosine
+      near-miss than by an honest empty list, and unlike the producer there is
+      no semantic fallback behind this one to catch what the floor drops.
+    - and every hit reports which branch found it, so a `keyword` hit is a
+      literal term match and a `semantic` one is "the embedder thought these
+      were about the same thing" — a distinction the caller can act on and a
+      bare score cannot.
+
+    The floor is applied to the semantic branch only, and after ranking, so a
+    keyword hit is never dropped by a threshold calibrated for cosine.
+    """
+    type_where = "a.type IN ({})".format(",".join("?" * len(EVIDENCE_TYPES)))
+    # status='result' written out rather than assembled from
+    # _lifecycle_sql's two negations: that function answers "hide these two",
+    # this one asks "show me exactly this one", and only the second is
+    # robust to a status being added to the vocabulary.
+    eligible = f"{type_where} AND a.status = 'result'"
+
+    ordered: list[Artifact] = []
+    scores: list[float] = []
+    matches: list[str] = []
+    seen: set[str] = set()
+
+    fts_query = _fts_query(claim)
+    if fts_query:
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT a.* FROM artifacts_fts
+                JOIN artifacts a ON a.row_id = artifacts_fts.row_id
+                {_LATEST_VERSION_JOIN}
+                WHERE artifacts_fts MATCH ? AND {eligible}
+                ORDER BY a.created_at DESC, bm25(artifacts_fts)
+                LIMIT ?
+                """,
+                [fts_query, *EVIDENCE_TYPES, top_k],
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = []  # malformed FTS syntax from raw claim text
+        for row in rows:
+            art = _row_to_artifact(row, load_content=False)
+            ordered.append(art)
+            scores.append(1.0)
+            matches.append("keyword")
+            seen.add(art.row_id)
+
+    if len(ordered) < top_k:
+        rows = conn.execute(
+            f"SELECT a.* FROM artifacts a {_LATEST_VERSION_JOIN} WHERE {eligible}",
+            EVIDENCE_TYPES,
+        ).fetchall()
+        floor = evidence_floor()
+        q_vec = embeddings.embed(claim)
+        semantic = [
+            (_row_to_artifact(row, load_content=False), embeddings.cosine_sim(q_vec,
+             np.frombuffer(row["embedding"], dtype=np.float32)))
+            for row in rows if row["row_id"] not in seen
+        ]
+        semantic.sort(key=lambda pair: (pair[1], pair[0].created_at), reverse=True)
+        for art, score in semantic[: top_k - len(ordered)]:
+            if score < floor:
+                # Sorted descending, so the first one under the floor ends
+                # the branch rather than being skipped over.
+                break
+            ordered.append(art)
+            scores.append(score)
+            matches.append("semantic")
+
+    return list(zip(ordered, scores, matches))
+
+
+def unfinished_questions(
+    conn: sqlite3.Connection, statuses: tuple[str, ...] = ("open", "in_progress"),
+) -> list[sqlite3.Row]:
+    """Every question in `statuses`, newest first.
+
+    A whole-table scan of a small table, and it is one for the same reason
+    `spine.related_questions` has one: SQLite has no case-folding or
+    whitespace-collapsing function, so a "same question" comparison has to
+    happen in Python, and a question is a row per top-level question rather
+    than per artifact. The consumer's `ask` compares normalised text against
+    these; the normalisation itself is `spine.normalise_question_text`, which
+    is not re-implemented here (TTD U4's argument, one rule one spelling).
+    """
+    return conn.execute(
+        f"SELECT * FROM questions WHERE status IN ({','.join('?' * len(statuses))}) "
+        f"ORDER BY created_at DESC, rowid DESC",
+        statuses,
+    ).fetchall()
 
 
 def get_artifact(

@@ -12,7 +12,9 @@ two servers over two stores and importing the server opened a database.
 
 from __future__ import annotations
 
+import contextvars
 import json
+import sqlite3
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _installed_version
@@ -104,6 +106,161 @@ class ToolCallLogger(Middleware):
                     payload.get("artifact_row_ids", []),
                 )
         return result
+
+
+# The dsos session a consumer tool call belongs to, published by
+# ConsumerSessions for the duration of the call. A ContextVar rather than an
+# argument because the consumer tools take NO session_id (D12): a reader with
+# no session to manage has nothing to pass one for, and a parameter they
+# would have to invent would be a parameter they get wrong.
+_CONSUMER_SESSION: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "dsos_consumer_session", default=None
+)
+
+# The key used when the transport gives no per-client session id. One consumer
+# session for the whole server process, which is the honest reading of "this
+# client has no session": attributing every such call to one row keeps them
+# countable rather than dropping them or inventing a session per call.
+_PROCESS_SESSION_KEY = "\x00process"
+
+
+def consumer_session_id() -> str:
+    """The dsos session id for the consumer call in progress.
+
+    Only valid inside a tool call on a server carrying `ConsumerSessions`,
+    which is every server `build_consumer` produces. Raises rather than
+    returning a plausible id if it is not, because every use of it is a
+    write attributed to somebody: a wrong id here is a tool call logged
+    against a session that never asked the question.
+    """
+    session_id = _CONSUMER_SESSION.get()
+    if session_id is None:
+        raise RuntimeError(
+            "no consumer session is active for this call. The consumer tools "
+            "only work on a server built by dsos.server.build_consumer, which "
+            "registers the ConsumerSessions middleware."
+        )
+    return session_id
+
+
+class ConsumerSessions(Middleware):
+    """D12: every consumer call is logged, against a session of its own.
+
+    The producer's log works because every producer tool takes a `session_id`
+    the agent obtained from `start_session`. A consumer has no such call to
+    make — `start_session` is not on its surface, and giving it one would put
+    a producer tool on a profile whose whole reason to exist is that a PM
+    never pays for `run_python`. So the session is established here, from the
+    MCP client session, and the tools read it rather than being handed it.
+
+    One `sessions` row per client session, with `kind='consumer'` and a
+    question of `consumer: <client>` so the GUI and the reuse metric can tell
+    a reader's session from a worker's without reading the tool log. Every
+    call is then logged against it, which is what makes "how often does a PM
+    come back to this store" a number the store can produce (D12).
+
+    This replaces `ToolCallLogger` on the consumer profile rather than
+    sitting beside it: that one keys off a `session_id` argument, which no
+    consumer tool has, so it would log nothing at all.
+
+    The session row is inserted here rather than through `store.py` because
+    this WP's ownership of that file is read helpers only. That is a layering
+    seam and is recorded as one, the same shape as TTD U3: the natural home
+    for this INSERT is `store.py` beside `start_session`, and it should move
+    there the next time a WP owns the file for another reason.
+    """
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+        # client session key -> dsos session id. One entry per client session
+        # for the life of the process, and the only reason the INSERT below
+        # runs once rather than per call. A plain dict is safe: the event loop
+        # is single-threaded and the check-then-insert has no await in it.
+        self._sessions: dict[str, str] = {}
+
+    async def on_call_tool(self, context, call_next):
+        ctx = context.fastmcp_context
+        key, client = self._client(context)
+        session_id = self._sessions.get(key) or self._open_session(key, client)
+
+        args = context.message.arguments or {}
+        # Set before the tool runs and reset after, so a tool that raises
+        # cannot leave a stale id visible to the next call on this context.
+        token = _CONSUMER_SESSION.set(session_id)
+        try:
+            result = await call_next(context)
+        finally:
+            _CONSUMER_SESSION.reset(token)
+
+        payload = getattr(result, "structured_content", None) or {}
+        with self._db.write() as conn:
+            store.log_tool_call(
+                conn,
+                session_id,
+                context.message.name,
+                args,
+                json.dumps(payload, default=str)[:300],
+                payload.get("artifact_row_ids", []),
+            )
+        return result
+
+    def _client(self, context) -> tuple[str, str]:
+        """(the key to attribute calls under, the client's name).
+
+        `ctx.session_id` is the per-client session on every transport FastMCP
+        supports here; the fallback is for a request context that has no
+        session at all, where attributing to one process-wide row is more
+        honest than dropping the call or minting a session per call.
+        """
+        ctx = context.fastmcp_context
+        try:
+            key = ctx.session_id
+        except RuntimeError:
+            key = _PROCESS_SESSION_KEY
+        return key, _client_name(ctx)
+
+    def _open_session(self, key: str, client: str) -> str:
+        with self._db.write() as conn:
+            session_id = _insert_consumer_session(conn, client)
+        self._sessions[key] = session_id
+        return session_id
+
+
+def _client_name(ctx) -> str:
+    """The MCP client's `clientInfo.name`, or a stand-in for one.
+
+    Both spellings are tried because the field has been `clientInfo` and
+    `client_info` across MCP SDK versions, and pinning either one would make
+    `client` null on the other. `clientInfo` is a client-supplied free string,
+    so it is clipped rather than trusted: it lands in a `sessions.question`
+    column that the GUI renders.
+    """
+    try:
+        params = ctx.session.client_params
+    except (AttributeError, RuntimeError):
+        params = None
+    for attribute in ("client_info", "clientInfo"):
+        info = getattr(params, attribute, None) if params is not None else None
+        name = getattr(info, "name", None) if info is not None else None
+        if name:
+            return str(name)[:80]
+    return "unknown client"
+
+
+def _insert_consumer_session(conn: sqlite3.Connection, client: str) -> str:
+    """The `kind='consumer'` row, and its id. See ConsumerSessions for why
+    this INSERT is here rather than in store.py."""
+    session_id = store._new_id()
+    conn.execute(
+        """INSERT INTO sessions (id, question, started_at, kind, client)
+           VALUES (?, ?, ?, 'consumer', ?)""",
+        (session_id, f"consumer: {client}", store._now(), client),
+    )
+    # Committed here, not left to the caller: `db.write()` is a Python lock,
+    # not a transaction boundary (TTD U6), so an uncommitted write here would
+    # hold a RESERVED lock on the file and lock out every other thread.
+    conn.commit()
+    return session_id
 
 
 def with_inline_image(payload: dict, art: store.Artifact):

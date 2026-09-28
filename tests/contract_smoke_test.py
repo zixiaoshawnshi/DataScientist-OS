@@ -19,13 +19,12 @@ Three things this pins down:
 
 1. The producer block equals `render(build_producer(config))` — a
    mismatch prints a diff and names the one command that fixes it.
-2. The consumer block equals `render(build_consumer(config))` and is
-   currently **an empty table**. build_consumer has no tools until WP-F1
-   (find_evidence/get_claim/cite/ask), and that is the honest rendering of
-   the registry, not a gap to be papered over: a placeholder row here would
-   go stale the moment F1 lands, which is exactly the failure this WP
-   exists to prevent. When F1 adds the tools, the block fills in and this
-   same check keeps it honest.
+2. The consumer block equals `render(build_consumer(config))` and has one
+   row per registered tool. It was **an empty table** until WP-F1 put
+   find_evidence/get_claim/cite/ask on the profile, and the honest rendering
+   of the registry is what it was and is: a placeholder row would have gone
+   stale the moment F1 landed, which is exactly the failure this WP exists to
+   prevent. The same registry-relative check now covers both profiles.
 3. `--write` is idempotent. Running it twice produces no second diff — a
    generator that isn't idempotent makes this test flaky in a way that is
    hard to diagnose much later, when someone changes a docstring and gets
@@ -111,22 +110,24 @@ def main() -> None:
                 "consumer", doc_text, consumer_table)
 
     # Rows in a rendered table, excluding the header and the `|---|` rule.
-    # Counted the same way for both profiles so the empty consumer case and
-    # the populated producer case cannot disagree about what a "row" is.
+    # Counted the same way for both profiles so the two cannot disagree about
+    # what a "row" is.
     def rows_of(table: str) -> list[str]:
         return [
             ln for ln in table.splitlines()
             if ln.startswith("|") and not ln.startswith("|---") and "tool |" not in ln
         ]
 
-    # The consumer profile carries no tools until WP-F1, so its generated
-    # table is a header with no rows. Asserted rather than assumed: this is
-    # the assertion that will fail loudly (and correctly) when F1 lands and
-    # someone forgets to regenerate, and the one that would fail if a
-    # placeholder row had crept in to make the doc look finished.
-    check("the consumer table is empty — zero tools until WP-F1",
-          rows_of(consumer_table) == [],
-          f"{len(rows_of(consumer_table))} row(s)")
+    # Both blocks now have one row per registered tool. The consumer half used
+    # to assert the table was EMPTY ("zero tools until WP-F1"), which was the
+    # assertion that failed loudly when F1 landed and the doc had not been
+    # regenerated. It is kept in the same registry-relative form as the
+    # producer's below — a row count, not a name list, so the next WP that
+    # changes a signature does not have to edit a second source of truth.
+    check("the consumer block has a row per registered tool",
+          len(rows_of(consumer_table)) == len(contract._list_tools(consumer)),
+          f"{len(rows_of(consumer_table))} row(s), "
+          f"{len(contract._list_tools(consumer))} tool(s)")
 
     # The producer side is not asserted by name here on purpose:
     # tests/surface_smoke_test.py already pins the exact tool set, and

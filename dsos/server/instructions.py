@@ -66,18 +66,41 @@ for get_artifact/run_sql/run_python's input_row_ids; there is no separate \
 
 # The consumer profile is the other direction through the same store: it
 # never computes anything, it only asks what has already been computed and
-# cites what it is told. It is built here with the right shape and no tools
-# at all, because the four evidence tools are WP-F1's — and F1 owns this
-# string too, so what is here says what is true today rather than
-# describing tools an agent would then fail to call.
-CONSUMER_INSTRUCTIONS = (f"{_UPDATE_NOTICE}\n\n" if _UPDATE_NOTICE else "") + """\
-This server is a read-only window onto a DS Artifact OS store: a working \
-layer where earlier analysis sessions registered the datasets, queries, \
-charts and write-ups they computed, each with the question it answered and \
+# cites what it is told. WP-F1 put the four tools on it, and this string is
+# that agent's first and only orientation — there is no CLAUDE.md in a PM's
+# repo to point at it — so it says the two things a first call has to get
+# right: search before concluding there is nothing, and read `warning` on
+# every hit.
+CONSUMER_INSTRUCTIONS = (f"{_UPDATE_NOTICE}\n\n"
+    if _UPDATE_NOTICE else "") + """\
+This server is a read-only window onto a DS Artifact OS store: a working
+layer where earlier analysis sessions registered the datasets, queries,
+charts and write-ups they computed, each with the question it answered and
 the rows it was built from. It never fetches, computes or saves anything.
 
-It currently exposes no tools: the evidence tools that read this store \
-(find_evidence, get_claim, cite, ask) arrive with WP-F1, and until they do \
-there is nothing here to call. Use the producer server over the same store \
-if you need to compute something.
+You are here to decide whether to believe a number. Every number here was
+computed by somebody else, and some of them were later found to be wrong.
+Nothing in this store is on your authority alone.
+
+Workflow, in order:
+1. find_evidence(claim) — the claim as you would state it. This is the first
+call for anything you intend to repeat, and an empty result is a real answer
+rather than a failure.
+2. Read `validation` and `warning` on every hit before you quote one. A result
+later marked `contradicted` is returned to you on purpose — hiding it would
+make the tool useless exactly when it matters — so the label is your only
+signal, and it arrives as a `warning` string in the payload rather than
+something you have to know to go looking for.
+3. get_claim(row_id) when a hit is load-bearing: the finding, its caveats and
+confidence, its validation history with each verdict's basis, and the full
+derivation from the source dataset through the code that computed it.
+4. cite(row_id) for the reference line to paste into a document. It is not a
+gate — you can cite a superseded row, and should, when you need to explain
+what changed — but it returns that row's status and validation with it, and
+dropping those is how a retracted number gets quoted again.
+5. ask(question, context=...) when no evidence exists, or when what exists
+does not settle it. That opens a question an analysis agent picks up; it is
+not a computation and nothing waits on it. Say in `context` what you already
+know and what decision the answer is for. Asking the same question twice
+returns the one already open.
 """

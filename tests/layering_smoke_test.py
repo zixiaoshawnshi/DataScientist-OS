@@ -183,12 +183,18 @@ async def _two_producers_two_stores() -> list[str]:
         tools_a = await producer_a.list_tools()
         if len(tools_a) != 12:
             problems.append(f"producer A exposes {len(tools_a)} tools, not 12")
-        # Zero tools until WP-F1 adds the four; asserted here because a
-        # consumer that accidentally inherited the producer's registrations
-        # would be invisible in every other test.
         consumer_tools = await build_consumer(config_a).list_tools()
-        if consumer_tools:
-            problems.append(f"the consumer exposes {len(consumer_tools)} tools, not 0")
+        # Asserted here because a consumer that accidentally inherited the
+        # producer's registrations would be invisible in every other test.
+        # It asserted ZERO for the whole of the producer's life, which is a
+        # count that had to be edited by whoever added the first consumer
+        # tool; what the check is actually for is that the two surfaces do
+        # not bleed into each other, so that is what it says now.
+        leaked = sorted({t.name for t in consumer_tools} & {t.name for t in tools_a})
+        if leaked:
+            problems.append(f"the consumer exposes the producer's {leaked}")
+        if not consumer_tools:
+            problems.append("the consumer exposes no tools at all")
 
         async with Client(producer_a) as client:
             r = await client.call_tool("start_session", {"question": "isolation check"})
