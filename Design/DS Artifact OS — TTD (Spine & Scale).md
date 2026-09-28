@@ -34,7 +34,7 @@ These resolve ambiguities in Doc II so that agents don't each resolve them diffe
 | D3 | **Default status:** `run_sql`/`run_python` output → `exploratory`; `save_artifact` → `result`; decisions → `result`. | Computation is exploratory until claimed. A deliberate registration is a claim. |
 | D4 | **Inputs are bound as `in_1..in_N`** (in `input_row_ids` order) in both SQL and Python. Python also gets `inputs: dict[row_id, object]`. Names derived from titles are gone. | Removes the digit-leading, title-collision and title-rename bug classes. |
 | D5 | **`scratch=True` stays**, but without the cache, `scratch_id` or promotion. | It's still useful for quick checks. Promotion is replaced by `status`. |
-| D6 | **Producer tools (10):** `start_session`, `search_artifacts`, `get_artifact`, `save_artifact`, `run_sql`, `run_python`, `get_lineage`, `mark`, `close_question`, `record_decision`. **Consumer tools (4):** `find_evidence`, `get_claim`, `cite`, `ask`. | `mark` covers both the status change and appending a validation, so there's one tool rather than two. |
+| D6 | **Producer tools (11):** `start_session`, `search_artifacts`, `get_artifact`, `save_artifact`, `run_sql`, `run_python`, `get_lineage`, `mark`, `close_question`, `record_decision`, `save_template`. **Plus `list_templates` for discovery (12).** **Consumer tools (4):** `find_evidence`, `get_claim`, `cite`, `ask`. | `mark` covers both the status change and appending a validation, so there's one tool rather than two. `save_template`/`list_templates` were cut in WP-B2 and restored by the maintainer's decision in U1: a shared chart style and a house report layout are the reuse case the store exists for. `publish_report` did **not** come back — the GUI report route already consumes report templates. |
 | D7 | **`superseded` rows are hidden from search once WP-E2 lands.** `exploratory` rows are hidden only at cutover (WP-G1). | A superseded row was explicitly marked, so hiding it is safe. Hiding exploratory rows changes what agents see, so it goes last. |
 | D8 | **Concurrency:** one `Database` per process, one SQLite connection per thread, and a process-wide write lock. **One daemon per store**, enforced by `daemon.json`. | A single `sqlite3` connection shared across FastMCP's thread pool is not safe once there are concurrent clients. |
 | D9 | **The daemon serves the GUI.** The GUI stays read-only and needs no auth on loopback. The MCP endpoints require a bearer token. | `cite` URLs have to open in a browser. GUI auth is deferred. |
@@ -226,6 +226,32 @@ The wave table below is a **schedule, not a claim that every cell is safe to par
 4. A legacy store containing an `error` artifact row migrates cleanly, and that row stays hidden.
 
 ---
+
+### WP-B2R — Restore templates (after B2, before C1; supersedes part of B2)
+
+**Owns:** `dsos/mcp_server.py` (`save_template` and `list_templates` only), `dsos/templating.py` (the agent-facing error strings only), `tests/surface_smoke_test.py` (the tool-count expectation), `tests/skills_templates_smoke_test.py`, `tests/publish_smoke_test.py`
+
+**Why this exists:** the maintainer reversed the templates half of WP-B2's trim — see U1. Everything in U1's scope note applies. WP-B2R must run **before WP-C1**, because both own `dsos/mcp_server.py`.
+
+**Spec**
+- Re-register `save_template` and `list_templates` on the producer server. Both were thin MCP wrappers over `templating.py` functions that still exist, so the prior implementations are recoverable from git (`git show 5c363d6^:dsos/mcp_server.py`) — use them as the starting point rather than rewriting from scratch. **Read them before writing anything.**
+- `save_template` keeps the whole prior contract: `kind` (`chart-style` | `report`), `content` or `base`, `artifact_id` for re-versioning, `title`/`description`/`tags`, and **validation at save time** via `validate_chart_style_text` / `validate_report_template_text` so a bad template fails in one call rather than at render time.
+- `list_templates` keeps the prior contract: built-ins plus customs, optionally filtered by `kind`.
+- **Fix the U1 dead-end.** `resolve_chart_style`'s "none saved yet — create one with save_template" and its three sibling strings now name a tool that exists again, so re-check each of the four (`templating.py:105`, `:121`, `:156`, `:263`) and make the wording correct. Where a string refers to `list_templates` to discover what exists, that is right again. Where it offers creation, that is right again. Do not leave a string referring to `publish_report` as an MCP tool, because that tool is **not** coming back — point report-template guidance at the GUI report route instead, which is what actually consumes them.
+- **Do not restore `list_skills`, `save_skill`, `publish_report`, `promote_scratch`, or re-enable seeding.** Those cuts stand. A restored `save_template` must not require the store to be seeded.
+- `INSTRUCTIONS` gains back a short templates step, and keeps its `scratch=True` mention and its current shape otherwise.
+- **Update `tests/surface_smoke_test.py`:** `EXPECTED_TOOLS` becomes the 9-tool set. The other three assertions in that file (no `scratch_id`, zero skill rows after `start_session`, untyped search excluding skills) are **still correct and must keep passing unchanged** — this WP restores templates, not skills.
+
+**Tests (write first)**
+1. `list_tools()` returns exactly the 9 producer tools — the prior 7 plus `save_template` and `list_templates`.
+2. A saved chart-style template is listed by `list_templates(kind="chart-style")` and resolves from `run_python(style=<row_id>)`.
+3. A saved report template is listed by `list_templates(kind="report")` and resolves through the GUI's report route.
+4. An invalid chart style fails **at save time** with a one-call error, not at use time.
+5. Re-versioning on the same `artifact_id` keeps existing references resolving (`base_template_content` and `resolve_chart_style` still find it).
+6. `list_templates` with no `kind` lists both kinds and the built-ins; a bad `kind` is rejected with the allowed set.
+7. A fresh store is still unseeded: no `skill` rows, and `list_skills` is still absent from the tool list.
+
+**Done when** the 9-tool assertion holds, the four `templating.py` strings are correct, and the store is still not seeded.
 
 ## Lane C — structure
 
@@ -507,25 +533,19 @@ All three WPs live in `benchmark/`, now tracked on `feature/spine-and-scale` and
 
 These are real, and none of the WPs below owns the file they live in. Recorded here so they are not lost, not handed to an agent silently, and not fixed by whoever happens to be editing nearby.
 
-### U1 — a live dead-end in a removed tool's error message
+### U1 — RESOLVED (Sep 27, maintainer): templates stay
 
-WP-B2 removed `save_template` and `list_templates` from the MCP surface but, correctly, left `templating.py` alone. One of its error strings is still reachable from `run_python(style=...)`, which stays. Verified by hand against the merged branch:
+**Decision: templates come back on the producer surface.** The maintainer's reason: a consistent chart style and a house report layout are genuinely useful to someone working a DS workstream across sessions, and that is the reuse case the store is for. This overrides §MVP scope's decision to defer skills and templates, for **templates only**.
 
-```
-$ run_python(..., output_type="chart", style="nonexistent_style")
-status = error
-error  = ValueError: unknown chart style 'nonexistent_style'. Built-ins: dsos, minimal, report.
-         Custom chart-style templates: (none saved yet — create one with save_template)
-```
+**Scope of the reversal, and why it is two tools and not three:**
 
-The agent is told to call a tool it does not have. Two other strings have the same shape (`templating.py:105`, `:121`, `:156`, `:263`).
+- `save_template` and `list_templates` come back as producer tools. Nothing is lost by putting them back: `templating.py` still holds every library function they need (`validate_chart_style_text`, `validate_report_template_text`, `base_template_content`, `template_kind`, `template_tags`), so this is restoring a thin MCP wrapper, not rebuilding anything.
+- `list_templates` is **not** redundant with `search_artifacts`. Search filters on `query` + `type` and has no tag filter, while `list_templates(kind=...)` filters on the kind tag. A rank-based search is also the wrong tool for "list every chart style in the store".
+- **`publish_report` does NOT come back, and this is deliberate.** Report templates look orphaned, but they are not: `dsos/gui.py`'s report route calls `render_report_html(conn, row_id, template=template)`, which resolves through `templating.resolve_report_template`. So a report template created by an agent is consumable by the GUI's report page today, with no dead end. Restoring `publish_report` would add a tool definition to every turn of every agent to serve a use the GUI already covers. If a producer agent later needs to render a report itself, that is the moment to add it — as a deliberate cost, not as a side effect of restoring templates.
+- **Skills stay out.** `list_skills`/`save_skill` remain removed and the store is no longer seeded. The maintainer asked for templates; skills-as-shareable-bundles stays deferred for the reason §MVP scope gives (author, version, origin, portable export).
+- **The `templating.py` error strings are fixed as part of the restoration** (see the WP below), so the dead-end that started this is closed rather than papered over.
 
-**This is a product decision, not a string edit, so it is not being fixed unilaterally.** The question is whether a producer agent may create a chart-style template *at all* now. Two defensible answers:
-
-- **Templates are read-only on this surface.** The message names the built-ins and says custom styles from an earlier session still resolve but cannot be created here. Consistent with skills/templates being deferred in §MVP scope.
-- **Creation moves to another surface** (GUI, or direct registration), and the message points there.
-
-Whichever is chosen, `templating.py`'s chart-style and report-template error strings need it. Until then an agent that mistypes a style name is sent to a tool that does not exist.
+**Cost, stated plainly:** the producer surface goes 7 -> 9 now, and 10 -> 12 at the full D6 list. Doc II's measured 25% premium is the reason the trim happened at all, so this spends part of it back. That is a trade the maintainer has chosen knowingly, not an oversight.
 
 ### U2 — stale `FINDABILITY_TOOLS` in the benchmark
 
