@@ -267,7 +267,7 @@ The wave table below is a **schedule, not a claim that every cell is safe to par
 
 ### WP-D1 — One daemon owns the store (after C1)
 
-**Owns:** `dsos/daemon.py` (new), `dsos/gui.py`, `pyproject.toml` (pin `fastmcp>=4.0`), `tests/daemon_smoke_test.py` (new)
+**Owns:** `dsos/daemon.py` (new), `dsos/gui.py`, `dsos/store.py` (`failed_executions` only — see U3), `pyproject.toml` (pin `fastmcp>=4.0`), `tests/daemon_smoke_test.py` (new)
 
 **Spec**
 - **Entry point:** `python -m dsos.daemon [--host 127.0.0.1] [--port 8765]`, also configurable via env `DSOS_PORT`. **Refuse any non-loopback `--host`** with "remote access is not supported yet" (see Doc II open question 5).
@@ -347,6 +347,7 @@ The wave table below is a **schedule, not a claim that every cell is safe to par
   - `status` must be one of `exploratory|result|superseded`.
   - `caveats` is a list of at most **5** strings, each at most **200** chars. Otherwise raise "caveats are short properties of a result; write a narrative for longer notes".
   - `confidence` is a list of `{claim, level: high|medium|low, basis}`, and `basis` is required and must be non-empty. Requiring a basis is the guard against "high" every time.
+  - **Every writer must pass `status` explicitly from this WP onward — none may rely on the column default.** WP-E1 left `DEFAULT 'ready'` in M1 deliberately, to keep fresh and migrated stores schema-identical. The consequence is a live inconsistency: after M3, a *migrated* store's old rows read `result`, while a row written by the current `save_artifact` still reads `ready`, because its Python default is unchanged. Nothing in the suite depends on it today, which is exactly why it is dangerous. This WP is where the writers change, so this is the moment to decide: make `status` required (or default it to `exploratory` in the Python signature) and, if the column default is worth changing at all, change it here in M4 where fresh and migrated stores stay in step.
   - Add `decision` to `ARTIFACT_TYPES`.
 - **The `run_sql`/`run_python` tools** gain `status="exploratory"`. **The `save_artifact` tool** gains `status="result"`, `caveats` and `confidence`.
 - **`mark(row_id, session_id, status=None, verdict=None, basis=None, superseded_by=None)`:**
@@ -529,6 +530,15 @@ Whichever is chosen, `templating.py`'s chart-style and report-template error str
 ### U2 — stale `FINDABILITY_TOOLS` in the benchmark
 
 `benchmark/metrics.py:47` and `benchmark/report.py:50` both list `list_skills` and `list_templates` in `FINDABILITY_TOOLS`. Dead since WP-B2. Harmless — a removed tool cannot appear in a transcript, so it is never counted — but wrong, and it will mislead anyone reading the findability numbers. **Belongs to the next Lane H WP (H2).**
+
+### U3 — a raw SQL query living in `gui.py`
+
+WP-B3 needed the session-detail page to list that session's failed executions. Its `store.py` ownership is `get_execution` only, so rather than widen the WP it put a small `conn.execute` in `dsos/gui.py` and flagged the gap instead. Correct call under rule 3, and the gap is real:
+
+- §Refactor plan says `store.py` "is doing a coherent persistence job and is the layer the GUI already reads". SQL in the GUI route contradicts that, and it is the first crack in the layering WP-C1 is about to enforce.
+- The natural home is `store.failed_executions(conn, session_id) -> list[Execution]`, sitting next to the `get_execution` B3 already added.
+
+**Assigned to WP-D1**, which owns `dsos/gui.py` and is already a `gui.py` refactor (into `create_gui_router`). Move the query into `store.py` there and add it to D1's `Owns` note. It is small; the point is that it should not survive to the daemon, where the GUI becomes a mounted router over a shared `Database`.
 
 ## Out of scope for this TTD
 
