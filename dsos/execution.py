@@ -21,11 +21,6 @@ of it. Either way the result flows back through the same save/record/
 lineage path — see dsos/sandbox.py. code_paths=[...] (unpackaged local
 modules) is wired into the subprocess wrapper's sys.path.
 
-A scratch run's result is cached in-process under a scratch_id
-(_SCRATCH_CACHE); promote_scratch() persists it later through the exact
-same save/record/lineage tail (_persist_run) a non-scratch call would have
-used, without re-executing anything (feedback #4, this round).
-
 A run_python `result` that's a matplotlib Figure/Axes (the natural shape of
 a chart cell) is rendered to PNG bytes automatically (feedback #2, this
 round) — see sandbox.py's wrapper template, which is the only place this
@@ -39,7 +34,6 @@ import io
 import sqlite3
 import traceback
 import uuid
-from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any
 
@@ -51,15 +45,6 @@ from dsos.store import Artifact, get_artifact_by_row_id, save_artifact
 
 _STDOUT_LIMIT = 2_000
 _STDERR_LIMIT = 4_000  # tail-capped: the traceback's final frames are the useful ones
-
-# scratch=True (feedback #8) never persists — by design. But that meant
-# promoting a scratch result that turned out useful required re-running the
-# code (feedback #4, this round). This in-memory, per-process cache lets a
-# scratch run be persisted from its scratch_id, without re-executing
-# anything. Capped and LRU-evicted since it's process memory, not storage:
-# lost on restart, and never grows unbounded across a long session.
-_SCRATCH_CACHE: "OrderedDict[str, dict]" = OrderedDict()
-_SCRATCH_CACHE_MAX = 200
 
 
 def _now() -> str:
@@ -159,35 +144,27 @@ def _record_execution(
     return exec_id
 
 
-def _scratch_payload(
-    run: dict, inputs: list[Artifact], *, kind: str, code: str, title: str, description: str,
-    output_type: str = "transform",
-) -> dict:
+def _scratch_payload(run: dict, inputs: list[Artifact]) -> dict:
     """The inline response for a scratch run: same shape as a persisted
     run's payload (status/stdout/result preview), minus anything that
     implies an artifact exists, plus scratch=True.
 
-    Also caches the run (feedback #4) under a scratch_id, so a later
-    promote_scratch call can persist it as a real artifact without
-    re-running the code."""
+    A scratch run is not promotable: if a check turns out to be worth
+    keeping, re-run it with scratch=False. There is deliberately no id and
+    no in-process cache behind it (WP-B2) — a cached result that outlived
+    the process was a second, invisible copy of the store's truth, and the
+    input order it cached was the only correct in_1/in_2 mapping (the
+    promotion path rebuilt it from lineage order instead, which need not
+    match)."""
     from dsos import present
 
     input_row_ids = [a.row_id for a in inputs]
     input_tables = input_aliases(inputs)
-    scratch_id = uuid.uuid4().hex
-    _SCRATCH_CACHE[scratch_id] = {
-        "kind": kind, "code": code, "title": title, "description": description,
-        "output_type": output_type, "input_row_ids": input_row_ids, "run": run,
-    }
-    _SCRATCH_CACHE.move_to_end(scratch_id)
-    while len(_SCRATCH_CACHE) > _SCRATCH_CACHE_MAX:
-        _SCRATCH_CACHE.popitem(last=False)
 
     payload: dict[str, Any] = {
         "status": run["status"],
         "stdout": run["stdout"][:_STDOUT_LIMIT],
         "scratch": True,
-        "scratch_id": scratch_id,
         "input_tables": input_tables,
         "artifact_row_ids": list(input_row_ids),
     }
@@ -205,10 +182,8 @@ def _persist_run(
     code: str,
 ) -> str:
     """Save a run's result as a new artifact, lineage-linked to its inputs,
-    and record the execution — the shared tail of run_sql/run_python's
-    persisted path and promote_scratch (feedback #4), so promoting a cached
-    scratch run goes through the exact same save/record path a fresh
-    non-scratch run would."""
+    and record the execution — the shared tail of run_sql and run_python's
+    persisted path, so both write an artifact the same way."""
     status, error, result = run["status"], run["error"], run["result"]
     output_format = _infer_format(result) if status == "ok" else "parquet"
     output_row_id = save_artifact(
@@ -222,32 +197,6 @@ def _persist_run(
         output_summary=_output_summary(result),
     )
     return output_row_id
-
-
-def promote_scratch(
-    conn: sqlite3.Connection, *, scratch_id: str, session_id: str,
-    title: str, description: str,
-) -> str:
-    """Persist a previously-run scratch=True result as a real artifact,
-    without re-running its code (feedback #4) — the "spike, then keep it"
-    shortcut. `title`/`description` may differ from the original scratch
-    call's (the agent gets to name it properly now that it's staying).
-
-    Raises ValueError if scratch_id is unknown — either it never existed,
-    or it aged out of the cache (capped at the most recent
-    _SCRATCH_CACHE_MAX scratch runs, per server process)."""
-    entry = _SCRATCH_CACHE.pop(scratch_id, None)
-    if entry is None:
-        raise ValueError(
-            f"no cached scratch run with scratch_id {scratch_id!r} — it may have "
-            "aged out (this cache is per-process and capped) or already been "
-            "promoted. Re-run with scratch=False instead."
-        )
-    return _persist_run(
-        conn, kind=entry["kind"], run=entry["run"], input_row_ids=entry["input_row_ids"],
-        session_id=session_id, title=title, description=description,
-        output_type=entry["output_type"], started_at=_now(), code=entry["code"],
-    )
 
 
 def run_sql(
@@ -291,8 +240,7 @@ def run_sql(
     run = {"status": status, "error": error, "stderr": stderr_text,
            "stdout": stdout.getvalue(), "result": result}
     if scratch:
-        return _scratch_payload(run, inputs, kind="sql", code=code, title=title,
-                                 description=description, output_type="query")
+        return _scratch_payload(run, inputs)
 
     return _persist_run(
         conn, kind="sql", run=run, input_row_ids=input_row_ids, session_id=session_id,
@@ -356,8 +304,7 @@ def run_python(
                "stdout": "", "stderr": traceback.format_exc(), "result": pd.DataFrame()}
 
     if scratch:
-        return _scratch_payload(run, inputs, kind="python", code=code, title=title,
-                                 description=description, output_type=output_type)
+        return _scratch_payload(run, inputs)
 
     return _persist_run(
         conn, kind="python", run=run, input_row_ids=input_row_ids, session_id=session_id,

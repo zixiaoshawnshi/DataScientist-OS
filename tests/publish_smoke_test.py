@@ -1,8 +1,13 @@
-"""Layer-2b smoke test: publish_report, over the MCP wire (same pattern as
+"""Layer-2b smoke test: publishing, at the library level (same pattern as
 tests/mcp_smoke_test.py). Builds a narrative that embeds both a tabular
 artifact and a chart, publishes it, and checks the rendered HTML actually
 contains the substituted table/image rather than the raw {{artifact:...}}
 markers.
+
+The artifacts are still registered over MCP — that is the part a real
+session does — but the publish itself goes through dsos.publish directly:
+publish_report is no longer an MCP tool (WP-B2), the renderer is library
+code, and that is where this test now exercises it.
 
 Run: .venv/Scripts/python.exe tests/publish_smoke_test.py
 """
@@ -29,7 +34,8 @@ shutil.rmtree(Path(os.environ["DSOS_DB_PATH"]).parent, ignore_errors=True)
 
 from fastmcp import Client  # noqa: E402
 
-from dsos.mcp_server import mcp  # noqa: E402 — import after DSOS_DB_PATH is set
+from dsos import publish  # noqa: E402
+from dsos.mcp_server import conn as mcp_conn, mcp  # noqa: E402 — import after DSOS_DB_PATH is set
 
 # A minimal valid 1x1 transparent PNG.
 _TINY_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
@@ -84,15 +90,12 @@ async def main() -> None:
         narrative_row = r.data["row_id"]
         print(f"[ok] saved narrative embedding dataset/query/chart -> {narrative_row}")
 
-        r = await client.call_tool(
-            "publish_report", {"row_id": narrative_row, "session_id": s1}
-        )
-        assert "error" not in r.data, r.data
-        path = r.data["path"]
+        r = publish.publish_report(mcp_conn, narrative_row)
+        path = r["path"]
         assert Path(path).is_file(), f"publish_report should write a real file: {path}"
         print(f"[ok] publish_report wrote {path}")
 
-        touched = set(r.data["artifact_row_ids"])
+        touched = set(r["artifact_row_ids"])
         assert {narrative_row, dataset_row, query_row, chart_row} <= touched, r.data
         print("[ok] artifact_row_ids covers the narrative and everything it embeds")
 
@@ -108,9 +111,9 @@ async def main() -> None:
         assert "<p></table>" not in html_text, "a table must not be torn in half by a stray </p><p>"
         print("[ok] rendered HTML is self-contained: tables + inlined image, no raw embed markers")
 
-        # publish_report should NOT create its own artifact row (Philosophy
-        # #5: a rendered export exits this layer, it isn't itself a
-        # versioned artifact) — search shouldn't surface the .html output.
+        # publish should NOT create its own artifact row (Philosophy #5: a
+        # rendered export exits this layer, it isn't itself a versioned
+        # artifact) — search shouldn't surface the .html output.
         r = await client.call_tool(
             "search_artifacts", {"query": "Team Scores Report", "session_id": s1}
         )
@@ -118,11 +121,12 @@ async def main() -> None:
         print("[ok] publish_report did not register itself as a new artifact")
 
         # publish_report on a non-narrative row should fail cleanly.
-        r = await client.call_tool(
-            "publish_report", {"row_id": dataset_row, "session_id": s1}
-        )
-        assert "error" in r.data and "narrative" in r.data["error"]
-        print(f"[ok] publish_report on a non-narrative row fails cleanly: {r.data['error']}")
+        try:
+            publish.publish_report(mcp_conn, dataset_row)
+            raise AssertionError("publishing a non-narrative row should raise")
+        except ValueError as exc:
+            assert "narrative" in str(exc), str(exc)
+            print(f"[ok] publish_report on a non-narrative row fails cleanly: {exc}")
 
     print("\npublish_report smoke test passed.")
 
