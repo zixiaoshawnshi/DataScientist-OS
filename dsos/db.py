@@ -8,8 +8,9 @@ plus the numbered migrations that move an existing store file forward.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from collections.abc import Callable
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 SCHEMA = """
@@ -244,14 +245,18 @@ class _Connection(sqlite3.Connection):
     _dsos_db_path: str
 
 
-def connect(db_path: str | Path = "data/store.db") -> sqlite3.Connection:
-    """Open (and if needed, migrate) the store's SQLite database."""
+def _open(db_path: str | Path) -> sqlite3.Connection:
+    """Open the store's SQLite file and put the connection in the mode every
+    caller expects (row factory, WAL, busy timeout, db path), without
+    touching the schema. `connect()` and `Database.conn()` both start here so
+    the two cannot drift apart."""
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # check_same_thread=False: the MCP server runs tools in a thread pool by
-    # default (FastMCP's run_in_thread), so this connection is used from
-    # whichever thread handles each call. Fine at demo scale (effectively
-    # one call in flight at a time) — not a claim of real concurrency safety.
+    # check_same_thread=False is required, not a shortcut: a sqlite3
+    # connection belongs to the thread that opened it, and FastMCP runs tools
+    # in a thread pool, so the thread that opens a connection is rarely the
+    # one that later uses it. What makes it safe is that each thread has its
+    # OWN connection (Database.conn()), never that one is shared.
     conn = sqlite3.connect(path, factory=_Connection, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     # WAL: the read-only GUI opens its own connection to this same file while
@@ -259,13 +264,110 @@ def connect(db_path: str | Path = "data/store.db") -> sqlite3.Connection:
     # Default (rollback-journal) mode throws "database is locked" under that
     # read/write overlap; WAL lets readers and a writer coexist.
     conn.execute("PRAGMA journal_mode=WAL")
-    # A migration's BEGIN IMMEDIATE waits for whoever else holds the write
-    # lock instead of failing immediately — the read-only GUI keeps its own
-    # connection open on this file, including across a restart.
+    # A migration's BEGIN IMMEDIATE, and every ordinary write transaction,
+    # waits for whoever else holds the write lock instead of failing
+    # immediately — the read-only GUI keeps its own connection open on this
+    # file, including across a restart.
+    #
+    # This is a safety net, not the concurrency story. It does not fire at all
+    # for the case that actually bites: a transaction that has already taken a
+    # read snapshot and then tries to upgrade to a write gets SQLITE_BUSY
+    # (SQLITE_BUSY_SNAPSHOT) returned immediately, with no busy-handler
+    # consultation, because waiting cannot help. That is Database.write()'s job.
     conn.execute("PRAGMA busy_timeout=5000")
-    migrate(conn, path)
     conn._dsos_db_path = str(path)
     return conn
+
+
+def connect(db_path: str | Path = "data/store.db") -> sqlite3.Connection:
+    """Open (and if needed, migrate) the store's SQLite database.
+
+    Kept for the callers that want one connection and no concurrency story:
+    the GUI, the seeding path, the single-threaded tests, and dsos.mcp_server
+    until WP-C1 moves it onto a Database. A connection from here is not safe
+    to use from two threads at once; use Database for that.
+    """
+    conn = _open(db_path)
+    migrate(conn, conn._dsos_db_path)
+    return conn
+
+
+# One write lock per PROCESS, not per Database instance. Two handles onto the
+# same store file in one process (a test that opens its own, a GUI and a
+# server sharing a path) would each serialise against only themselves and so
+# would not serialise against each other, which is the entire point. SQLite's
+# own file lock is deliberately not a substitute: it is the thing that is
+# already failing, and it can only say "wait", never "nobody else is writing".
+_WRITE_LOCK = threading.RLock()
+
+
+class Database:
+    """The store handle: one per process, one connection per thread, and one
+    process-wide write lock (decision D8).
+
+    Migrations run once, in __init__, not per connection: eight threads each
+    running the migration list would be eight writers racing to take the same
+    schema version, and the loser would fail on a lock or, worse, on a
+    user_version another thread had already bumped.
+
+        db = Database(path)
+        with db.write():
+            store.save_artifact(db.conn(), ...)
+
+    `write()` is re-entrant (RLock), so a tool that takes it and then calls a
+    helper that also takes it does not deadlock; what it costs is that the
+    outer block holds the lock for the helper's duration too, which is the
+    right answer anyway — the outer block was going to hold it regardless.
+    """
+
+    def __init__(self, db_path: str | Path) -> None:
+        self.path = Path(db_path)
+        # A throwaway connection for the migration run, so the handle holds
+        # no connection of its own and the first conn() in whichever thread
+        # asks is the first connection that thread opens.
+        bootstrap = _open(self.path)
+        try:
+            migrate(bootstrap, self.path)
+        finally:
+            bootstrap.close()
+        self._local = threading.local()
+
+    def conn(self) -> sqlite3.Connection:
+        """This thread's connection, opened on first use and kept for the
+        life of the thread.
+
+        Thread-local rather than one shared connection because a single
+        sqlite3 connection is not safe to use from two threads at once even
+        with check_same_thread=False: its cursor state, its transaction and its
+        statement cache are all per-connection, so two threads interleave
+        inside one BEGIN and commit each other's half-written work.
+
+        Thread-local also means a short-lived thread's connection is dropped
+        with the thread, instead of a thread pool accumulating a connection
+        per thread that ever ran a tool. A thread that never calls conn()
+        never opens one.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._local.conn = _open(self.path)
+        return conn
+
+    @contextmanager
+    def write(self):
+        """Serialise writers in this process for the duration of the block,
+        yielding the calling thread's connection so a write reads as
+        `with db.write() as conn:` and cannot accidentally reach for another
+        thread's.
+        """
+        # The lock is taken for the whole block, and released only on the way
+        # out of it — including on an exception, which is the point: a tool
+        # that raises mid-write must not leave the store locked for the next
+        # caller. Commit stays where store.py put it (in each store function):
+        # the lock serialises writers, it does not own the transaction, and a
+        # store function that is called outside a write() block still commits
+        # exactly as it did before.
+        with _WRITE_LOCK:
+            yield self.conn()
 
 
 def blob_dir_for(conn: sqlite3.Connection) -> Path:
