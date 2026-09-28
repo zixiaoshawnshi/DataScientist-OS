@@ -281,9 +281,14 @@ The wave table below is a **schedule, not a claim that every cell is safe to par
 **Owns:** `dsos/server/contract.py` (new), `tests/contract_smoke_test.py` (new), Doc II (the marker blocks only)
 
 **Spec**
-- `render(server) -> str` produces a markdown table with columns **tool | params** (`name: type`, required ones marked `*`) **| summary** (first docstring line).
+- `render(server) -> str` produces a markdown table with columns **tool | params** (`name: type`, required ones marked `*`) **| summary**.
+- **The summary is the first SENTENCE, not the first physical line** (amended after execution — see below). Collapse the hard-wrap, then cut at the first sentence terminator, guarding abbreviations (`e.g.`, `i.e.` — both occur in these docstrings). Cap the cell at roughly 200-240 chars with an ellipsis. A tool with no docstring renders an empty cell rather than raising.
 - `python -m dsos.server.contract --write` rewrites the regions between `<!-- contract:producer -->…<!-- /contract:producer -->` and `<!-- contract:consumer -->…<!-- /contract:consumer -->` in Doc II. Find the file with the glob `Design/*Design Doc II*.md`.
 - **Replace the tool table in Doc II §Architecture with these two generated blocks.**
+
+**Why the spec changed.** It originally said "the first docstring line", assuming a convention the codebase does not follow. All nine producer docstrings in `producer.py` are hard-wrapped at ~80 columns, so the literal first physical line is a mid-sentence fragment in every case — e.g. `search_artifacts` starts `"Search over everything saved so far, across every past session, not"`. Generating that would have put nine truncated fragments into Doc II, which is a worse artifact than the drift this WP exists to prevent. The word "summary" in the original spec is also not satisfied by a fragment.
+
+**The root cause, as a follow-up (not this WP).** If every tool docstring opened with a single deliberately *unwrapped* summary line and hard-wrapped only the prose beneath it, the original "first docstring line" wording would be literally true and the generator could stay a trivial line-split. That means rewriting nine docstrings in `dsos/server/producer.py`, which this WP does not own. **Fold it into whichever WP next edits those docstrings in bulk** — E2 adds the `status`/`caveats`/`confidence` parameters and will be rewriting them anyway. Until then `_summary()` carries the burden, which is why it is written to be obviously replaceable.
 
 **Tests (write first):** for each profile, the doc block equals `render(...)`. On a mismatch the test prints a diff and says "run `python -m dsos.server.contract --write`".
 
@@ -375,7 +380,7 @@ The wave table below is a **schedule, not a claim that every cell is safe to par
   - `confidence` is a list of `{claim, level: high|medium|low, basis}`, and `basis` is required and must be non-empty. Requiring a basis is the guard against "high" every time.
   - **Every writer must pass `status` explicitly from this WP onward — none may rely on the column default.** WP-E1 left `DEFAULT 'ready'` in M1 deliberately, to keep fresh and migrated stores schema-identical. The consequence is a live inconsistency: after M3, a *migrated* store's old rows read `result`, while a row written by the current `save_artifact` still reads `ready`, because its Python default is unchanged. Nothing in the suite depends on it today, which is exactly why it is dangerous. This WP is where the writers change, so this is the moment to decide: make `status` required (or default it to `exploratory` in the Python signature) and, if the column default is worth changing at all, change it here in M4 where fresh and migrated stores stay in step.
   - Add `decision` to `ARTIFACT_TYPES`.
-- **The `run_sql`/`run_python` tools** gain `status="exploratory"`. **The `save_artifact` tool** gains `status="result"`, `caveats` and `confidence`.
+- **The `run_sql`/`run_python` tools** gain `status="exploratory"`. **The `save_artifact` tool** gains `status="result"`, `caveats` and `confidence`. **This WP also rewraps the producer tool docstrings** so each opens with a single unwrapped summary line before the hard-wrapped prose (see the C2 follow-up note) — it is the natural moment, because these parameters are being documented anyway.
 - **`mark(row_id, session_id, status=None, verdict=None, basis=None, superseded_by=None)`:**
   - **Status transitions:** only `exploratory → result`, `exploratory → superseded` and `result → superseded`. Superseded is terminal; to revive something, save a new version.
   - **`superseded_by`** is required when the new status is `superseded`, and must be an existing row.
