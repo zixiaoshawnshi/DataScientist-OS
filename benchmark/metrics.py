@@ -495,6 +495,70 @@ def exploratory_noise_metrics(db_path: pathlib.Path) -> dict:
     }
 
 
+# --------------------------------------------------------- parallel arm
+
+_TITLE_PUNCT = re.compile(r"[^a-z0-9 ]+")
+
+
+def _norm_title(title: str) -> str:
+    return " ".join(_TITLE_PUNCT.sub(" ", (title or "").lower()).split())
+
+
+def duplicate_work_metrics(db_path: pathlib.Path, runs: list[dict]) -> dict:
+    """Duplicate-work rate between two concurrent producers, per question pair.
+
+    Definition, fixed before the numbers were seen: for a pair (A, B), a
+    **duplicate** is an artifact registered by the second agent B whose
+    `content_hash` equals that of an artifact A registered (both hashes
+    non-empty), *or* whose normalised title equals a normalised title in A.
+    Content hash catches the same output; title catches the same stated
+    result written twice. The **duplicate-work rate** is B's duplicates over
+    B's registrations — B is the agent that could have avoided the work.
+
+    `runs` is the runner's per-agent index (results/runs_<label>.json) with
+    `pair`, `agent` and `session_id`; artifacts are read back from the store
+    by session. A pair with a missing session_id is reported as unmeasured
+    rather than as a zero.
+    """
+    arts = _rows(db_path, "SELECT row_id, session_id, content_hash, title FROM artifacts")
+    by_session: dict[str, list[dict]] = {}
+    for row_id, sid, chash, title in arts:
+        by_session.setdefault(sid, []).append(
+            {"row_id": row_id, "content_hash": chash, "title": title})
+    pairs: dict[str, dict] = {}
+    for entry in runs:
+        pairs.setdefault(entry.get("pair", "?"), {})[entry.get("agent")] = entry.get("session_id")
+    out, tot_b, tot_dup = {}, 0, 0
+    for pair, sides in sorted(pairs.items()):
+        a_sid, b_sid = sides.get("a"), sides.get("b")
+        if not a_sid or not b_sid:
+            out[pair] = {"measured": False, "a_session": a_sid, "b_session": b_sid,
+                         "a_registrations": None, "b_registrations": None,
+                         "duplicates": None, "duplicate_work_rate": None}
+            continue
+        a_arts, b_arts = by_session.get(a_sid, []), by_session.get(b_sid, [])
+        a_hashes = {a["content_hash"] for a in a_arts if a["content_hash"]}
+        a_titles = {_norm_title(a["title"]) for a in a_arts}
+        dup = 0
+        for b in b_arts:
+            by_hash = b["content_hash"] and b["content_hash"] in a_hashes
+            by_title = _norm_title(b["title"]) in a_titles
+            dup += bool(by_hash or by_title)
+        tot_b += len(b_arts)
+        tot_dup += dup
+        out[pair] = {
+            "measured": True, "a_session": a_sid, "b_session": b_sid,
+            "a_registrations": len(a_arts), "b_registrations": len(b_arts),
+            "duplicates": dup,
+            "duplicate_work_rate": (dup / len(b_arts)) if b_arts else None,
+        }
+    return {
+        "pairs": out,
+        "totals": {"b_registrations": tot_b, "duplicates": tot_dup,
+                   "duplicate_work_rate": (tot_dup / tot_b) if tot_b else None},
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)

@@ -42,6 +42,26 @@
       "manifest": false,
       "tools": "builtin",
       "mode": "claims"
+    },
+    "parallel_board": {
+      "label": "parallel producers (board on)",
+      "order": 6,
+      "scored_from": "store",
+      "raw_csv_policy": "n/a",
+      "manifest": false,
+      "tools": "builtin+dsos",
+      "mode": "parallel",
+      "board": "on"
+    },
+    "parallel_noboard": {
+      "label": "parallel producers (board off)",
+      "order": 7,
+      "scored_from": "store",
+      "raw_csv_policy": "n/a",
+      "manifest": false,
+      "tools": "builtin+dsos",
+      "mode": "parallel",
+      "board": "off"
     }
   }
 }

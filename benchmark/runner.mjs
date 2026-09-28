@@ -44,7 +44,7 @@ import { join, resolve, dirname, basename } from "node:path";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawnSync, spawn } from "node:child_process";
 import { StdioMcpClient } from "./mcp_client.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -78,6 +78,9 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === "--condition") out.condition = argv[++i];
     else if (a === "--table") out.tables.push(argv[++i]);
+    else if (a === "--board") out.board = argv[++i];
+    else if (a === "--port") out.port = Number(argv[++i]);
+    else if (a === "--stagger") out.staggerMs = Number(argv[++i]);
     else if (a === "--tables") { const v = argv[++i]; if (v === "all") out.allTables = true; else out.tables.push(...v.split(",")); }
     else if (a === "--round" || a === "--rounds") out.rounds = argv[++i].split(",").map(Number);
     else if (a === "--reset-store") out.resetStore = true;
@@ -413,7 +416,7 @@ function toolEvents(messages) {
  * Dropping the server instructions (as an earlier version of this bridge
  * did) is not a neutral handicap — it understates the real product.
  */
-function dsosToolExtension(client) {
+function dsosToolExtension(client, onResult) {
   const snippet = "DS Artifact OS — start_session() first, search_artifacts() before fetching or rebuilding anything";
   const guidelines = (client.instructions || "")
     .split("\n")
@@ -436,6 +439,7 @@ function dsosToolExtension(client) {
           : {}),
         execute: async (_toolCallId, params) => {
           const result = await client.callTool(t.name, params, TOOL_CALL_TIMEOUT_MS);
+          if (onResult) onResult(t.name, result);
           const content = (result.content ?? []).filter((c) => c.type === "text" || c.type === "image");
           if (!content.length && result.structuredContent != null) {
             content.push({ type: "text", text: JSON.stringify(result.structuredContent, null, 2) });
@@ -563,6 +567,156 @@ async function runClaims(args, ARM, LABEL) {
   console.log(`  answer: ${answer.slice(0, 300).replace(/\n/g, " ")}`);
 }
 
+// ------------------------------------------------------- parallel arm (H3)
+
+// Overlapping question pairs, each asked concurrently by two producer agents
+// through ONE daemon. The `b` phrasing is a paraphrase of `a` on purpose: a
+// board that only matched identical text would be useless, and WP-E3R made it
+// match content terms. Each pair needs its raw CSV in the agent's workspace,
+// so both agents can do the work independently — which is exactly the work the
+// board is supposed to stop one of them from duplicating.
+const PARALLEL_PAIRS = [
+  {
+    id: "diamonds_clean", file: "diamonds.csv",
+    a: "Load diamonds.csv from your working directory. Some rows have x, y or z equal to 0 — drop every such row, then add price_per_carat = price / carat. Report how many rows remain and the mean price_per_carat over all of them.",
+    b: "Work with the diamonds data in your working directory: discard any row whose x, y or z value is zero, add a price-per-carat column (price divided by carat), then tell me the number of surviving rows and the average price per carat across them.",
+  },
+  {
+    id: "vgsales_totals", file: "vgsales.csv",
+    a: "Load vgsales.csv from your working directory. Compute the sum of Global_Sales over all rows, and count the rows with a missing Publisher. Report both numbers.",
+    b: "Using the video-game sales data in your working directory, total up Global_Sales across every row, and tell me how many rows have no Publisher listed. Report both numbers.",
+  },
+  {
+    id: "census_missing", file: "census.csv",
+    a: "Load census.csv from your working directory. Count how many rows have a '?' in workclass, and how many have a '?' in occupation. Report both counts.",
+    b: "In the census data in your working directory, how many records carry a question-mark for workclass, and how many for occupation? Report both counts.",
+  },
+];
+
+// The daemon port for the parallel arm. Distinct from the chain store's 8765
+// and the consumer store's 8766 so the three arms never collide.
+const PARALLEL_PORT = 8767;
+
+function sessionIdFrom(result) {
+  if (result?.structuredContent?.session_id) return result.structuredContent.session_id;
+  for (const c of result?.content ?? []) {
+    if (c.type === "text") {
+      try { const d = JSON.parse(c.text); if (d.session_id) return d.session_id; } catch { /* not json */ }
+    }
+  }
+  return null;
+}
+
+async function waitHealthz(port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try { const r = await fetch(`http://127.0.0.1:${port}/healthz`); if (r.ok) return true; }
+    catch { /* not up yet */ }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return false;
+}
+
+// Two producer agents, one daemon. The ONLY difference between the board-on
+// and board-off conditions is `DSOS_DISABLE_BOARD` in the daemon's environment
+// (read per call by spine.related_questions); same questions, same order, same
+// stagger, same model. Anything else differing would make the duplicate-work
+// comparison worthless.
+async function runParallel(args, ARM, LABEL) {
+  const board = ARM.board ?? "on";
+  const storePath = args.store ?? join(HERE, "parallel", board, "store.db");
+  mkdirSync(dirname(storePath), { recursive: true });
+  if (args.resetStore) {
+    for (const s of ["", "-wal", "-shm"]) {
+      if (existsSync(storePath + s)) rmSync(storePath + s);
+    }
+  }
+  const port = args.port ?? PARALLEL_PORT;
+  const env = { DSOS_DB_PATH: storePath, DSOS_PYTHON_PATH: VENV_PY };
+  if (board === "off") env.DSOS_DISABLE_BOARD = "1";
+  const logDir = join(HERE, "results", "transcripts", "parallel_server");
+  mkdirSync(logDir, { recursive: true });
+  const daemonLog = join(logDir, `${LABEL}.log`);
+  const daemon = spawn(VENV_PY, ["-m", "dsos.daemon", "--port", String(port)], {
+    env: { ...process.env, ...env }, stdio: ["ignore", "ignore", "pipe"], windowsHide: true,
+  });
+  let daemonErr = "";
+  daemon.stderr.setEncoding("utf8");
+  daemon.stderr.on("data", (d) => { daemonErr += d; });
+  if (!(await waitHealthz(port, 30000))) {
+    writeFileSync(daemonLog, daemonErr, "utf8");
+    daemon.kill();
+    throw new Error(`parallel daemon did not start on :${port}; see ${daemonLog}`);
+  }
+  console.log(`[parallel] daemon up on :${port} store=${storePath} board=${board}`);
+  const stagger = args.staggerMs ?? 3000;
+  try {
+    for (const pair of PARALLEL_PAIRS) {
+      console.log(`\n=== pair ${pair.id} [board=${board}] ===`);
+      const runSide = async (side, question, delayMs) => {
+        if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
+        const workspace = join(tmpdir(), "dsos-bench", LABEL, pair.id, side);
+        mkdirSync(workspace, { recursive: true });
+        const csv = join(workspace, pair.file);
+        if (!existsSync(csv)) copyFileSync(join(HERE, "data", pair.file), csv);
+        const capture = {};
+        const client = new StdioMcpClient({
+          command: VENV_PY, args: ["-m", "dsos.mcp_server"],
+          env: { DSOS_DB_PATH: storePath, DSOS_PYTHON_PATH: VENV_PY },
+          stderrPath: join(logDir, `${pair.id}_${side}.stderr.log`),
+        });
+        await client.start();
+        const loader = new DefaultResourceLoader({
+          cwd: workspace, agentDir: getAgentDir(),
+          extensionFactories: [dsosToolExtension(client, (name, result) => {
+            if (name === "start_session" && !capture.session_id) {
+              capture.session_id = sessionIdFrom(result);
+            }
+          })],
+        });
+        await loader.reload();
+        const prompt = `${question}\n\nThe file is at ${csv} in your working directory.\n\n${PERSIST_HINT}`;
+        const sessionOpts = {
+          cwd: workspace, tools: [...BUILTIN_TOOLS, ...client.tools.map((t) => t.name)],
+          sessionManager: SessionManager.inMemory(workspace), resourceLoader: loader,
+        };
+        if (args.model) sessionOpts.model = args.model;
+        const { session } = await createAgentSession(sessionOpts);
+        const t0 = Date.now();
+        let aborted = false;
+        const timer = setTimeout(() => { aborted = true; session.abort(); }, args.timeoutMs ?? ROUND_TIMEOUT_MS);
+        try { await session.prompt(prompt); }
+        catch (e) { console.error(`  ${side} prompt error: ${e.message}`); }
+        finally { clearTimeout(timer); }
+        const messages = session.messages ?? [];
+        const usage = sumUsage(messages);
+        const dur = Math.round((Date.now() - t0) / 1000);
+        const usedModel = session.model?.id ?? session.model ?? null;
+        session.dispose(); client.stop();
+        console.log(`  ${side}: ${dur}s in=${usage.input} out=${usage.output} tools=${usage.toolCalls} session=${capture.session_id ?? "?"}`);
+        return { side, tokens_in: usage.input, tokens_out: usage.output,
+                 tool_calls: usage.toolCalls, answer: lastAssistantText(messages),
+                 dur, model: usedModel, session_id: capture.session_id ?? null, aborted };
+      };
+      const [a, b] = await Promise.all([
+        runSide("a", pair.a, 0),
+        runSide("b", pair.b, stagger),
+      ]);
+      for (const r of [a, b]) {
+        mergeAnswers(LABEL, `${pair.id}_${r.side}::R1`, {
+          answer_text: r.answer, tokens_in: r.tokens_in, tokens_out: r.tokens_out,
+          duration_s: r.dur, tool_calls: r.tool_calls, model: r.model, aborted: r.aborted,
+        });
+        recordRun(LABEL, { pair: pair.id, agent: r.side, round: 1,
+                           condition: args.condition, session_id: r.session_id });
+      }
+    }
+  } finally {
+    daemon.kill();
+    writeFileSync(daemonLog, daemonErr, "utf8");
+  }
+}
+
 // -------------------------------------------------------------------- main
 
 const args = parseArgs(process.argv.slice(2));
@@ -580,6 +734,13 @@ const { createAgentSession, SessionManager, DefaultResourceLoader, getAgentDir }
 // and they take neither the breadth manifest nor the chain rounds.
 if (ARM.mode === "claims") {
   await runClaims(args, ARM, LABEL);
+  console.log("\nbatch done");
+  process.exit(0);
+}
+
+// The parallel arm owns its own daemon and runs within it, not the table loop.
+if (ARM.mode === "parallel") {
+  await runParallel(args, ARM, LABEL);
   console.log("\nbatch done");
   process.exit(0);
 }

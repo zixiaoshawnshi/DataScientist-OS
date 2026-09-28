@@ -31,7 +31,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 RESULTS = HERE / "results"
 sys.path.insert(0, str(HERE))
 from metrics import (MANIFEST_NAME, REMOTE_FETCH_RE, arm_of, arm_spec,  # noqa: E402
-                     claims_metrics, exploratory_noise_metrics, is_file_arm,
+                     claims_metrics, duplicate_work_metrics,
+                     exploratory_noise_metrics, is_file_arm,
                      load_arms, manifest_metrics, uses_manifest)
 
 
@@ -343,6 +344,29 @@ def write_report_md(report, conditions):
                       "repudiated row` is the healthy case: the agent named the "
                       "bad row as the reason to reject the claim. The files ceiling "
                       "has no rows to cite, so both are `none` by construction."]
+    if report.get("parallel"):
+        lines += ["", "## Parallel arm (duplicate work)", "",
+                  "| arm | pair | A regs | B regs | B duplicates | rate |",
+                  "|---|---|---|---|---|---|"]
+        for cond, data in report["parallel"].items():
+            for pair, p in data["pairs"].items():
+                if not p["measured"]:
+                    lines.append(f"| {cond} | {pair} | n/a | n/a | n/a | n/a |")
+                    continue
+                rate = p["duplicate_work_rate"]
+                lines.append(
+                    f"| {cond} | {pair} | {p['a_registrations']} | {p['b_registrations']} | "
+                    f"{p['duplicates']} | {'n/a' if rate is None else format(rate, '.0%')} |")
+            t = data["totals"]
+            rate = t["duplicate_work_rate"]
+            lines.append(
+                f"| {cond} | **all** | | {t['b_registrations']} | {t['duplicates']} | "
+                f"{'n/a' if rate is None else format(rate, '.0%')} |")
+        lines += ["", "`duplicates` = registrations by the second agent B whose "
+                      "`content_hash` or normalised title matches one of A's. "
+                      "`rate` = duplicates / B's registrations. The board-on and "
+                      "board-off conditions differ in nothing but "
+                      "`DSOS_DISABLE_BOARD` on the daemon."]
     if report.get("exploratory_noise"):
         noise = report["exploratory_noise"]["store"]
         lines += ["", "## Exploratory noise", "",
@@ -375,7 +399,9 @@ def main():
     # chain-derived three-way table — putting a verdict count next to an
     # accuracy would be comparing two different tasks.
     claims_arms = [c for c in discovered if arm_spec(c).get("mode") == "claims"]
-    conditions = [c for c in discovered if c not in claims_arms]
+    parallel_arms = [c for c in discovered if arm_spec(c).get("mode") == "parallel"]
+    conditions = [c for c in discovered
+                  if c not in claims_arms and c not in parallel_arms]
     answers = {c: rounds_of(load_json(RESULTS / f"answers_{c}.json")) for c in conditions}
     # score.py keys conditions by the answers filename stem: "answers_file"/"answers_dsos".
     raw_scores = load_json(RESULTS / "scores.json")
@@ -491,6 +517,16 @@ def main():
         exploratory_noise_metrics(HERE / "store.db") if (HERE / "store.db").exists()
         else {})
 
+    # Parallel arm: two producers, one daemon, duplicate work with the board on
+    # vs the same pair with DSOS_DISABLE_BOARD=1.
+    report["parallel"] = {}
+    for cond in parallel_arms:
+        idx = RESULTS / f"runs_{cond}.json"
+        store = HERE / "parallel" / arm_spec(cond).get("board", "on") / "store.db"
+        if idx.exists() and store.exists():
+            runs = json.loads(idx.read_text(encoding="utf-8"))
+            report["parallel"][cond] = duplicate_work_metrics(store, runs)
+
     (RESULTS / "report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n",
                                          encoding="utf-8")
 
@@ -569,6 +605,19 @@ def main():
                 print(f"  {sid[:12]}  searches={s['searches']} "
                       f"returning-exploratory={s['searches_returning_exploratory']} "
                       f"only-exploratory={s['searches_only_exploratory']}")
+    if report.get("parallel"):
+        print("\n== Parallel arm (duplicate work) ==")
+        print(f"{'arm':20s} {'pair':18s} {'A regs':>6s} {'B regs':>6s} {'dups':>5s} {'rate':>6s}")
+        for cond, data in report["parallel"].items():
+            for pair, p in data["pairs"].items():
+                rate = p.get("duplicate_work_rate")
+                print(f"{cond:20s} {pair:18s} {str(p['a_registrations']):>6s} "
+                      f"{str(p['b_registrations']):>6s} {str(p['duplicates']):>5s} "
+                      f"{'n/a' if rate is None else format(rate, '.0%'):>6s}")
+            t = data["totals"]
+            rate = t["duplicate_work_rate"]
+            print(f"{cond:20s} {'ALL':18s} {'':>6s} {t['b_registrations']:>6d} "
+                  f"{t['duplicates']:>5d} {'n/a' if rate is None else format(rate, '.0%'):>6s}")
     write_report_md(report, conditions)
     print("\nWrote results/report.json and results/report.md")
 
