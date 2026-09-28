@@ -129,11 +129,13 @@ def main() -> None:
           f"{len(rows_of(consumer_table))} row(s)")
 
     # The producer side is not asserted by name here on purpose:
-    # tests/surface_smoke_test.py already pins the exact nine-tool set, and
+    # tests/surface_smoke_test.py already pins the exact tool set, and
     # duplicating that list is exactly the second source of truth this WP
-    # removes. What matters here is only that the doc follows the registry.
+    # removes. What matters here is only that the doc follows the registry —
+    # so the row count is compared against the registry itself rather than
+    # a number, which would have to be edited by every WP that adds a tool.
     check("the producer block has a row per registered tool",
-          len(rows_of(producer_table)) == 9,
+          len(rows_of(producer_table)) == len(contract._list_tools(producer)),
           f"{len(rows_of(producer_table))} row(s)")
 
     # 3. Idempotency, on a *stale* copy of the real doc — never the working

@@ -204,12 +204,20 @@ def _scratch_payload(run: dict, inputs: list[Artifact]) -> dict:
 def _record_run(
     conn: sqlite3.Connection, *, kind: str, run: dict, input_row_ids: list[str],
     session_id: str, title: str, description: str, output_type: str, started_at: str,
-    code: str,
+    code: str, artifact_status: str = "exploratory",
 ) -> RunOutcome:
     """The shared tail of run_sql and run_python's persisted path: on
     success save the result as a new artifact, lineage-linked to its
     inputs, and record the execution against it; on failure record the
     execution alone.
+
+    `artifact_status` is the LIFECYCLE state the saved row gets, and is a
+    different thing from the `run["status"]` this function reads: that one
+    is whether the code ran (ok/error, and the only value that ever
+    reaches the executions table), this one is what the output is
+    (D3). A run is exploratory until a caller claims otherwise — the
+    default is on the tool, and this default exists only for a direct
+    execution.run_sql caller, so that neither path can omit it.
 
     The two branches are deliberately not "save, then record": the failure
     branch touches neither `artifacts` nor `lineage`, so a crashed run
@@ -230,7 +238,7 @@ def _record_run(
     output_row_id = save_artifact(
         conn, type=output_type, title=title, description=description,
         content=result, content_format=output_format, session_id=session_id,
-        parent_row_ids=input_row_ids, status=status,
+        parent_row_ids=input_row_ids, status=artifact_status,
     )
     exec_id = _record_execution(
         conn, output_row_id=output_row_id, session_id=session_id,
@@ -243,7 +251,7 @@ def _record_run(
 
 def run_sql(
     conn: sqlite3.Connection, *, code: str, session_id: str, title: str, description: str,
-    input_row_ids: list[str], scratch: bool = False,
+    input_row_ids: list[str], scratch: bool = False, status: str = "exploratory",
 ) -> RunOutcome | dict:
     """Runs `code` in DuckDB with each input artifact registered as a table
     named `in_1`, `in_2`, ... in the order the caller listed them in
@@ -252,10 +260,17 @@ def run_sql(
     behave the same. The result becomes a
     new `query` artifact, lineage-linked to every input — unless
     scratch=True, in which case the payload comes back inline and nothing is
-    persisted. Returns a RunOutcome, or the scratch payload dict."""
+    persisted. Returns a RunOutcome, or the scratch payload dict.
+
+    `status` is the saved row's lifecycle state (D3): 'exploratory' (the
+    default) for a query that is a finding, 'result' for one the caller is
+    asserting as an answer. A scratch run persists nothing and takes no
+    status."""
     started_at = _now()
     stdout = io.StringIO()
-    status, error, stderr_text, result = "ok", None, "", None
+    # run_status: whether the CODE ran, as distinct from the `status`
+    # parameter, which is the lifecycle state of the row this run may save.
+    run_status, error, stderr_text, result = "ok", None, "", None
 
     inputs: list[Artifact] = []
     duck = duckdb.connect(":memory:")
@@ -273,13 +288,13 @@ def run_sql(
         # appended (feedback #8) so a column/table typo is fixable from this
         # message alone; the full traceback goes in stderr, which is where a
         # real unhandled exception would print it anyway.
-        status, error = "error", f"{type(exc).__name__}: {exc}{_schema_hint(inputs)}"
+        run_status, error = "error", f"{type(exc).__name__}: {exc}{_schema_hint(inputs)}"
         stderr_text = traceback.format_exc()
         result = pd.DataFrame()
     finally:
         duck.close()
 
-    run = {"status": status, "error": error, "stderr": stderr_text,
+    run = {"status": run_status, "error": error, "stderr": stderr_text,
            "stdout": stdout.getvalue(), "result": result}
     if scratch:
         return _scratch_payload(run, inputs)
@@ -287,7 +302,7 @@ def run_sql(
     return _record_run(
         conn, kind="sql", run=run, input_row_ids=input_row_ids, session_id=session_id,
         title=title, description=description, output_type="query", started_at=started_at,
-        code=code,
+        code=code, artifact_status=status,
     )
 
 
@@ -296,7 +311,7 @@ def run_python(
     input_row_ids: list[str], python_path: str, output_type: str = "transform",
     output_format: str = "parquet", scratch: bool = False,
     requirements: list[str] | None = None, code_paths: list[str] | None = None,
-    style: str | None = "dsos",
+    style: str | None = "dsos", status: str = "exploratory",
 ) -> RunOutcome | dict:
     """Runs `code` in a subprocess against `python_path`, with each input
     artifact bound to `in_1`, `in_2`, ... in the order the caller listed
@@ -322,7 +337,11 @@ def run_python(
     a bare light style; a custom chart-style template's row_id/artifact_id
     works too; None = raw matplotlib defaults. Resolved BEFORE the code
     runs, so a bad reference is a one-call error, not a matplotlib error
-    mid-chart."""
+    mid-chart.
+
+    `status` is the saved row's lifecycle state (D3), same as run_sql's:
+    'exploratory' (the default) for a transform nobody has claimed yet,
+    'result' for one this session is asserting."""
     started_at = _now()
     inputs: list[Artifact] = []
 
@@ -352,7 +371,7 @@ def run_python(
     return _record_run(
         conn, kind="python", run=run, input_row_ids=input_row_ids, session_id=session_id,
         title=title, description=description, output_type=output_type, started_at=started_at,
-        code=code,
+        code=code, artifact_status=status,
     )
 
 

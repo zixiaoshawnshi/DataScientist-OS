@@ -46,7 +46,9 @@ STANDALONE_PORT = 8420
 # "template": chart styles / report layouts — artifacts like anything else
 # (see dsos/templating.py). Authoring stays agent-only for now; the GUI
 # just doesn't hide them from the gallery.
-ARTIFACT_TYPES = ["dataset", "query", "transform", "chart", "narrative", "skill", "template"]
+ARTIFACT_TYPES = [
+    "dataset", "query", "transform", "chart", "narrative", "decision", "skill", "template",
+]
 
 
 def create_gui_router(db: Database) -> APIRouter:
@@ -92,9 +94,19 @@ def create_gui_router(db: Database) -> APIRouter:
         q: str | None = None,
     ):
         """`q` calls search_artifacts directly, so gallery search and agent
-        search share one index (see design doc, GUI routes)."""
+        search share one index (see design doc, GUI routes).
+
+        include_superseded=True here, unlike the agent-facing search: the
+        gallery's other path (list_artifacts, for no `q`) lists every row
+        it holds, so hiding superseded ones from the searched path would
+        make the same gallery answer two different questions depending on
+        whether you typed. The agent-facing default is the opposite call —
+        a search for "what do I have" should not answer with a row a human
+        already retired (D7)."""
         if q:
-            hits = store.search_artifacts(db.conn(), q, top_k=50, type=type)
+            hits = store.search_artifacts(
+                db.conn(), q, top_k=50, type=type, include_superseded=True
+            )
             artifacts = [a for a, _score in hits]
             if session_id:
                 artifacts = [a for a in artifacts if a.session_id == session_id]
@@ -135,6 +147,16 @@ def create_gui_router(db: Database) -> APIRouter:
                 "graph": _mermaid_graph(art, uses, used_by),
                 "versions": store.list_versions(conn, art.artifact_id),
                 "execution": store.get_execution(conn, output_row_id=row_id),
+                # The lifecycle, for the same reason the MCP payload carries
+                # it (present.artifact_payload): status, the caveats the
+                # author flagged, and the validation ledger behind the
+                # current verdict. Read here rather than recomputed, so the
+                # page and the payload can never disagree about what this
+                # row's state is.
+                "validation": store.validation_status(conn, row_id),
+                "superseded_by": store.get_artifact_by_row_id(
+                    conn, art.superseded_by, load_content=False
+                ) if art.superseded_by else None,
             },
         )
 

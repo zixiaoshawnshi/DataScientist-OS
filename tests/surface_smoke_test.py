@@ -49,13 +49,13 @@ from fastmcp import Client  # noqa: E402
 
 from dsos.mcp_server import mcp  # noqa: E402 — import after DSOS_DB_PATH is set
 
-# The nine producer tools: the seven MVP ones plus the two the maintainer's
-# U1 decision restored. Not a subset — both directions are load-bearing. A
-# tenth tool is something that should not have come back; a seventh here is
-# something that was dropped.
+# The producer tools: the seven MVP ones, the two the maintainer's U1
+# decision restored, and mark (WP-E2). Not a subset — both directions are
+# load-bearing. An eleventh tool is something that should not have come
+# back; a ninth here is something that was dropped.
 EXPECTED_TOOLS = {
     "start_session", "search_artifacts", "get_artifact", "save_artifact",
-    "run_sql", "run_python", "get_lineage", "save_template", "list_templates",
+    "run_sql", "run_python", "get_lineage", "mark", "save_template", "list_templates",
 }
 # Still cut after U1; kept here so a regression names the tool, not a diff.
 # save_template/list_templates were in this set between WP-B2 and WP-B2R.
@@ -73,7 +73,7 @@ def check(label: str, ok: bool, detail: str = "") -> None:
 async def main() -> None:
     async with Client(mcp) as client:
         tools = {t.name for t in (await client.list_tools())}
-        check("list_tools() returns exactly the nine producer tools",
+        check("list_tools() returns exactly the ten producer tools",
               tools == EXPECTED_TOOLS,
               f"extra={sorted(tools - EXPECTED_TOOLS)} missing={sorted(EXPECTED_TOOLS - tools)}")
         check("no still-cut tool survives", not (tools & REMOVED_TOOLS),

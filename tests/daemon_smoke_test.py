@@ -20,7 +20,7 @@ Covered here:
 1. An MCP request with no Authorization header is rejected with 401, and the
    same request with the token from `<db dir>/daemon.token` is not. That also
    proves the token file is where the spec says it is.
-2. An authenticated fastmcp.Client over HTTP lists the nine producer tools at
+2. An authenticated fastmcp.Client over HTTP lists the ten producer tools at
    /mcp/producer and zero tools at /mcp/consumer (WP-F1 adds four).
 3. Two concurrent authenticated clients doing 20 save_artifact calls each
    produce 40 distinct rows, 40 FTS rows, and no error anywhere — see the
@@ -91,7 +91,7 @@ FAILURES: list[str] = []
 # to the server package has to be made deliberately here too.
 EXPECTED_PRODUCER_TOOLS = {
     "start_session", "search_artifacts", "get_artifact", "save_artifact",
-    "run_sql", "run_python", "get_lineage", "list_templates", "save_template",
+    "run_sql", "run_python", "get_lineage", "mark", "list_templates", "save_template",
 }
 
 CLIENTS = 2
@@ -234,7 +234,7 @@ async def mcp_scenario() -> list[dict]:
         tools = await producer.list_tools()
     names = sorted(t.name for t in tools)
     check(
-        "an authenticated HTTP client lists the 9 producer tools at /mcp/producer",
+        "an authenticated HTTP client lists the 10 producer tools at /mcp/producer",
         set(names) == EXPECTED_PRODUCER_TOOLS,
         f"{len(names)} tools: {', '.join(names)}",
     )
