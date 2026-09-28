@@ -169,10 +169,28 @@ A structured file system plus a manifest serves one analysis agent that has loca
 
 Every tool definition costs tokens on every turn, for every agent that loads it, and that is part of the 25% premium measured above. A PM agent should never pay for `run_python`. The daemon exposes two profiles on two endpoints:
 
-| Profile | Caller | MVP tools |
+**producer** — called by analysis agents. Generated from the live FastMCP registry by `python -m dsos.server.contract --write`; do not hand-edit between the markers.
+
+<!-- contract:producer -->
+| tool | params | summary |
 |---|---|---|
-| **producer** | analysis agents | `start_session`, `search_artifacts`, `get_artifact`, `save_artifact`, `run_sql`, `run_python`, `get_lineage`, `mark` (status change + append a validation), `close_question`, `record_decision` |
-| **consumer** | PM agent and other non-analysis agents | `find_evidence`, `get_claim`, `cite`, `ask` |
+| `get_artifact` | `row_id*`: string, `session_id*`: string | Fetch an artifact's full metadata and content, by the row_id that save_artifact/run_sql/run_python/search_artifacts gave you — that row_id is the only id you need; there's no separate "artifact_id" to look up. |
+| `get_lineage` | `row_id*`: string, `session_id*`: string, `direction`: string | See what an artifact was built from (direction="ancestors", the default) or what has been built from it (direction="descendants"). |
+| `list_templates` | `session_id*`: string, `kind`: string \| null | Chart styles and report templates — the consistency layer, built-ins and custom. |
+| `run_python` | `code*`: string, `session_id*`: string, `title*`: string, `description*`: string, `input_row_ids*`: list[string], `output_type`: string, `scratch`: boolean, `requirements`: list[string] \| null, `code_paths`: list[string] \| null, `style`: string \| null, `python_path`: string \| null | Run Python against one or more artifacts. |
+| `run_sql` | `code*`: string, `session_id*`: string, `title*`: string, `description*`: string, `input_row_ids*`: list[string], `scratch`: boolean | Run SQL (DuckDB) against one or more artifacts. |
+| `save_artifact` | `type*`: string, `title*`: string, `description*`: string, `content_format*`: string, `session_id*`: string, `content_text`: string \| null, `content_path`: string \| null, `tags`: list[string] \| null, `source`: object \| null, `parent_row_ids`: list[string] \| null, `dedupe`: boolean | Register something as a real artifact. |
+| `save_template` | `session_id*`: string, `kind*`: string, `content`: string \| null, `artifact_id`: string \| null, `title`: string \| null, `description`: string \| null, `tags`: list[string] \| null, `base`: string \| null | Create or re-version a template — the customizable half of the consistency layer. |
+| `search_artifacts` | `query*`: string, `session_id*`: string, `top_k`: integer, `type`: string \| null | Search over everything saved so far, across every past session, not just this one — an exact term (a title, a column name) reliably matches even with the fallback embedding model; a vaguer query still finds something… |
+| `start_session` | `question*`: string | Start a new round of work. |
+<!-- /contract:producer -->
+
+**consumer** — called by the PM agent and other non-analysis agents. The table is empty until the consumer's tools are registered; the registry is the source of truth, so it fills in on the next regeneration rather than by an edit here.
+
+<!-- contract:consumer -->
+| tool | params | summary |
+|---|---|---|
+<!-- /contract:consumer -->
 
 The consumer tools are designed against the PM agent:
 
