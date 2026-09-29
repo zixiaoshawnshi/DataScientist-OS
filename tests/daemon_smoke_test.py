@@ -37,6 +37,14 @@ Plus the spec lines that cost one process launch each: DSOS_PORT as an
 alternative to --port, a stale daemon.json not locking the next daemon out,
 and the refusal of a non-loopback --host.
 
+And two from the PR #15 review. The GUI and /healthz carry no token, so a
+page on some other origin that rebinds its own hostname to 127.0.0.1 could
+read them; a request whose Host is not a loopback name is refused with 400,
+and the loopback ones every real client sends still work. And a daemon.json
+naming a *live* daemon that is serving a *different* store is not a
+conflict for this one — the check that refuses a second daemon asks which
+store /healthz reports, not just whether it answers.
+
 On serialisation (decision D13). Check 3 asserts the row count *and* that no
 writer saw a lock error, and it is worth being precise about which of those
 carries the weight: `busy_timeout=5000` absorbs ordinary contention, but
@@ -329,7 +337,10 @@ def check_lifespan_composition() -> None:
     # remove, and would pass vacuously without one.
     write_manifest(own_dir, 8765, "http://127.0.0.1:8765", own_store)
 
-    with TestClient(app) as client:
+    # TestClient's default Host is "testserver", which the daemon's
+    # TrustedHostMiddleware refuses like any other non-loopback name. A real
+    # client sends 127.0.0.1:<port>, so that is what this one sends too.
+    with TestClient(app, base_url="http://127.0.0.1") as client:
         check("a manifest written at start is present while the daemon is running",
               (own_dir / "daemon.json").exists(), "")
         response = client.post(
@@ -344,6 +355,74 @@ def check_lifespan_composition() -> None:
 
     check("the lifespan removes daemon.json when the daemon shuts down",
           not (own_dir / "daemon.json").exists(), "")
+
+
+def check_host_header() -> None:
+    """DNS rebinding: the unauthenticated half of the daemon answers only to
+    loopback names.
+
+    A browser that loads evil.example, and whose resolver then hands it
+    127.0.0.1 for that name, sends `Host: evil.example` to this port — the
+    same-origin policy is satisfied, because as far as the browser knows it
+    is still talking to evil.example. The GUI and /healthz have no token, so
+    the Host header is the only thing that can tell that request apart from
+    a real one.
+    """
+    evil = httpx.get(f"{DAEMON_URL}/", headers={"Host": "evil.example"})
+    check("GET / with Host: evil.example is refused with 400",
+          evil.status_code == 400, f"got {evil.status_code}")
+    evil_health = httpx.get(f"{DAEMON_URL}/healthz", headers={"Host": "evil.example"})
+    check("GET /healthz with Host: evil.example is refused too",
+          evil_health.status_code == 400, f"got {evil_health.status_code}")
+    port = DAEMON_URL.rsplit(":", 1)[1]
+    by_name = httpx.get(f"{DAEMON_URL}/healthz", headers={"Host": f"localhost:{port}"})
+    check("Host: localhost:<port> is still accepted",
+          by_name.status_code == 200, f"got {by_name.status_code}")
+    check("/healthz with the normal Host still answers after the guard",
+          healthz(DAEMON_URL) is not None, "")
+    authenticated = httpx.post(
+        f"{DAEMON_URL}/mcp/producer/", json=INIT_BODY,
+        headers={**INIT_HEADERS, "Authorization": f"Bearer {DAEMON_TOKEN}"},
+    )
+    check("an authenticated MCP call with the normal Host still works",
+          authenticated.status_code == 200, f"got {authenticated.status_code}")
+
+
+def check_other_store_manifest(record: dict) -> None:
+    """A manifest that names a live daemon for a *different* store is stale.
+
+    The live daemon started above is serving DB_PATH. A daemon.json in some
+    other store's directory that points at it — a copied directory, a port
+    that has since been reused — must not stop a daemon for that other store
+    from starting: nobody is serving *that* store, and /healthz says so.
+    """
+    other_dir = DB_DIR / "other-store"
+    other_dir.mkdir(parents=True, exist_ok=True)
+    other_db = other_dir / "store.db"
+    (other_dir / "daemon.json").write_text(json.dumps(record), encoding="utf-8")
+    other_url = f"http://127.0.0.1:{free_port()}"
+    other = launch(
+        "daemon-other", ["--host", "127.0.0.1", "--port", other_url.rsplit(":", 1)[1]],
+        {"DSOS_DB_PATH": str(other_db)},
+    )
+    try:
+        answer = wait_until_serving(other_url, other)
+        check("a manifest naming a live daemon for another store does not block startup",
+              answer is not None, read_log("daemon-other")[-400:])
+        check("that daemon serves its own store",
+              answer is not None and answer.get("db_path") == str(other_db),
+              str(answer and answer.get("db_path")))
+        note = read_log("daemon-other")
+        check("it says why it overwrote the manifest, naming the other store",
+              "overwriting" in note and str(DB_PATH) in note, note.strip()[:300])
+        rewritten = json.loads((other_dir / "daemon.json").read_text(encoding="utf-8"))
+        check("the overwritten manifest records the new daemon, not the old one",
+              rewritten.get("base_url") == other_url
+              and rewritten.get("pid") != record.get("pid"),
+              json.dumps(rewritten))
+    finally:
+        stop(other)
+    check("the first daemon was not disturbed", healthz(DAEMON_URL) is not None, "")
 
 
 def main() -> int:
@@ -409,6 +488,9 @@ def main() -> int:
           f"got {page.status_code}")
     check("the GUI shows the sessions the MCP clients created",
           "daemon probe 0" in page.text, "")
+
+    check_host_header()
+    check_other_store_manifest(record)
 
     # (5) A second daemon over the same store must refuse. The first daemon is
     # provably live here: this test started it and has just been talking to it

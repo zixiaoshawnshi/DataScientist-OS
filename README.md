@@ -88,15 +88,22 @@ tracking main directly.
 
 ## Running the server standalone
 
+The store is owned by one long-lived daemon; `python -m dsos.mcp_server` is
+only a stdio shim that finds it and forwards to it. Start the daemon first,
+with the store and the default analysis interpreter in *its* environment:
+
 ```sh
-.venv/Scripts/python -m dsos.mcp_server
+DSOS_DB_PATH="<abs path>/store.db" DSOS_PYTHON_PATH="<analysis python>" \
+  .venv/Scripts/python -m dsos.daemon
 ```
 
-Set `DSOS_DB_PATH` to an absolute path if you're launching this from outside
-the repo (e.g. a coding agent open in an unrelated project) — otherwise it
-defaults to `data/store.db` relative to wherever the process happens to be
-launched, which silently scatters a fresh empty store into whatever directory
-that is.
+(PowerShell: `$env:DSOS_DB_PATH = "..."; $env:DSOS_PYTHON_PATH = "..."; & .venv/Scripts/python -m dsos.daemon`.)
+
+Use an absolute `DSOS_DB_PATH` — otherwise the daemon defaults to
+`data/store.db` relative to wherever it happens to be launched, which
+silently scatters a fresh empty store into whatever directory that is.
+`DSOS_PYTHON_PATH` is read by the daemon, which is where `run_python` runs;
+it does nothing in an MCP client's config.
 
 ## Wiring into a coding agent
 
@@ -105,7 +112,9 @@ agent to follow directly (e.g. "install dsos and wire it into Claude
 Code"). The summary, for a human doing it manually:
 
 Both agents below use the identical command, so registering once makes it
-available from any repo the agent opens — no per-project setup.
+available from any repo the agent opens — no per-project setup. Both launch
+the shim, which needs the daemon above running over the same
+`DSOS_DB_PATH`; the shim itself reads only that variable.
 
 **Claude Code** (registered globally, one time):
 

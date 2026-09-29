@@ -188,7 +188,7 @@ Every tool definition costs tokens on every turn, for every agent that loads it,
 | `start_session` | `question*`: string, `question_id`: string \| null | Start a new round of work, and learn what this store already holds. |
 <!-- /contract:producer -->
 
-**consumer** — called by the PM agent and other non-analysis agents. The table is empty until the consumer's tools are registered; the registry is the source of truth, so it fills in on the next regeneration rather than by an edit here.
+**consumer** — called by the PM agent and other non-analysis agents. Generated the same way, from the consumer's registry; do not hand-edit between the markers.
 
 <!-- contract:consumer -->
 | tool | params | summary |
@@ -222,7 +222,7 @@ The pilot's bugs cluster where dsos owns things the agent could already do itsel
 - **A failed run is an execution, not an artifact.** It is recorded in `executions` only, with no `artifacts` row and no lineage edge. The error comes back in the response under the execution id. This replaces the current "error row that is hidden everywhere" design.
 - **`run_python` runs in the user's interpreter and records its outputs.** This has been the direction since `d6f2e10`; finish it, so there is no sandbox-specific environment to maintain. `requirements=` resolved via `uv` stays as a gap-filler.
 - **`promote_scratch` is removed.** The `exploratory` status replaces it.
-- **Skills and templates are out of the MVP.** `list_skills`, `save_skill`, `list_templates`, `save_template` and `publish_report` leave the MVP tool surface; the code stays. They come back later as **shareable, distributable bundles across users**. That needs things the current in-store design lacks: author, version and origin fields, and a portable format (SKILL.md-compatible for skills, so an exported skill also works as a native agent skill). For sharing in the MVP, the consumer's `cite` covers it by linking to the GUI page.
+- **Skills and templates are out of the MVP.** *Revised Sep 27 ([TTD U1](./DS%20Artifact%20OS%20%E2%80%94%20TTD%20(Spine%20%26%20Scale).md)): **templates were restored.** `save_template` and `list_templates` are back on the producer surface, as the generated table above shows. Skills (`list_skills`, `save_skill`) and `publish_report` stay out, and the rest of this bullet still holds for them.* Original decision: `list_skills`, `save_skill`, `list_templates`, `save_template` and `publish_report` leave the MVP tool surface; the code stays. They come back later as **shareable, distributable bundles across users**. That needs things the current in-store design lacks: author, version and origin fields, and a portable format (SKILL.md-compatible for skills, so an exported skill also works as a native agent skill). For sharing in the MVP, the consumer's `cite` covers it by linking to the GUI page.
 
 ---
 
@@ -257,8 +257,8 @@ Staged, in dependency order (revised Sep 27). The work-package breakdown, with f
 | Stage | Work | Why here |
 |---|---|---|
 | **0. Migrations** | numbered `user_version` migrations; backfill and verify against a copied legacy store | Everything below adds schema, including stage 1: a failed run can only leave `artifacts` once `executions.output_row_id` is nullable |
-| **1. Producer cuts** | bind inputs as `in_1..in_N`; failed runs go to `executions` only; remove `promote_scratch`; take skills/templates/`publish_report` off the MVP surface (§MVP scope) | Cheap, removes whole bug classes, and every later stage has less surface to carry |
-| **2. Core / transport split** | a core with no MCP imports (store, lineage, execution, search), `tools/producer.py`, `tools/consumer.py`, `ingest.py` (path → content), `payloads.py` (response shaping) | The daemon and both profiles need a core that does not know about MCP. Also makes the contract reviewable as code |
+| **1. Producer cuts** | bind inputs as `in_1..in_N`; failed runs go to `executions` only; remove `promote_scratch`; take skills/templates/`publish_report` off the MVP surface (§MVP scope; templates later restored, TTD U1) | Cheap, removes whole bug classes, and every later stage has less surface to carry |
+| **2. Core / transport split** | a core with no MCP imports (store, lineage, execution, search), `dsos/server/producer.py`, `dsos/server/consumer.py`, `dsos/ingest.py` (path → content), `dsos/present.py` (response shaping) | The daemon and both profiles need a core that does not know about MCP. Also makes the contract reviewable as code |
 | **3. Daemon** | one process owns the store; streamable-HTTP MCP on localhost with a bearer token; stdio shim that forwards to it | The coordination board and consumer tools assume a single writer and no shared file system |
 | **4. Contract as an artifact** | generate each profile's tool table in this doc from the registry; a smoke test asserts doc == registry | The 7-vs-13 drift should be impossible, not merely noted |
 | **5. Lifecycle and spine** | `status`/`exploratory`, `validations`, `questions` (auto-registered in `start_session`, with claim leases), `decision` rows | The substantive change. Needs 1–4 to be reviewable |

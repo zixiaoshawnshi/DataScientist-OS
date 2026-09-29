@@ -17,25 +17,28 @@ convenience:
   tools write through — a reader that sees a session mid-write, with no
   second process and no second connection;
 - the producer MCP app at `/mcp/producer`, built by `dsos.server`;
-- the consumer MCP app at `/mcp/consumer`, which has no tools until WP-F1
-  and exists so the shape is provable before anything depends on it.
+- the consumer MCP app at `/mcp/consumer`, built the same way, which serves
+  the consumer's four read-oriented tools (D6, WP-F1).
 
 Both MCP apps carry a `StaticTokenVerifier` over a token that lives in
 `<db dir>/daemon.token`, so an MCP client is a bearer-token client and the
 GUI and `/healthz` stay open — a `cite` URL has to open in a browser, and
-loopback is not a security boundary (D9). Non-loopback binds are refused
-outright rather than quietly allowed: Doc II lists remote access as an open
-question, and an accidental `--host 0.0.0.0` on a machine that would accept
-one is a worse outcome than a refusal.
+loopback is not a security boundary (D9). Open to a browser means open to a
+DNS-rebinding page too, so the whole app sits behind a Host-header check that
+admits loopback names only. Non-loopback binds are refused outright rather
+than quietly allowed: Doc II lists remote access as an open question, and an
+accidental `--host 0.0.0.0` on a machine that would accept one is a worse
+outcome than a refusal.
 
 `daemon.json`, next to the store, is how "one daemon per store" is enforced
-across processes. A file naming a live pid whose `/healthz` answers means
-somebody is already serving this store, and this process exits rather than
-binding a second writer to the same file. A file whose pid is gone is stale
-— a hard kill, a reboot — and is overwritten. Both halves of that check are
-needed, and the pid check has to be a real one: on Windows, `os.kill(pid, 0)`
-reports a *reaped* child as alive for as long as the parent holds its handle,
-so a naive liveness probe would refuse to start for ever after a crash.
+across processes. A file naming a live pid whose `/healthz` answers *for this
+store* means somebody is already serving it, and this process exits rather
+than binding a second writer to the same file. A file whose pid is gone is
+stale — a hard kill, a reboot — and is overwritten, and so is one whose
+daemon answers for a different store. The checks are all needed, and the pid
+check has to be a real one: on Windows, `os.kill(pid, 0)` reports a *reaped*
+child as alive for as long as the parent holds its handle, so a naive
+liveness probe would refuse to start for ever after a crash.
 
 Run: .venv/Scripts/python.exe -m dsos.daemon
 """
@@ -56,6 +59,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from dsos import gui
 from dsos.db import Database
@@ -69,6 +73,15 @@ DEFAULT_PORT = 8765
 # someone types; it resolves to a loopback address, and the check is about
 # the interface the socket lands on, not about the string's spelling.
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+# The Host headers the app will answer. Not the same list as the binds above:
+# this one is about what a *request* claims, and it is the DNS-rebinding
+# guard. A page on evil.example that rebinds its name to 127.0.0.1 reaches
+# this port with `Host: evil.example`, and the unauthenticated GUI and
+# /healthz would otherwise answer it. Starlette compares the host part with
+# the brackets of an IPv6 literal kept on ("[::1]", as of Starlette 1.x); the
+# bare "::1" is kept alongside it for a parser that strips them.
+ALLOWED_HOST_HEADERS = ["127.0.0.1", "localhost", "::1", "[::1]"]
 
 TOKEN_ENV = "DSOS_TOKEN"
 PORT_ENV = "DSOS_PORT"
@@ -183,16 +196,20 @@ def read_manifest(db_dir: Path) -> dict | None:
         return None
 
 
-def check_no_other_daemon(db_dir: Path) -> None:
+def check_no_other_daemon(db_dir: Path, db_path: Path) -> None:
     """Refuse to start if a live daemon already owns this store.
 
-    Both conditions matter, and they are not the same condition. A live pid
-    with an answering `/healthz` is a daemon serving this store: start
-    nothing, say which one, exit. A live pid with a *silent* `/healthz` is
-    something else — a process that crashed between writing the manifest and
-    binding the port, or a long-dead pid that the OS has since reused — and
-    refusing on that basis would strand the store behind a file nobody can
-    explain. A dead pid is stale by definition and gets overwritten.
+    Three conditions matter, and they are not the same condition. A live pid
+    whose `/healthz` answers *and reports this store* is a daemon serving
+    it: start nothing, say which one, exit. A live pid with a *silent*
+    `/healthz` is something else — a process that crashed between writing
+    the manifest and binding the port, or a long-dead pid that the OS has
+    since reused — and refusing on that basis would strand the store behind
+    a file nobody can explain. A live, answering daemon that reports a
+    *different* store is a manifest that has stopped describing this
+    directory (a copied directory, a port since taken by another store's
+    daemon): nobody is serving this store, so that is stale too. A dead pid
+    is stale by definition. Every stale case gets overwritten, with a note.
     """
     record = read_manifest(db_dir)
     if not record:
@@ -201,12 +218,23 @@ def check_no_other_daemon(db_dir: Path) -> None:
     if not isinstance(pid, int) or not _pid_alive(pid):
         return
     base_url = record.get("base_url")
-    if base_url and _healthz_answers(base_url):
-        raise DaemonConflict(
-            f"a dsos daemon is already serving {record.get('db_path', str(db_dir))}: "
-            f"pid {pid} on {base_url} (started {record.get('started_at', 'unknown')}). "
-            f"Stop it, or point DSOS_DB_PATH at another store."
+    answer = _healthz(base_url) if base_url else None
+    if answer is not None:
+        served = answer.get("db_path")
+        # A /healthz with no db_path predates it being reported; it can only
+        # be taken at its word, which is the manifest's.
+        if not isinstance(served, str) or same_store(served, db_path):
+            raise DaemonConflict(
+                f"a dsos daemon is already serving {served or record.get('db_path', str(db_dir))}: "
+                f"pid {pid} on {base_url} (started {record.get('started_at', 'unknown')}). "
+                f"Stop it, or point DSOS_DB_PATH at another store."
+            )
+        print(
+            f"dsos: overwriting a daemon.json whose daemon (pid {pid}, {base_url}) "
+            f"is serving a different store, {served}, not {db_path}",
+            file=sys.stderr,
         )
+        return
     print(
         f"dsos: overwriting a daemon.json that no live daemon answers for "
         f"(pid {pid}, {base_url or 'no base_url recorded'})",
@@ -214,13 +242,28 @@ def check_no_other_daemon(db_dir: Path) -> None:
     )
 
 
-def _healthz_answers(base_url: str, timeout: float = 2.0) -> bool:
-    """Does that daemon's health endpoint answer right now?"""
+def same_store(a: str | Path, b: str | Path) -> bool:
+    """Do two spellings of a store path name the same file?
+
+    Resolved first, so a relative path, a `..` or a symlink cannot make one
+    store look like two; then case-folded where the filesystem is (normcase
+    is a no-op off Windows, which is the right answer there).
+    """
+    def canonical(p: str | Path) -> str:
+        return os.path.normcase(str(Path(p).resolve()))
+    return canonical(a) == canonical(b)
+
+
+def _healthz(base_url: str, timeout: float = 2.0) -> dict | None:
+    """That daemon's /healthz answer right now, or None if it does not give one."""
     try:
         with urllib.request.urlopen(f"{base_url}/healthz", timeout=timeout) as response:
-            return response.status == 200
+            if response.status != 200:
+                return None
+            body = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, ValueError):
-        return False
+        return None
+    return body if isinstance(body, dict) else {}
 
 
 def write_manifest(db_dir: Path, port: int, base_url: str, db_path: Path) -> None:
@@ -290,13 +333,22 @@ def build_app(config: ServerConfig, db_path: Path, db_dir: Path) -> FastAPI:
             remove_manifest(db_dir)
 
     app = FastAPI(title="DS Artifact OS", lifespan=lifespan)
+    # Outermost, so it covers everything below: the GUI, /healthz, and both
+    # mounted MCP apps. The MCP apps have a bearer token and would survive
+    # without it; the GUI and /healthz have nothing else. Every real client
+    # sends a loopback Host — a browser on the printed URL, an MCP client on
+    # 127.0.0.1:<port>, the shim's own /healthz probe — so this refuses only
+    # a request that arrived under somebody else's name.
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOST_HEADERS)
     app.include_router(gui.create_gui_router(config.db))
 
     @app.get("/healthz")
     def healthz() -> dict:
         """Liveness, with the store it is serving. No token: the daemon.json
-        check in the next startup is what reads it, and a health endpoint
-        that needed a secret could not tell a stale manifest from a live one.
+        check in the next startup and the stdio shim are what read it, and a
+        health endpoint that needed a secret could not tell a stale manifest
+        from a live one. Both compare `db_path` against the store they were
+        pointed at, so the path is part of the answer, not decoration.
         """
         return {"ok": True, "version": server_version(), "db_path": str(db_path)}
 
@@ -343,7 +395,7 @@ def main(argv: list[str] | None = None) -> int:
     db_dir = db_path.parent
     db_dir.mkdir(parents=True, exist_ok=True)
     try:
-        check_no_other_daemon(db_dir)
+        check_no_other_daemon(db_dir, db_path)
     except DaemonConflict as exc:
         print(f"dsos: {exc}", file=sys.stderr)
         return 3

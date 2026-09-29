@@ -569,6 +569,14 @@ WP-B3 needed the session-detail page to list that session's failed executions. I
 
 **Assigned to WP-D1**, which owns `dsos/gui.py` and is already a `gui.py` refactor (into `create_gui_router`). Move the query into `store.py` there and add it to D1's `Owns` note. It is small; the point is that it should not survive to the daemon, where the GUI becomes a mounted router over a shared `Database`.
 
+### U4 — `store._fts_query` is private; promote it only if a second module needs it
+
+The FTS AND-prefix rule lives in `dsos/store.py:_fts_query`, a private function, and today every caller is inside `store.py` (`search_artifacts` and the consumer's `find_evidence`). The underscore is honest.
+
+It was briefly a wart. **WP-E3** had `dsos/spine.py` import `store._fts_query` across the module boundary for the question board — approved at the time over copying the rule, since two spellings of one rule is the drift this project keeps paying to undo. **WP-E3R** removed that import: the board now builds its own OR-ranked query (`spine._board_fts_query`), because AND was the wrong rule for free-prose questions (U5), not a second spelling of the right one.
+
+**Nothing to do now.** If a module outside `store.py` ever needs the artifact-search rule, promote it at that point — a rename to `fts_match` with the underscore dropped — rather than importing a private name.
+
 ### U5 — the coordination board only matches IDENTICAL phrasing (found by E3, confirmed by the integrator)
 
 `related_questions` uses the same AND-prefix FTS rule as `search_artifacts`, plus exact normalised-text matching. Measured against a real store after WP-E3 merged:
@@ -626,12 +634,6 @@ this result was later CONTRADICTED — do not quote it without reading why:
 
 For the one profile whose entire purpose is a non-technical reader deciding whether to trust a number, a dict repr is the wrong register. It should name the verdict and the basis in a sentence. **Small and cosmetic, not correctness** — recorded rather than fixed, because `consumer.py` has no owner now and it is not worth a worker round-trip on its own. Fold it into whoever next touches `consumer.py`, or into a polish pass before the demo.
 
-The FTS AND-prefix rule lives in `dsos/store.py:_fts_query`, a private function. `search_artifacts` uses it internally, and since **WP-E3** the question board uses it too, across a module boundary: `dsos/spine.py` imports `store._fts_query`.
-
-That is a deliberate wart, approved during E3's execution rather than discovered later. The tidier fix is to promote it to a public helper, which is a change to `store.py` — a file E3, F1 and G1 all own and E3 did not. Copying the rule into `spine.py` was the alternative and was rejected: two spellings of one rule is the exact drift this project keeps paying to undo, and a tuned AND-prefix would silently diverge between artifact search and the board.
-
-**Whoever is next in `store.py` for another reason should promote it** — a rename to `fts_match` with the underscore dropped, updating both call sites. It is a two-line mechanical change. Until then the import carries a comment saying it is deliberate.
-
 ### U8 — the abandon sweep has no index for its correlated subquery
 
 Found by WP-G1, which built `spine.sweep_abandoned`. The sweep runs inside every `start_session`, so it is on the hot path, and its activity test is:
@@ -643,6 +645,10 @@ MAX(ts) FROM tool_calls WHERE session_id = questions.claimed_by
 `tool_calls.session_id` has **no index**. The candidate set is bounded by the indexed `questions(status)` filter (M3), so this is not a full scan of `tool_calls` — but it is one correlated scan per open question, and a store with many open questions pays that on every session start.
 
 **Fix: add an index on `tool_calls(session_id)` as a new migration (M4).** It needs `db.py`, which WP-G1 did not own, so it was flagged rather than done. Note this is the same index the claim lease's activity read wants (`lease_state` does the same correlated lookup), so it pays for two features, not one.
+
+## Review follow-ups (PR #15)
+
+PR #15 (`feature/spine-and-scale`) was reviewed before merge. The findings were fixed on `fix/review-*` branches cut from it, one per area and each with its own tests; the commits there carry the detail. `fix/review-daemon-docs` covers the daemon and the install docs: AGENTS.md now sets `DSOS_DB_PATH` and `DSOS_PYTHON_PATH` on the daemon rather than the shim and describes the consumer's four tools; the daemon's and the shim's `/healthz` checks compare the store's `db_path` rather than only liveness; the daemon refuses a non-loopback `Host` header (DNS rebinding against the unauthenticated GUI); and Doc II/this TTD are brought up to date where they had drifted (U1's template restoration, U4).
 
 ## Out of scope for this TTD
 
