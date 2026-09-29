@@ -393,7 +393,7 @@ def build_consumer(config: ServerConfig) -> FastMCP:
                         "question_id": existing["id"],
                         "status": existing["status"],
                         "deduplicated": True,
-                        "note": f"an open question already asks this (asked "
+                        "note": f"an unfinished question already asks this (asked "
                                 f"{existing['created_at'][:10]}). It is on the board; "
                                 f"no second one was opened.",
                     }

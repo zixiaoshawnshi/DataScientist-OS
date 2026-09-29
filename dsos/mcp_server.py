@@ -88,10 +88,14 @@ if __name__ == "__main__":
     import json
     import urllib.error
     import urllib.request
+    import uuid
     from pathlib import Path
 
     from fastmcp import Client
+    from fastmcp.client.transports import StreamableHttpTransport
     from fastmcp.server import create_proxy
+
+    from dsos.server.common import CLIENT_SESSION_HEADER
 
     URL_ENV = "DSOS_URL"
     TOKEN_ENV = "DSOS_TOKEN"
@@ -251,7 +255,16 @@ if __name__ == "__main__":
         # disconnected Client, and a Client is where the transport's
         # credentials belong; its factory clones one per request, so each
         # proxied call gets its own backend session.
-        proxy = create_proxy(Client(url, auth=token), name=f"dsos-{args.profile}")
+        #
+        # Which is why this shim names its own session in a header: the
+        # per-call backend sessions share nothing the daemon can key on, and
+        # every shim reports the same clientInfo, so without it two shims
+        # running at once would be logged as one consumer. One id per shim
+        # process; Client.new() shares the transport, so every clone sends it.
+        transport = StreamableHttpTransport(
+            url, headers={CLIENT_SESSION_HEADER: uuid.uuid4().hex}
+        )
+        proxy = create_proxy(Client(transport, auth=token), name=f"dsos-{args.profile}")
         # `proxy` is a local, so this is an ordinary name lookup — unlike the
         # bare `mcp.run()` this replaces, which was a NameError because a
         # module-level __getattr__ is not consulted for global names inside the

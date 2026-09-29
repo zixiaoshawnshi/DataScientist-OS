@@ -160,7 +160,9 @@ def build_producer(config: ServerConfig) -> FastMCP:
 
         Closing clears the claim and records the time, so the question stops
         reading as in-flight. You do not have to hold the claim to close it:
-        a finished question is a fact about the store, not a permission.
+        a finished question is a fact about the store, not a permission. A
+        question that is already answered or abandoned cannot be closed
+        again — its answer is kept; start a new question if it is wrong.
 
         `note` is returned in the response and recorded in your tool-call
         trace; it is not stored on the question, so put anything that must
@@ -202,7 +204,9 @@ def build_producer(config: ServerConfig) -> FastMCP:
 
         Pass question_id to also close that question as answered by this
         decision — the decision is written first, so the question can never
-        point at a row that does not exist.
+        point at a row that does not exist. The question must still be open
+        or in progress; if it is already closed the call is refused before
+        the decision is written — drop question_id to record it on its own.
         """
         try:
             with db.write() as conn:
@@ -383,6 +387,17 @@ def build_producer(config: ServerConfig) -> FastMCP:
         genuinely want a second copy — same data deliberately re-registered
         under a new name or source.
         """
+        # Checked before the dedupe lookup, not left to store.save_artifact:
+        # a status="superseded" save whose content matches a current result
+        # would otherwise come back as a successful dedupe instead of the
+        # error saying superseded is mark's job.
+        if status not in store.WRITABLE_STATUSES:
+            return {
+                "error": f"status must be one of {list(store.WRITABLE_STATUSES)}, got "
+                         f"{status!r}. A row becomes superseded through "
+                         f"mark(status='superseded', superseded_by=...).",
+                "artifact_row_ids": [],
+            }
         # Reading the file is local I/O, not a store operation, so it happens
         # before the write lock is taken.
         if content_path:

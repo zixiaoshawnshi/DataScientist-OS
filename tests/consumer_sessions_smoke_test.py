@@ -273,6 +273,27 @@ async def daemon_checks(base_url: str, token: str) -> None:
     check("3 calls through one stdio shim process -> exactly 1 consumer session",
           len(rows) == 1, f"{len(rows)} new sessions")
 
+    # 5. Two shims at once. Every shim's backend client reports the same
+    #    clientInfo, so only the per-process header the shim sends can tell
+    #    them apart; without it both land in one session.
+    def shim_client() -> Client:
+        return Client(
+            StdioTransport(
+                command=sys.executable,
+                args=["-m", "dsos.mcp_server", "--profile", "consumer"],
+                env=child_env(),
+                cwd=str(REPO_ROOT),
+            ),
+            timeout=180,
+        )
+
+    before = consumer_sessions()
+    await asyncio.gather(calls(shim_client(), "shim-a"), calls(shim_client(), "shim-b"))
+    rows = new_rows(before)
+    check("two concurrent shim processes -> 2 consumer sessions, 3 calls each",
+          len(rows) == 2 and sorted(call_sessions(rows).values()) == [CALLS_PER_CLIENT] * 2,
+          f"{len(rows)} new sessions; {call_sessions(rows)}")
+
 
 def in_process_checks() -> None:
     """5. The cache's bound and the idle window, without a daemon or a client.
