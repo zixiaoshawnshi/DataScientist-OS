@@ -48,6 +48,12 @@ STATUS_TRANSITIONS: dict[str, tuple[str, ...]] = {
     "superseded": (),
 }
 
+# The states a row may be BORN in. Not `superseded`: that state means
+# "replaced by superseded_by", and only mark requires the pointer — a writer
+# that could save a superseded row would produce superseded_by=NULL, the one
+# shape mark exists to refuse. A row is created current and then retired.
+WRITABLE_STATUSES = ("exploratory", "result")
+
 # caveats and confidence are the two fields a model can fill in dishonestly
 # for free, so both are bounded and both demand evidence. caveats is capped
 # at 5 x 200 chars because a caveat that needs more than that is a narrative
@@ -67,6 +73,10 @@ VERDICTS = ("confirmed", "contradicted", "stale", "needs_review")
 # the person who checked the work is the authority on it, and a model that
 # keeps re-asserting its own opinion must not be able to bury that.
 VERDICT_AUTHORITY = ("human", "model")
+# The verdicts the derived stale check may replace — a whitelist, so a
+# verdict added to the vocabulary later is left alone until someone argues it
+# in. See validation_status for why contradicted and needs_review are not.
+_STALE_PROMOTES = ("confirmed", "unvalidated")
 
 # "7d"/"12h"/"2w": how long a fetched source stays fresh. Anything else —
 # "static", "when the site changes", a typo — is not an interval this code
@@ -186,15 +196,39 @@ def _content_hash(content: Any, content_format: str) -> str | None:
 def find_by_content_hash(
     conn: sqlite3.Connection, type: str, content_hash: str | None
 ) -> str | None:
-    """row_id of the earliest artifact of `type` with this exact content, or
-    None. Used by save_artifact's MCP wrapper to collapse a re-registration
-    of data already in the store into the existing row."""
+    """row_id of the earliest CURRENT artifact of `type` with this exact
+    content, or None. Used by save_artifact's MCP wrapper to collapse a
+    re-registration of data already in the store into the existing row.
+
+    Current means `status='result'` on the latest version of its logical
+    artifact — the only rows a collapse can hand back without losing the
+    caller's claim. A superseded row is hidden from search and stays
+    superseded, so collapsing into it makes the re-registration invisible
+    (and drops its caveats, which are never written). An exploratory row
+    is excluded for the same reason from the other side: a save_artifact
+    IS a claim, and collapsing it into a row nobody claimed would leave the
+    content unclaimed while telling the caller it was stored. An older
+    version is not what search or find_evidence read either. In all three
+    cases the save registers a new row instead, which is what makes the
+    content findable again — and the next identical save collapses into
+    that one.
+
+    The latest-version test is a correlated NOT EXISTS rather than the
+    _LATEST_VERSION_JOIN search uses: that join groups the whole table,
+    and this lookup runs inside save_artifact's write lock on every save,
+    where the (type, content_hash) and artifact_id indexes make it a
+    handful of index probes instead.
+    """
     if not content_hash:
         return None
     row = conn.execute(
-        """SELECT row_id FROM artifacts
-           WHERE type = ? AND content_hash = ?
-           ORDER BY created_at ASC, rowid ASC LIMIT 1""",
+        """SELECT a.row_id FROM artifacts a
+           WHERE a.type = ? AND a.content_hash = ? AND a.status = 'result'
+             AND NOT EXISTS (
+                 SELECT 1 FROM artifacts newer
+                 WHERE newer.artifact_id = a.artifact_id AND newer.version > a.version
+             )
+           ORDER BY a.created_at ASC, a.rowid ASC LIMIT 1""",
         (type, content_hash),
     ).fetchone()
     return row["row_id"] if row else None
@@ -371,6 +405,8 @@ def save_artifact(
     have identical schemas, and a writer that leaned on it would put 'ready'
     next to the 'result' its own migrated rows carry. The one place this
     function's default is the thing that matters is the two words in it.
+    Those two are the only ones accepted (WRITABLE_STATUSES): 'superseded'
+    is reached through mark, which is what demands the superseded_by.
 
     Any `{{artifact:<row_id>}}` reference found in text `content` (e.g. a
     narrative embedding the datasets/charts it discusses) is automatically
@@ -387,9 +423,11 @@ def save_artifact(
         raise ValueError(f"unknown artifact type {type!r}, expected one of {ARTIFACT_TYPES}")
     if not description or not description.strip():
         raise ValueError("save_artifact requires a real description, not a filename")
-    if status not in STATUS_TRANSITIONS:
+    if status not in WRITABLE_STATUSES:
         raise ValueError(
-            f"status must be one of {list(STATUS_TRANSITIONS)}, got {status!r}"
+            f"a new artifact's status must be 'exploratory' or 'result', got {status!r}. "
+            f"superseded is reached only by mark(row_id=..., status=\"superseded\", "
+            f"superseded_by=...) on an existing row, which names what replaced it."
         )
     caveats = _validated_caveats(caveats)
     confidence = _validated_confidence(confidence)
@@ -662,16 +700,22 @@ def validation_status(conn: sqlite3.Connection, row_id: str) -> dict:
       opinion must not be able to overwrite the fact that someone looked.
     - then the derived stale check (D11), which promotes 'confirmed' and
       'unvalidated' to 'stale' while the inputs are past their refresh
-      window. It does NOT promote 'contradicted': something already known
-      to be wrong is not improved into a different kind of doubt, and
-      silently downgrading a known-bad result to "stale" would be the one
-      case where the automation is confidently wrong.
+      window, and nothing else. It does NOT promote 'contradicted':
+      something already known to be wrong is not improved into a different
+      kind of doubt, and silently downgrading a known-bad result to "stale"
+      would be the one case where the automation is confidently wrong. Nor
+      'needs_review': that verdict already says "do not lean on this yet"
+      and, unlike stale, says what to check — replacing a specific request
+      for review with the generic staleness label loses the more useful of
+      the two. (A stored 'stale' verdict is already stale.)
 
     `history` is the append-only ledger itself, newest first, with every
     entry's basis. It is part of the return value because a verdict
     without its reasoning is a label, and a reader who disagrees with the
-    label needs the reasoning to say so. `stale_reason` is present only
-    when the derived check fired, and names the expired dataset.
+    label needs the reasoning to say so. `stale_reason` is present whenever
+    the inputs are past their window — whether or not that changed
+    `current` — and names the expired dataset, so a needs_review or
+    contradicted row whose inputs have also expired still says so.
 
     The table has BEFORE UPDATE / BEFORE DELETE triggers aborting on it, so
     a verdict can only ever be added — which is what makes "a human verdict
@@ -691,11 +735,10 @@ def validation_status(conn: sqlite3.Connection, row_id: str) -> dict:
         if latest is not None:
             current = latest["verdict"]
             break
-    stale_reason = None
-    if current != "contradicted":
-        reasons = _expired_sources(conn, row_id)
-        if reasons:
-            current, stale_reason = "stale", "; ".join(reasons)
+    reasons = _expired_sources(conn, row_id)
+    stale_reason = "; ".join(reasons) if reasons else None
+    if stale_reason and current in _STALE_PROMOTES:
+        current = "stale"
     result = {"current": current, "history": history}
     if stale_reason:
         result["stale_reason"] = stale_reason
@@ -723,7 +766,16 @@ def mark(
     `superseded_by` is required for a superseded status (a row that is
     dead with nothing said about what replaced it is just a deletion with
     extra steps) and must name a row that exists, so the chain is walkable
-    from either end.
+    from either end. It is accepted ONLY with status='superseded': on a
+    result row it would be a pointer claiming a replacement the status
+    denies, and a verdict-only call does not touch the column at all.
+
+    It also may not name a row that is itself superseded. That one rule is
+    what keeps every chain ending at a current row: A->B then B->A would
+    otherwise leave a question with no current answer at all, and pointing
+    at a dead row just makes a reader walk further for the same answer. The
+    error names that row's own replacement, which is almost always what the
+    caller meant.
 
     A `verdict` is appended with by='model' and requires a `basis`, for the
     same reason a confidence level does: an unsupported verdict is a label
@@ -736,10 +788,17 @@ def mark(
             "or both."
         )
     row = conn.execute(
-        "SELECT status, title FROM artifacts WHERE row_id = ?", (row_id,)
+        "SELECT status, title, superseded_by FROM artifacts WHERE row_id = ?", (row_id,)
     ).fetchone()
     if row is None:
         raise ValueError(f"no artifact with row_id {row_id!r}")
+    if superseded_by is not None and status != "superseded":
+        raise ValueError(
+            "superseded_by is only accepted with status=\"superseded\" — it names what "
+            "replaced a retired row, and "
+            + (f"status={status!r} does not retire this one."
+               if status is not None else "a verdict alone does not retire anything.")
+        )
 
     if status is not None:
         current = row["status"]
@@ -761,10 +820,18 @@ def mark(
                 )
             if superseded_by == row_id:
                 raise ValueError("superseded_by must be a different row — an artifact cannot replace itself")
-            if conn.execute(
-                "SELECT 1 FROM artifacts WHERE row_id = ?", (superseded_by,)
-            ).fetchone() is None:
+            target = conn.execute(
+                "SELECT status, superseded_by FROM artifacts WHERE row_id = ?", (superseded_by,)
+            ).fetchone()
+            if target is None:
                 raise ValueError(f"superseded_by {superseded_by!r} is not an existing row_id")
+            if target["status"] == "superseded":
+                raise ValueError(
+                    f"superseded_by {superseded_by!r} is itself superseded (by "
+                    f"{target['superseded_by']!r}), so it cannot be what replaced {row_id}: "
+                    f"point superseded_by at a current row — most likely "
+                    f"{target['superseded_by']!r}, or the end of its chain."
+                )
 
     if verdict is not None:
         if verdict not in VERDICTS:
@@ -791,7 +858,9 @@ def mark(
     return {
         "row_id": row_id,
         "status": row["status"] if status is None else status,
-        "superseded_by": superseded_by,
+        # A verdict-only call left the column alone, so report what it holds
+        # rather than the None that was (not) passed.
+        "superseded_by": row["superseded_by"] if status is None else superseded_by,
         "validation": validation_status(conn, row_id),
     }
 
@@ -958,8 +1027,9 @@ def find_evidence(
       either to somebody deciding whether to back a number would be answering
       a different question than the one they asked. They are not hidden from
       the store — `get_claim` still reads them, with a warning.
-    - ranked exactly as `search_artifacts` ranks (keyword first on the 1.0
-      sentinel, embedding cosine as the fallback, newest first among ties),
+    - ranked exactly as `search_artifacts` ranks (keyword hits first, on
+      the 1.0 sentinel and ordered by bm25; embedding cosine as the
+      fallback; newest first among ties),
       so the two profiles cannot rank the same store two different ways.
     - but the SEMANTIC branch is floored. A reader with no data and no
       tolerance for a wrong number is worse served by a 0.1-cosine
@@ -994,7 +1064,7 @@ def find_evidence(
                 JOIN artifacts a ON a.row_id = artifacts_fts.row_id
                 {_LATEST_VERSION_JOIN}
                 WHERE artifacts_fts MATCH ? AND {eligible}
-                ORDER BY a.created_at DESC, bm25(artifacts_fts)
+                ORDER BY bm25(artifacts_fts), a.created_at DESC
                 LIMIT ?
                 """,
                 [fts_query, *EVIDENCE_TYPES, top_k],
@@ -1136,15 +1206,22 @@ def search_artifacts(
 
     Keyword hits are given a sentinel score of 1.0 (max confidence) rather
     than a normalized bm25 score — ranking keyword above semantic matters
-    more here than ranking keyword hits amongst themselves precisely. That
-    sentinel means every keyword hit ties, so a stale "v2"/"FINAL"/archived
-    near-duplicate could tie with (or, ordered arbitrarily by bm25, even
-    rank above) the current artifact — no way for the caller to tell which
-    to trust. Newest created_at now breaks that tie, both here and among
-    genuinely-tied semantic scores below: it's not a freshness guarantee
-    (an explicitly superseded artifact could still be newer than nothing),
-    but it's a real, cheap signal that recency and "current" correlate
-    far more often than not, with no schema change required.
+    more here than exposing a number whose scale means nothing to a caller.
+    The sentinel is only the reported score, though: keyword hits are
+    ORDERED by bm25, so an old row that is squarely about the query ranks
+    above a new one that mentions the words once in passing. Ordering them
+    newest-first instead (as this did) made recency the ranking and bm25 a
+    tie-break that almost never fired, which also let the LIMIT cut the
+    best match off a top_k list in favour of whatever was saved last.
+
+    Newest created_at is the tie-break, among equal bm25 and among
+    genuinely-tied semantic scores below. That is what the recency order
+    was for — a stale "v2"/"FINAL"/archived near-duplicate with the same
+    title and wording scores the same bm25 as the current artifact, and the
+    newer one is far more often the current one. It is not a freshness
+    guarantee (an explicitly superseded artifact could still be newer than
+    nothing); `mark(status="superseded")` is the real answer to a stale
+    duplicate, and it hides the row outright.
 
     Skills and templates (the consistency layer) are excluded unless the
     caller passes `type="skill"`/`"template"`: they are instructions and
@@ -1188,7 +1265,7 @@ def search_artifacts(
                 JOIN artifacts a ON a.row_id = artifacts_fts.row_id
                 {_LATEST_VERSION_JOIN}
                 WHERE artifacts_fts MATCH ? AND {type_where} AND a.status != 'error'{lifecycle_sql}
-                ORDER BY a.created_at DESC, bm25(artifacts_fts)
+                ORDER BY bm25(artifacts_fts), a.created_at DESC
                 LIMIT ?
                 """,
                 [fts_query, *type_params, top_k],
