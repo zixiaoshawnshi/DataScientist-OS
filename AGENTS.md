@@ -112,13 +112,29 @@ Windows (PowerShell):
 $env:DSOS_DB_PATH = "<db>"; $env:DSOS_PYTHON_PATH = "<analysis-python>"; & "<python>" -m dsos.daemon
 ```
 
-It prints its base URL and where the store is, and writes a manifest named
+It prints its channel, base URL and store, and writes a manifest named
 after the store (`store.db.daemon.json` for `store.db`) and `daemon.token`
 next to it — that is how the shim finds it, so the
 daemon and the client must agree on `DSOS_DB_PATH` (the shim checks: a
 daemon serving a different store is reported as "not running for `<db>`",
 with both paths named). Leave it running for as long as you want dsos
-available; it serves the read-only GUI at `http://127.0.0.1:8765/` too.
+available; it serves the read-only GUI at its base URL too.
+
+**Ports: prod and dev never share one.** The daemon knows which channel it
+is — `prod` for a released install, `dev` for a source checkout (override
+with `DSOS_CHANNEL=prod|dev`) — and with no `--port`/`DSOS_PORT` it takes
+the first free port in that channel's range: **prod 8765–8779, dev
+8780–8799**. Clients never need the number (the shim reads it from the
+manifest), so let it choose unless you register the HTTP endpoint directly.
+An explicit port is used exactly: if it is taken, the daemon refuses before
+opening the store and names who holds it.
+
+**Released installs: start them with `python -P`.** `python -m` puts the
+current directory first on `sys.path`, and MCP clients launch servers from
+the project directory. Opened inside a dsos checkout, a release's
+`-m dsos.mcp_server` then imports the *checkout's* code instead of its own.
+`-P` (Python 3.11+) turns that off; use it in every command below for a
+release (`"<python>" -P -m ...`). A source checkout does not need it.
 
 Relative paths in tool calls — `content_path` on `save_artifact`,
 `code_paths` and `python_path` on `run_python` — are resolved by the
@@ -137,7 +153,9 @@ claude mcp add dsos -s user \
 ```
 
 **Pi coding agent** (needs `pi install npm:pi-mcp-adapter` first). Add to
-`~/.config/mcp/mcp.json`:
+`~/.pi/agent/mcp.json` (pi also reads the shared `~/.config/mcp/mcp.json`;
+define each server name in only one of the two, or the entries shadow each
+other):
 
 ```json
 {
@@ -160,10 +178,12 @@ directly. One fewer process, and no proxy hop per tool call:
 
 ```sh
 claude mcp add --transport http -s user dsos \
-  http://127.0.0.1:8765/mcp/producer/ \
+  http://127.0.0.1:<port>/mcp/producer/ \
   --header "Authorization: Bearer <token>"
 ```
 
+`<port>` is the one the daemon printed; pin it with `--port` for an HTTP
+registration, since an auto-chosen port can differ after a restart.
 `<token>` is what the daemon printed, or the contents of the `daemon.token`
 file next to the store. If `DSOS_TOKEN` is set in the daemon's environment
 instead of written to a file, pass that same value here.
@@ -191,7 +211,7 @@ derivation), `cite` (a pasteable reference plus a link to the result's GUI
 page) and `ask` (put a question the store cannot answer on the board for an
 analysis agent). None of them runs code or writes a finding. Register both
 profiles if you want both roles; the HTTP form works here too, at
-`http://127.0.0.1:8765/mcp/consumer/` with the same bearer token.
+`http://127.0.0.1:<port>/mcp/consumer/` with the same bearer token.
 
 ## 5. Verify
 
@@ -232,7 +252,8 @@ liveness check the way `start_session` is the producer's.
 
 If either profile comes back with an empty tool list, the shim connected to
 nothing: check that the daemon is still running (open
-`http://127.0.0.1:8765/healthz`, which answers `{ok, version, db_path}` with
+`<base_url>/healthz` — `base_url` is in `<store>.daemon.json` — which
+answers `{ok, version, db_path, channel}` with
 no token), and that its `db_path` is the store you registered — the client
 and the daemon must be given the same `DSOS_DB_PATH`. Launching the shim by
 hand prints the reason on stderr: no daemon at all, or a daemon that is

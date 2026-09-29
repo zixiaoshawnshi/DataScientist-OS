@@ -95,6 +95,7 @@ if __name__ == "__main__":
     from fastmcp.client.transports import StreamableHttpTransport
     from fastmcp.server import create_proxy
 
+    from dsos.channel import channel
     from dsos.server.common import CLIENT_SESSION_HEADER
 
     URL_ENV = "DSOS_URL"
@@ -238,6 +239,16 @@ if __name__ == "__main__":
                 file=sys.stderr,
             )
             return 1
+
+        # A note, not a refusal: the store check above is what guards against
+        # writing to the wrong file, and a dev shim talking to a released
+        # daemon over the right store is legitimate. But it is also exactly
+        # how a prod registration ends up running checkout code (or the
+        # reverse) without anyone noticing, so it is said out loud.
+        mine, theirs = channel(), answer.get("channel")
+        if isinstance(theirs, str) and theirs != mine:
+            print(f"dsos: note — this {mine} shim is proxying to a {theirs} daemon at "
+                  f"{base_url} (v{answer.get('version', '?')}).", file=sys.stderr)
 
         token = os.environ.get(TOKEN_ENV) or _token_file_token(db_dir)
         if not token:
