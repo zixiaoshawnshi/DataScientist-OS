@@ -41,6 +41,19 @@ Covered here:
 4. db.conn() hands back the same object within a thread and a different object
    in every other thread.
 
+And the transaction boundary write() owns (TTD U6), which the lock alone did
+not give it:
+
+5. An exception raised inside `with db.write() as conn:` after an INSERT
+   rolls that INSERT back: the connection leaves the block with no open
+   transaction, the row is not in the store, and another thread's write goes
+   through at once instead of waiting out busy_timeout for a RESERVED lock
+   nobody is ever going to release.
+6. A block that writes and forgets to commit is committed on the way out, so
+   another thread sees the row and can write straight after it.
+7. A nested write() block does not end the outer block's transaction: only
+   the outermost block commits, so the outer's work stays one unit.
+
 Run: .venv/Scripts/python.exe tests/database_concurrency_smoke_test.py
 """
 
@@ -119,6 +132,100 @@ def reader_thread(db: Database, out: dict, stop: threading.Event) -> None:
                 out["errors"].append(f"reader: {exc!r}")
             return
         out["reads"] += 1
+
+
+class _Deliberate(RuntimeError):
+    """The failure a store function hits half-way through its writes."""
+
+
+def _insert_session(conn, session_id: str) -> None:
+    conn.execute(
+        "INSERT INTO sessions (id, question, started_at) VALUES (?, ?, '2026-01-01')",
+        (session_id, f"transaction probe {session_id}"),
+    )
+
+
+def _session_count(db: Database, session_id: str) -> int:
+    return db.conn().execute(
+        "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)).fetchone()[0]
+
+
+def _write_from_another_thread(db: Database, session_id: str) -> tuple[float, str]:
+    """(seconds taken, error text) for one committed write on a fresh thread
+    — and so on a connection of its own, which is the one that a transaction
+    left open on this thread's connection would lock out."""
+    out = {"elapsed": 0.0, "error": ""}
+
+    def run() -> None:
+        began = time.perf_counter()
+        try:
+            with db.write() as conn:
+                _insert_session(conn, session_id)
+                conn.commit()
+        except Exception as exc:  # noqa: BLE001 — reported by the caller
+            out["error"] = repr(exc)
+        out["elapsed"] = time.perf_counter() - began
+
+    t = threading.Thread(target=run)
+    t.start()
+    t.join()
+    return out["elapsed"], out["error"]
+
+
+# busy_timeout is 5s, so a write that had to wait for a leaked RESERVED lock
+# takes all five and then fails. Anything under one second did not wait.
+PROMPT = 1.0
+
+
+def check_raise_rolls_back(db: Database) -> None:
+    raised = False
+    try:
+        with db.write() as conn:
+            _insert_session(conn, "tx-raised")
+            raise _Deliberate("store function failed after its first INSERT")
+    except _Deliberate:
+        raised = True
+    check("the exception still reaches the caller", raised)
+    check("the connection leaves the block with no open transaction",
+          not db.conn().in_transaction, "a transaction is still open on it")
+    check("the INSERT before the raise was rolled back",
+          _session_count(db, "tx-raised") == 0, "the half-written row is in the store")
+    elapsed, error = _write_from_another_thread(db, "tx-after-raise")
+    check("another thread can write straight after the failed block",
+          not error and elapsed < PROMPT, error or f"{elapsed:.2f}s")
+
+
+def check_forgotten_commit(db: Database) -> None:
+    with db.write() as conn:
+        _insert_session(conn, "tx-forgot")  # and no commit(), which is the bug
+    check("a block that wrote without committing ends with no open transaction",
+          not db.conn().in_transaction, "the write is still pending")
+    visible = {}
+
+    def look() -> None:
+        visible["n"] = _session_count(db, "tx-forgot")
+
+    t = threading.Thread(target=look)
+    t.start()
+    t.join()
+    check("its write is committed, so another connection sees it",
+          visible.get("n") == 1, str(visible.get("n")))
+    elapsed, error = _write_from_another_thread(db, "tx-after-forgot")
+    check("another thread can write straight after it",
+          not error and elapsed < PROMPT, error or f"{elapsed:.2f}s")
+
+
+def check_nested_write(db: Database) -> None:
+    with db.write() as outer:
+        _insert_session(outer, "tx-outer")
+        with db.write() as inner:
+            check("a nested block hands back the same connection", inner is outer)
+            _insert_session(inner, "tx-inner")
+        check("the inner block's exit leaves the outer transaction open",
+              outer.in_transaction, "the inner exit committed the outer's work")
+    check("the outer block's exit commits both writes",
+          not db.conn().in_transaction
+          and _session_count(db, "tx-outer") == 1 and _session_count(db, "tx-inner") == 1)
 
 
 def main() -> None:
@@ -223,6 +330,22 @@ def main() -> None:
     found = store.search_artifacts(db.conn(), "concurrency probe", top_k=EXPECTED)
     check(f"all {EXPECTED} concurrently written artifacts are searchable",
           len(found) == EXPECTED, str(len(found)))
+
+    # (5)-(7) last, and each one cleans up after itself: a failure here means
+    # this thread's connection may be holding the write lock on the file, which
+    # would turn every check after it into a five-second busy_timeout.
+    for label, fn in (
+        ("a raise inside write() rolls the block back", check_raise_rolls_back),
+        ("a write() block that forgot to commit is committed", check_forgotten_commit),
+        ("a nested write() leaves the outer transaction open", check_nested_write),
+    ):
+        try:
+            fn(db)
+        except Exception as exc:  # noqa: BLE001 — a broken scenario is a failure
+            check(label, False, f"{type(exc).__name__}: {exc}")
+        finally:
+            if db.conn().in_transaction:
+                db.conn().rollback()
 
     shutil.rmtree(ROOT, ignore_errors=True)
     if FAILURES:

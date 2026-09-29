@@ -26,6 +26,21 @@ that have to survive a file on disk are defined:
    schema — the property that makes "run the migrations" and "start empty"
    interchangeable, and that no other test in the suite would catch.
 
+Plus the index the spine's hot paths lean on (M4, TTD U8), and the race
+between two openers of the same file:
+
+10. A fresh store and a migrated one both index tool_calls(session_id), and
+    the abandon sweep's lookup actually uses it.
+11. A v3 store upgrades to v4 and leaves a .bak-v3 of itself behind.
+12. Two connections migrating the same store at once — the daemon and a
+    standalone `python -m dsos.gui`, say — both succeed. Checked both
+    deterministically (the other opener runs the whole migration between
+    this one's version check and its first migration) and with real threads.
+    Before the fix, the loser re-ran M3's ALTER TABLE ADD COLUMN and died on
+    a duplicate column.
+13. The same race against a NEWER dsos is still refused, not waved through
+    as "nothing left to do".
+
 Run: .venv/Scripts/python.exe tests/migrations_smoke_test.py
 """
 
@@ -35,6 +50,7 @@ import os
 import shutil
 import sqlite3
 import sys
+import threading
 from pathlib import Path
 from unittest import mock
 
@@ -375,6 +391,198 @@ def test_fresh_and_migrated_agree() -> None:
           {"validations_no_update", "validations_no_delete"} <= set(a)
           and {"validations_no_update", "validations_no_delete"} <= set(b),
           str(sorted(set(a) & set(b))))
+    by_session = ["tool_calls(session_id)" in schema.get("idx_tool_calls_session_id", "")
+                  for schema in (a, b)]
+    check("both stores index tool_calls(session_id)", by_session == [True, True],
+          "" if by_session == [True, True] else str(by_session))
+
+
+# --- M4 and the two-openers race --------------------------------------------
+
+
+def build_store_at(path: Path, version: int) -> None:
+    """A store at user_version `version`, made by the real MIGRATIONS list
+    truncated to it (see build_v2_store for why not a hard-coded schema),
+    holding one session and one tool call so a backup has rows to keep."""
+    with mock.patch.object(db, "MIGRATIONS", db.MIGRATIONS[:version]):
+        conn = db.connect(path)
+    try:
+        conn.execute("INSERT INTO sessions (id, question, started_at)"
+                     " VALUES ('s0', 'a question', '2026-01-01')")
+        conn.execute("INSERT INTO tool_calls VALUES"
+                     " ('t0', 's0', '2026-01-01', 'search', '{}', '', '[]')")
+        conn.commit()
+    finally:
+        conn.close()
+    check(f"the fixture really is a v{version} store", user_version(path) == version,
+          f"v{user_version(path)}")
+
+
+def test_session_index_is_used() -> None:
+    fresh = ROOT / "m4-fresh" / "store.db"
+    conn = db.connect(fresh)
+    try:
+        index = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'idx_tool_calls_session_id'"
+        ).fetchone()
+        check("a fresh store indexes tool_calls(session_id)",
+              index is not None and "tool_calls(session_id)" in index[0], str(index and index[0]))
+        # The shape of spine.sweep_abandoned's and lease_state's activity
+        # read. The index is only worth a migration if SQLite picks it.
+        plan = " ".join(r["detail"] for r in conn.execute(
+            "EXPLAIN QUERY PLAN SELECT MAX(ts) FROM tool_calls WHERE session_id = ?", ("s",)))
+        check("the per-session activity lookup uses the index",
+              "idx_tool_calls_session_id" in plan, plan)
+    finally:
+        conn.close()
+
+
+def test_v3_store_upgrades_to_v4() -> None:
+    v3 = ROOT / "v3" / "store.db"
+    build_store_at(v3, 3)
+    conn = db.connect(v3)
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        check("a v3 store migrates to the latest version", version == len(db.MIGRATIONS),
+              f"user_version={version}")
+        names = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master")}
+        check("M4 adds idx_tool_calls_session_id to a v3 store",
+              "idx_tool_calls_session_id" in names)
+        kept = conn.execute("SELECT COUNT(*) FROM tool_calls").fetchone()[0]
+        check("the v3 store's tool calls survive", kept == 1, f"{kept} rows")
+    finally:
+        conn.close()
+    backup = v3.parent / "store.db.bak-v3"
+    check("migrating a v3 store writes a .bak-v3 copy", backup.exists(), str(backup))
+    if backup.exists():
+        con = sqlite3.connect(backup)
+        try:
+            bversion = con.execute("PRAGMA user_version").fetchone()[0]
+            bindex = con.execute("SELECT COUNT(*) FROM sqlite_master"
+                                 " WHERE name = 'idx_tool_calls_session_id'").fetchone()[0]
+        finally:
+            con.close()
+        check("the .bak-v3 is the store as it was before M4",
+              bversion == 3 and bindex == 0, f"user_version={bversion}, index present: {bool(bindex)}")
+
+
+def _migrate_with_interloper(path: Path, interloper) -> tuple[int | None, str]:
+    """Open `path`, and migrate it — but run `interloper(path)` from a
+    second connection at the worst possible moment: after this connection has
+    read user_version and decided what is pending, before it applies any of
+    it. That window is where two processes opening one store actually
+    collide, and a thread race only lands in it some of the time.
+
+    Returns (the version migrate() reported, any error text)."""
+    conn = db._open(path)
+    real_apply = db._apply
+    fired = []
+
+    def racing_apply(*args, **kwargs):
+        if not fired:
+            fired.append(True)
+            interloper(path)
+        return real_apply(*args, **kwargs)
+
+    try:
+        with mock.patch.object(db, "_apply", racing_apply):
+            try:
+                return db.migrate(conn, path), ""
+            except db.MigrationError as exc:
+                return None, str(exc)
+    finally:
+        conn.close()
+
+
+def _other_opener_migrates(path: Path) -> None:
+    db.connect(path).close()
+
+
+def test_racing_openers_deterministic() -> None:
+    for label, build in (("a v0.3 store", build_v03_store),
+                         ("an empty store", lambda p: p.parent.mkdir(parents=True, exist_ok=True))):
+        target = ROOT / "race-fixed" / label.replace(" ", "-").replace(".", "") / "store.db"
+        build(target)
+        version, error = _migrate_with_interloper(target, _other_opener_migrates)
+        check(f"{label}: the second opener's migrate() does not fail", not error, error)
+        check(f"{label}: it reports the latest version", version == len(db.MIGRATIONS),
+              f"reported {version}")
+        check(f"{label}: the store ends at the latest version",
+              user_version(target) == len(db.MIGRATIONS), f"v{user_version(target)}")
+    legacy = ROOT / "race-fixed" / "a-v03-store" / "store.db"
+    con = sqlite3.connect(legacy)
+    try:
+        rows = con.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0]
+    finally:
+        con.close()
+    check("the raced legacy store keeps its rows", rows == len(V03_ARTIFACTS), f"{rows} rows")
+
+
+def test_racing_openers_threaded() -> None:
+    """The same race with no hook in it: two threads, two connections, one
+    barrier, several rounds. Nondeterministic by nature, which is why the
+    deterministic version above is the one that pins the fix down; this is
+    the check that nothing else about two real openers collides (the
+    backup, the lock wait) either."""
+    errors: list[str] = []
+    for round_number in range(10):
+        target = ROOT / "race-threads" / f"round-{round_number}" / "store.db"
+        if round_number % 2:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            build_v03_store(target)
+        barrier = threading.Barrier(2)
+
+        def opener(name: str) -> None:
+            # The barrier is before _open, not after it: opening is part of
+            # the race (the first opener of a legacy file converts it to WAL),
+            # and a thread that failed there must not leave the other one
+            # waiting at a barrier forever — hence the timeout as well.
+            conn = None
+            try:
+                barrier.wait(timeout=30)
+                conn = db._open(target)
+                db.migrate(conn, target)
+            except Exception as exc:  # noqa: BLE001 — collected and reported
+                errors.append(f"round {round_number} {name}: {type(exc).__name__}: {exc}")
+            finally:
+                if conn is not None:
+                    conn.close()
+
+        threads = [threading.Thread(target=opener, args=(n,)) for n in ("a", "b")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if user_version(target) != len(db.MIGRATIONS):
+            errors.append(f"round {round_number}: ended at v{user_version(target)}")
+        backups = sorted(p.name for p in target.parent.glob("store.db.bak-*"))
+        expected = [] if round_number % 2 else ["store.db.bak-v0"]
+        if backups != expected:
+            errors.append(f"round {round_number}: backups {backups}, expected {expected}")
+    check("two threads racing migrate() on one store both succeed, every round",
+          not errors, "; ".join(errors[:3]))
+
+
+def test_racing_newer_store_is_refused() -> None:
+    target = ROOT / "race-newer" / "store.db"
+    build_store_at(target, 2)
+    newer = len(db.MIGRATIONS) + 1
+
+    def newer_dsos_migrates(path: Path) -> None:
+        con = sqlite3.connect(path)
+        try:
+            con.execute(f"PRAGMA user_version = {newer}")
+            con.commit()
+        finally:
+            con.close()
+
+    version, error = _migrate_with_interloper(target, newer_dsos_migrates)
+    check("a store a newer dsos migrated mid-open is still refused",
+          error == f"store was created by a newer dsos (schema v{newer}); upgrade dsos.",
+          error or f"migrate() returned {version}")
+    check("and is left at the newer dsos's version", user_version(target) == newer,
+          f"v{user_version(target)}")
 
 
 def test_fresh_store() -> None:
@@ -507,6 +715,11 @@ def main() -> None:
     case("validations are append-only in the schema", test_validations_are_append_only)
     case("the spine CHECK constraints reject bad values", test_check_constraints)
     case("a fresh store and a migrated store agree", test_fresh_and_migrated_agree)
+    case("the tool_calls(session_id) index is there and used", test_session_index_is_used)
+    case("a v3 store upgrades to v4", test_v3_store_upgrades_to_v4)
+    case("two openers racing migrate() both succeed", test_racing_openers_deterministic)
+    case("two threads racing migrate() both succeed", test_racing_openers_threaded)
+    case("a newer store is refused even mid-race", test_racing_newer_store_is_refused)
 
     shutil.rmtree(ROOT, ignore_errors=True)
     if FAILURES:
