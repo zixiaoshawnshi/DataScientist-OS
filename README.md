@@ -7,7 +7,7 @@ an agent's analysis, not a notebook or a dashboard. See
 model, and demo plan.
 
 Runs from a local venv against the source tree during development; tagged
-releases (currently `v0.2.0`) are citable checkpoints — see "Installing a
+releases (currently `v0.5.0`) are citable checkpoints — see "Installing a
 released version" below.
 
 ## Status
@@ -57,7 +57,7 @@ cut (see "Cutting a release" below) — it's not a real git "latest release"
 feature (git/pip have no such concept for `git+https` installs), just a
 floating alias so this command never needs hand-editing. Pin an explicit
 `@vX.Y.Z` instead if you want a reproducible install that won't shift under
-you later (currently `v0.2.0`).
+you later (currently `v0.5.0`).
 
 This is a real (non-editable) build, not the editable install above —
 verified against a throwaway venv as part of cutting each release, since an
@@ -89,8 +89,15 @@ tracking main directly.
 ## Running the server standalone
 
 The store is owned by one long-lived daemon; `python -m dsos.mcp_server` is
-only a stdio shim that finds it and forwards to it. Start the daemon first,
-with the store and the default analysis interpreter in *its* environment:
+only a stdio shim that forwards to it — and **starts it** the first time a
+client needs it, with the client's `DSOS_DB_PATH` and `DSOS_PYTHON_PATH`.
+So registering the shim (below) is enough; the daemon then keeps running,
+detached, for every later client and the GUI, and logs to
+`<store>.daemon.log`.
+
+To run it yourself instead (a service, a login task), start it with the
+store and the default analysis interpreter in *its* environment, and set
+`DSOS_NO_AUTOSTART=1` on the registrations:
 
 ```sh
 DSOS_DB_PATH="<abs path>/store.db" DSOS_PYTHON_PATH="<analysis python>" \
@@ -101,9 +108,10 @@ DSOS_DB_PATH="<abs path>/store.db" DSOS_PYTHON_PATH="<analysis python>" \
 
 Use an absolute `DSOS_DB_PATH` — otherwise the daemon defaults to
 `data/store.db` relative to wherever it happens to be launched, which
-silently scatters a fresh empty store into whatever directory that is.
-`DSOS_PYTHON_PATH` is read by the daemon, which is where `run_python` runs;
-it does nothing in an MCP client's config.
+silently scatters a fresh empty store into whatever directory that is (the
+shim refuses to start a daemon without one for exactly this reason). A
+released install's daemon takes a port in 8765–8779, a source checkout's in
+8780–8799, so the two never collide.
 
 ## Wiring into a coding agent
 
@@ -113,19 +121,23 @@ Code"). The summary, for a human doing it manually:
 
 Both agents below use the identical command, so registering once makes it
 available from any repo the agent opens — no per-project setup. Both launch
-the shim, which needs the daemon above running over the same
-`DSOS_DB_PATH`; the shim itself reads only that variable.
+the shim, which starts the store's daemon if none is running; the
+registration's environment is what that daemon is started with. For a
+released install add `-P` before `-m` (it stops the working directory
+shadowing the installed package — see AGENTS.md).
 
 **Claude Code** (registered globally, one time):
 
 ```sh
 claude mcp add dsos -s user \
   -e DSOS_DB_PATH="<repo>/data/store.db" \
+  -e DSOS_PYTHON_PATH="<analysis python>" \
   -- "<repo>/.venv/Scripts/python.exe" -m dsos.mcp_server
 ```
 
-**Pi coding agent** (needs `pi install npm:pi-mcp-adapter` first; it reads the
-standard tool-agnostic global config directly). Write `~/.config/mcp/mcp.json`:
+**Pi coding agent** (needs `pi install npm:pi-mcp-adapter` first). Write
+`~/.pi/agent/mcp.json` (pi also reads the shared `~/.config/mcp/mcp.json`;
+define each server name in only one of the two):
 
 ```json
 {
@@ -133,7 +145,8 @@ standard tool-agnostic global config directly). Write `~/.config/mcp/mcp.json`:
     "dsos": {
       "command": "<repo>/.venv/Scripts/python.exe",
       "args": ["-m", "dsos.mcp_server"],
-      "env": { "DSOS_DB_PATH": "<repo>/data/store.db" }
+      "env": { "DSOS_DB_PATH": "<repo>/data/store.db",
+               "DSOS_PYTHON_PATH": "<analysis python>" }
     }
   }
 }
@@ -236,10 +249,13 @@ dsos/
                  resolution/validation/rendering (built-ins live in assets/)
   present.py     shared artifact-payload rendering — used by both the MCP
                  server and the GUI so they can't drift apart
-  mcp_server.py  the stdio shim: finds the daemon and proxies one profile to
-                 it, plus the lazily-built `mcp` the tests import
+  mcp_server.py  the stdio shim: finds (or starts) the daemon and proxies one
+                 profile to it, plus the lazily-built `mcp` the tests import
+  autostart.py   starts a detached daemon for a store when the shim needs one
   daemon.py      the process that owns the store — GUI + both MCP profiles
                  off one Database, one per store, guarded by <store>.daemon.json
+  channel.py     prod (released install) vs dev (source checkout): port ranges
+  paths.py       one canonical spelling for a store path
   server/        the MCP layer proper: build_producer/build_consumer over a
                  ServerConfig, the tool-call logger, the instructions, and
                  contract.py (renders the tool table into Doc II)
@@ -283,6 +299,8 @@ tests/
   contract_smoke_test.py     Doc II's tool tables are the generated ones
   daemon_smoke_test.py       the daemon: auth, both profiles, one store
   shim_smoke_test.py         dsos.mcp_server proxies the daemon, owns no store
+  autostart_smoke_test.py    the shim starts one detached daemon per store
+  channel_smoke_test.py      prod/dev port ranges; busy ports refused early
 Design/
   DS Artifact OS — Design Doc.md   philosophy, data model, MCP tool list,
                                     demo plan

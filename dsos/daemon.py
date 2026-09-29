@@ -8,7 +8,11 @@ is not safe. Decision D8 fixes the shape: one `Database` per process, one
 connection per thread, one process-wide write lock, one daemon per store.
 This module is the process that has that `Database`.
 
-    python -m dsos.daemon [--host 127.0.0.1] [--port 8765]      # DSOS_PORT works too
+    python -m dsos.daemon [--host 127.0.0.1] [--port N]      # DSOS_PORT works too
+
+With no port, it takes the first free one in its channel's range
+(dsos.channel: prod 8765-8779 for a released install, dev 8780-8799 for a
+source checkout), so a released daemon and a dev daemon never contend.
 
 It serves three things off one ASGI app, which is the point rather than a
 convenience:
@@ -50,6 +54,7 @@ import argparse
 import json
 import os
 import secrets
+import socket
 import sys
 import urllib.error
 import urllib.request
@@ -63,12 +68,21 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from dsos import gui
+from dsos import paths
+from dsos.channel import channel
+from dsos.paths import store_path
 from dsos.db import Database
 from dsos.server import ServerConfig, build_consumer, build_producer
 from dsos.server.common import server_version
 
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8765
+
+# Each channel (dsos.channel) owns a port range, so a released daemon and a
+# source-checkout daemon never contend for the same default. With no port
+# given, a daemon takes the first free port in its channel's range — the
+# shim finds it through the store's manifest, so the number itself does not
+# matter to a client. An explicit port is used exactly or not at all.
+PORT_RANGES = {"prod": range(8765, 8780), "dev": range(8780, 8800)}
 
 # The binds this daemon will accept. "localhost" is here because it is what
 # someone types; it resolves to a loopback address, and the check is about
@@ -104,20 +118,87 @@ def db_path_from_env() -> Path:
     """Where the store is, from DSOS_DB_PATH or the usual default. Same
     lookup dsos.mcp_server does, so a client and its daemon agree without
     the user having to say it twice."""
-    return Path(os.environ.get("DSOS_DB_PATH", "data/store.db")).resolve()
+    return store_path(os.environ.get("DSOS_DB_PATH", "data/store.db"))
 
 
-def resolve_port(cli_port: int | None) -> int:
-    """--port wins over DSOS_PORT, which wins over the default. argparse only
-    supplies the default when the flag is absent, so the env var is consulted
-    here rather than in the parser — a user who exports DSOS_PORT once should
-    not have to remember the flag as well."""
+class PortUnavailable(RuntimeError):
+    """No port this daemon may bind is free. Raised before the store is
+    opened, so a daemon that cannot serve never migrates anything."""
+
+
+def explicit_port(cli_port: int | None) -> int | None:
+    """--port wins over DSOS_PORT; None means "pick one from the channel's
+    range". argparse only supplies a default when the flag is absent, so the
+    env var is consulted here rather than in the parser — a user who exports
+    DSOS_PORT once should not have to remember the flag as well."""
     if cli_port is not None:
         return cli_port
     from_env = os.environ.get(PORT_ENV)
     if from_env:
         return int(from_env)
-    return DEFAULT_PORT
+    return None
+
+
+def port_in_use(host: str, port: int) -> bool:
+    """Is anything already listening where this daemon would bind?
+
+    Two probes, because either alone misses a case that has actually
+    happened here. A connect catches any listener that answers on this
+    host, including one bound to every interface — on Windows a daemon can
+    bind 127.0.0.1:8765 *alongside* a `python -m http.server 8765` on
+    0.0.0.0, and then the two silently split the traffic. A bind catches a
+    socket that is bound but not accepting. SO_EXCLUSIVEADDRUSE makes the
+    Windows bind refuse to share, which is the behaviour the probe needs.
+    """
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.3)
+        if probe.connect_ex((host, port)) == 0:
+            return True
+    with socket.socket(family, socket.SOCK_STREAM) as probe:
+        exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if exclusive is not None:
+            probe.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        try:
+            probe.bind((host, port))
+        except OSError:
+            return True
+    return False
+
+
+def describe_port_owner(host: str, port: int) -> str:
+    """Who holds that port, in the terms a user can act on."""
+    answer = _healthz(f"http://{host}:{port}", timeout=1.0)
+    if answer and isinstance(answer.get("db_path"), str):
+        return (f"a dsos {answer.get('channel', '(pre-channel)')} daemon "
+                f"v{answer.get('version', '?')} serving {answer['db_path']}")
+    return "a process that is not a dsos daemon"
+
+
+def choose_port(host: str, cli_port: int | None, chan: str,
+                candidates: range | None = None) -> int:
+    """The port to bind: the explicit one if it is free, else the first free
+    port in this channel's range. Raises PortUnavailable, naming who is in
+    the way, rather than letting uvicorn fail after the store is opened."""
+    wanted = explicit_port(cli_port)
+    if wanted is not None:
+        if port_in_use(host, wanted):
+            raise PortUnavailable(
+                f"port {wanted} is taken by {describe_port_owner(host, wanted)}. "
+                f"Pick another with --port/{PORT_ENV}, or leave both unset to take the "
+                f"first free port in the {chan} range "
+                f"({PORT_RANGES[chan].start}-{PORT_RANGES[chan].stop - 1})."
+            )
+        return wanted
+    candidates = candidates or PORT_RANGES[chan]
+    for port in candidates:
+        if not port_in_use(host, port):
+            return port
+    raise PortUnavailable(
+        f"every port in the {chan} range ({candidates.start}-{candidates.stop - 1}) is "
+        f"taken; the first is held by {describe_port_owner(host, candidates.start)}. "
+        f"Stop a daemon you no longer need, or pass --port."
+    )
 
 
 def _pid_alive(pid: int) -> bool:
@@ -280,9 +361,7 @@ def same_store(a: str | Path, b: str | Path) -> bool:
     store look like two; then case-folded where the filesystem is (normcase
     is a no-op off Windows, which is the right answer there).
     """
-    def canonical(p: str | Path) -> str:
-        return os.path.normcase(str(Path(p).resolve()))
-    return canonical(a) == canonical(b)
+    return paths.same_store(a, b)
 
 
 def _healthz(base_url: str, timeout: float = 2.0) -> dict | None:
@@ -306,6 +385,7 @@ def write_manifest(db_path: Path, port: int, base_url: str) -> None:
                 "base_url": base_url,
                 "db_path": str(db_path),
                 "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "channel": channel(),
             },
             indent=2,
         ),
@@ -382,7 +462,8 @@ def build_app(config: ServerConfig, db_path: Path, db_dir: Path) -> FastAPI:
         from a live one. Both compare `db_path` against the store they were
         pointed at, so the path is part of the answer, not decoration.
         """
-        return {"ok": True, "version": server_version(), "db_path": str(db_path)}
+        return {"ok": True, "version": server_version(), "db_path": str(db_path),
+                "channel": channel()}
 
     app.mount("/mcp/producer", producer_app)
     app.mount("/mcp/consumer", consumer_app)
@@ -400,7 +481,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--port", type=int, default=None,
-        help=f"port to bind ({DEFAULT_PORT}); overridden by {PORT_ENV}",
+        help=(f"port to bind (also {PORT_ENV}); default: the first free port in this "
+              f"channel's range, prod {PORT_RANGES['prod'].start}-{PORT_RANGES['prod'].stop - 1}, "
+              f"dev {PORT_RANGES['dev'].start}-{PORT_RANGES['dev'].stop - 1}"),
     )
     return parser.parse_args(argv)
 
@@ -417,12 +500,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    try:
-        port = resolve_port(args.port)
-    except ValueError as exc:
-        print(f"dsos: {PORT_ENV} is not a port number: {exc}", file=sys.stderr)
-        return 2
-
     db_path = db_path_from_env()
     db_dir = db_path.parent
     db_dir.mkdir(parents=True, exist_ok=True)
@@ -431,6 +508,20 @@ def main(argv: list[str] | None = None) -> int:
     except DaemonConflict as exc:
         print(f"dsos: {exc}", file=sys.stderr)
         return 3
+
+    # The port is settled BEFORE the store is opened. Opening it migrates
+    # it, and a daemon that then fails to bind has changed the store and
+    # served nothing — which is how a busy port used to surface: as a
+    # migrated store, a vanished manifest, and a uvicorn warning.
+    chan = channel()
+    try:
+        port = choose_port(args.host, args.port, chan)
+    except ValueError as exc:
+        print(f"dsos: {PORT_ENV} is not a port number: {exc}", file=sys.stderr)
+        return 2
+    except PortUnavailable as exc:
+        print(f"dsos: {exc}", file=sys.stderr)
+        return 4
 
     base_url = f"http://{args.host}:{port}"
     db = Database(db_path)
@@ -444,7 +535,7 @@ def main(argv: list[str] | None = None) -> int:
     app = build_app(config, db_path, db_dir)
     write_manifest(db_path, port, base_url)
     print(
-        f"dsos daemon on {base_url} serving {db_path}\n"
+        f"dsos {chan} daemon v{server_version()} on {base_url} serving {db_path}\n"
         f"  producer: {base_url}/mcp/producer/\n"
         f"  consumer: {base_url}/mcp/consumer/\n"
         f"  gui:      {base_url}/\n"
@@ -453,6 +544,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         uvicorn.run(app, host=args.host, port=port, log_level="warning")
+    except SystemExit as exc:
+        # uvicorn exits this way when the bind fails — the port was taken
+        # between choose_port's probe and now. Say so in dsos's words
+        # instead of leaving a uvicorn warning as the only trace.
+        if exc.code:
+            print(f"dsos: could not bind {base_url}: it was taken as the daemon "
+                  f"started ({describe_port_owner(args.host, port)}). Start it again "
+                  f"to take the next free port.", file=sys.stderr)
+            return 4
+        raise
     finally:
         # Belt to the lifespan's braces: uvicorn's own shutdown does not
         # always reach the finaliser above (a failed bind, for one), and a

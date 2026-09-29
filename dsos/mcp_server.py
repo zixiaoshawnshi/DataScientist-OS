@@ -95,6 +95,8 @@ if __name__ == "__main__":
     from fastmcp.client.transports import StreamableHttpTransport
     from fastmcp.server import create_proxy
 
+    from dsos import autostart, paths
+    from dsos.channel import channel
     from dsos.server.common import CLIENT_SESSION_HEADER
 
     URL_ENV = "DSOS_URL"
@@ -123,9 +125,7 @@ if __name__ == "__main__":
     def _same_store(a: str | Path, b: str | Path) -> bool:
         """The comparison dsos.daemon.same_store makes, for the same reason:
         resolved, then case-folded where the filesystem is."""
-        def canonical(p: str | Path) -> str:
-            return os.path.normcase(str(Path(p).resolve()))
-        return canonical(a) == canonical(b)
+        return paths.same_store(a, b)
 
     def _manifest_path(db_path: Path) -> Path:
         """`<store file>.daemon.json` — dsos.daemon.manifest_path's rule."""
@@ -160,20 +160,32 @@ if __name__ == "__main__":
         base_url = (record or {}).get("base_url")
         return base_url if isinstance(base_url, str) and base_url else None
 
-    def _no_daemon(db_path: Path) -> int:
+    def _no_daemon(db_path: Path, why_not_started: str = "") -> int:
         """The one failure a new user hits first, said the one useful way.
 
         It names the store (so it is obvious which of several DSOS_DB_PATH
         values is the problem) and the exact command, built from the
         interpreter actually running this shim rather than a hardcoded
-        `python` — which, in a venv, is very often the wrong one.
+        `python` — which, in a venv, is very often the wrong one — plus why
+        the shim did not simply start one itself.
         """
         print(
             f"dsos daemon not running for {db_path}. "
-            f"Start it: {sys.executable} -m dsos.daemon",
+            f"Start it: {sys.executable} -m dsos.daemon"
+            + (f" ({why_not_started})" if why_not_started else ""),
             file=sys.stderr,
         )
         return 1
+
+    def _live_base_url(db_path: Path) -> str | None:
+        """The manifest's base URL, but only while a daemon there answers
+        /healthz for THIS store — what "a daemon is running for it" means."""
+        url = _manifest_base_url(db_path)
+        answer = _healthz(url) if url else None
+        if answer is None:
+            return None
+        served = answer.get("db_path")
+        return url if not isinstance(served, str) or _same_store(served, db_path) else None
 
     def _token_file_token(db_dir: Path) -> str:
         """The token the daemon wrote beside the store, or "" if it never did."""
@@ -202,19 +214,44 @@ if __name__ == "__main__":
         # The same lookup dsos.daemon does, deliberately: a client and its
         # daemon have to agree on which store is meant without the user saying
         # it twice, and this is also what the failure message names.
-        db_path = Path(os.environ.get("DSOS_DB_PATH", "data/store.db")).resolve()
+        db_path = paths.store_path(os.environ.get("DSOS_DB_PATH", "data/store.db"))
         db_dir = db_path.parent
 
         from_env = os.environ.get(URL_ENV)
         base_url = from_env or _manifest_base_url(db_path)
+
+        # No daemon serving this store: start one, unless the user pointed
+        # at a specific daemon (DSOS_URL — starting a different one would
+        # ignore them), turned it off, or never said which store. That last
+        # guard matters: with no DSOS_DB_PATH the store is data/store.db
+        # under whatever directory the client launched this from, and a
+        # daemon started there would quietly create a new, empty store in
+        # some project folder — the pitfall AGENTS.md step 2 warns about.
+        # When it is not started, the checks below still run and say why in
+        # their own terms (a manifest naming another store's daemon is named
+        # as such); `not_started` only adds the reason no daemon was started.
+        not_started = ""
+        if not from_env and _live_base_url(db_path) is None:
+            if not autostart.enabled():
+                not_started = f"automatic start is off: {autostart.DISABLE_ENV}"
+            elif "DSOS_DB_PATH" not in os.environ:
+                not_started = ("not started automatically because DSOS_DB_PATH is not set; "
+                               "set it to the store's absolute path")
+            else:
+                try:
+                    base_url = autostart.start_daemon(db_path, lambda: _live_base_url(db_path))
+                except autostart.AutostartError as exc:
+                    print(f"dsos: {exc}", file=sys.stderr)
+                    return 1
+
         if not base_url:
-            return _no_daemon(db_path)
+            return _no_daemon(db_path, not_started)
         answer = _healthz(base_url)
         if answer is None:
             # A manifest left by a daemon that is gone, or a DSOS_URL that
             # points at nothing. Both are the same thing to the user, and
             # the same command fixes both.
-            return _no_daemon(db_path)
+            return _no_daemon(db_path, not_started)
         served = answer.get("db_path")
         # Checked whenever the user named a store. DSOS_URL with no
         # DSOS_DB_PATH at all names none — the default is a guess relative to
@@ -238,6 +275,16 @@ if __name__ == "__main__":
                 file=sys.stderr,
             )
             return 1
+
+        # A note, not a refusal: the store check above is what guards against
+        # writing to the wrong file, and a dev shim talking to a released
+        # daemon over the right store is legitimate. But it is also exactly
+        # how a prod registration ends up running checkout code (or the
+        # reverse) without anyone noticing, so it is said out loud.
+        mine, theirs = channel(), answer.get("channel")
+        if isinstance(theirs, str) and theirs != mine:
+            print(f"dsos: note — this {mine} shim is proxying to a {theirs} daemon at "
+                  f"{base_url} (v{answer.get('version', '?')}).", file=sys.stderr)
 
         token = os.environ.get(TOKEN_ENV) or _token_file_token(db_dir)
         if not token:

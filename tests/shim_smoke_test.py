@@ -133,6 +133,10 @@ def child_env(**overrides: str) -> dict[str, str]:
     # discovery files the first check is about.
     env.pop("DSOS_URL", None)
     env.pop("DSOS_TOKEN", None)
+    # This test is about the shim finding (or refusing) a daemon it did not
+    # start; starting one itself is tests/autostart_smoke_test.py's subject,
+    # and would turn every refusal checked here into a start.
+    env["DSOS_NO_AUTOSTART"] = "1"
     env.update(overrides)
     return env
 

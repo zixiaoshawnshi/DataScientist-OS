@@ -74,82 +74,106 @@ analysis stack into the dedicated venv from step 1 —
 (or `.venv/Scripts/pip install -e ".[analysis]"` for the editable-install
 case) — and point `DSOS_PYTHON_PATH` at that same venv's interpreter.
 
-`DSOS_PYTHON_PATH` is a **daemon** setting, not an MCP-client one: every
-`run_python` call executes in the daemon (step 4), which reads the variable
-once, at start-up. Setting it in an MCP client's registration does nothing,
-because the stdio shim that client launches never reads it. To change it,
-restart the daemon.
+`DSOS_PYTHON_PATH` is read by the **daemon** (step 4), once, when it starts:
+every `run_python` call executes there. Put it in the MCP registration's
+environment anyway — the shim passes its environment to the daemon it
+starts. A daemon that is already running keeps the value it started with;
+restart it to change it.
 
-## 4. Start the daemon, then register the MCP server
+## 4. Register the MCP server (it starts the daemon for you)
 
 Find the python executable from step 1 first (the venv's, not a system
 one) — call it `<python>` below, the chosen path from step 2 `<db>`, and
 the interpreter from step 3 `<analysis-python>`.
 
-**First, start the daemon.** The store is owned by a long-lived process, not
-by the MCP server: one `python -m dsos.daemon` per store, serving the GUI and
-both MCP profiles off one database connection. `dsos.mcp_server` is now only
-a shim — it finds that daemon and forwards to it over stdio, which is what
-lets a stdio-only client talk to a server that is not a subprocess of its
-own. Without a daemon, the shim exits immediately and says so.
+**How it runs.** The store is owned by one long-lived process per store,
+the daemon (`python -m dsos.daemon`), which serves the GUI and both MCP
+profiles. What an MCP client launches, `python -m dsos.mcp_server`, is a
+thin stdio shim that forwards to it. **The shim starts the daemon itself**
+the first time a client needs one: registering the shim is the whole
+install. The daemon then keeps running, detached, for every later client
+and the GUI; it is not tied to the client that happened to start it.
 
-The daemon is the process that owns the store and runs the analysis, so it
-is the one that needs **both** settings: `DSOS_DB_PATH` (which store) and
-`DSOS_PYTHON_PATH` (which interpreter `run_python` uses by default). Set
-them in the daemon's own environment. A daemon started with no
-`DSOS_DB_PATH` opens `data/store.db` under whatever directory you launched
-it from — exactly the pitfall step 2 warns about.
+The registration's environment is the configuration:
 
-macOS/Linux (POSIX shell):
+- `DSOS_DB_PATH` — **required, absolute.** Which store. The shim will not
+  start a daemon without it: the fallback is `data/store.db` under whatever
+  directory the client launched from, and a daemon there would quietly
+  create a new, empty store in some project folder.
+- `DSOS_PYTHON_PATH` — the analysis interpreter from step 3.
+- Optional: `DSOS_PORT` (default: the first free port in the channel's
+  range, below), `DSOS_NO_AUTOSTART=1` (never start a daemon; see
+  "Managing the daemon yourself"), `DSOS_AUTOSTART_TIMEOUT` (seconds to
+  wait for a first start, default 90).
 
-```sh
-DSOS_DB_PATH="<db>" DSOS_PYTHON_PATH="<analysis-python>" "<python>" -m dsos.daemon
-```
-
-Windows (PowerShell):
-
-```powershell
-$env:DSOS_DB_PATH = "<db>"; $env:DSOS_PYTHON_PATH = "<analysis-python>"; & "<python>" -m dsos.daemon
-```
-
-It prints its base URL and where the store is, and writes a manifest named
-after the store (`store.db.daemon.json` for `store.db`) and `daemon.token`
-next to it — that is how the shim finds it, so the
-daemon and the client must agree on `DSOS_DB_PATH` (the shim checks: a
-daemon serving a different store is reported as "not running for `<db>`",
-with both paths named). Leave it running for as long as you want dsos
-available; it serves the read-only GUI at `http://127.0.0.1:8765/` too.
-
-Relative paths in tool calls — `content_path` on `save_artifact`,
-`code_paths` and `python_path` on `run_python` — are resolved by the
-daemon, against the directory the *daemon* was started from, not the
-agent's. Pass absolute paths.
-
-**Claude Code** (the shim, over stdio). The shim needs only `DSOS_DB_PATH`,
-to find the store's manifest (`<store>.daemon.json`) and `daemon.token`
-beside it; everything else
-is the daemon's:
+**Claude Code** (the shim, over stdio):
 
 ```sh
 claude mcp add dsos -s user \
   -e DSOS_DB_PATH="<db>" \
-  -- "<python>" -m dsos.mcp_server --profile producer
+  -e DSOS_PYTHON_PATH="<analysis-python>" \
+  -- "<python>" -P -m dsos.mcp_server --profile producer
 ```
 
 **Pi coding agent** (needs `pi install npm:pi-mcp-adapter` first). Add to
-`~/.config/mcp/mcp.json`:
+`~/.pi/agent/mcp.json` (pi also reads the shared `~/.config/mcp/mcp.json`;
+define each server name in only one of the two, or the entries shadow each
+other):
 
 ```json
 {
   "mcpServers": {
     "dsos": {
       "command": "<python>",
-      "args": ["-m", "dsos.mcp_server", "--profile", "producer"],
-      "env": { "DSOS_DB_PATH": "<db>" }
+      "args": ["-P", "-m", "dsos.mcp_server", "--profile", "producer"],
+      "env": { "DSOS_DB_PATH": "<db>", "DSOS_PYTHON_PATH": "<analysis-python>" }
     }
   }
 }
 ```
+
+**`-P` is for released installs** (drop it for a source checkout, where it
+is harmless but unneeded). `python -m` puts the current directory first on
+`sys.path`, and MCP clients launch servers from the project directory:
+opened inside a dsos checkout, a release's `-m dsos.mcp_server` would
+import the *checkout's* code instead of its own. `-P` (Python 3.11+) turns
+that off. The daemon the shim starts is always started with `-P`.
+
+**What you will see beside the store** once a daemon has run:
+`<store>.daemon.json` (the manifest: pid, port, base URL, channel — how
+shims find it), `daemon.token` (the bearer token, one per directory), and
+`<store>.daemon.log` (the daemon's output — read this first if a client
+reports that the daemon did not start). The GUI is at the base URL in the
+manifest.
+
+**Ports: prod and dev never share one.** The daemon knows which channel it
+is — `prod` for a released install, `dev` for a source checkout (override
+with `DSOS_CHANNEL=prod|dev`) — and with no `--port`/`DSOS_PORT` it takes
+the first free port in that channel's range: **prod 8765–8779, dev
+8780–8799**. Clients never need the number (the shim reads it from the
+manifest), so let it choose unless you register the HTTP endpoint directly.
+An explicit port is used exactly: if it is taken, the daemon refuses before
+opening the store and names who holds it.
+
+Relative paths in tool calls — `content_path` on `save_artifact`,
+`code_paths` and `python_path` on `run_python` — are resolved by the
+daemon, which runs from the store's directory, not the agent's. Pass
+absolute paths.
+
+**Managing the daemon yourself** (a service, a login task, a different
+interpreter): set `DSOS_NO_AUTOSTART=1` on the registrations and start it
+with the same two settings:
+
+```sh
+DSOS_DB_PATH="<db>" DSOS_PYTHON_PATH="<analysis-python>" "<python>" -P -m dsos.daemon
+```
+
+```powershell
+$env:DSOS_DB_PATH = "<db>"; $env:DSOS_PYTHON_PATH = "<analysis-python>"; & "<python>" -P -m dsos.daemon
+```
+
+To stop a daemon, end the process whose pid is in `<store>.daemon.json`;
+the next client that needs it starts a fresh one (unless autostart is off).
 
 **Any other MCP-compatible client** (Claude Desktop, Cursor, etc.): the
 same `command` / `args` / `env` shape applies — adapt to that client's own
@@ -160,10 +184,12 @@ directly. One fewer process, and no proxy hop per tool call:
 
 ```sh
 claude mcp add --transport http -s user dsos \
-  http://127.0.0.1:8765/mcp/producer/ \
+  http://127.0.0.1:<port>/mcp/producer/ \
   --header "Authorization: Bearer <token>"
 ```
 
+`<port>` is the one the daemon printed; pin it with `--port` for an HTTP
+registration, since an auto-chosen port can differ after a restart.
 `<token>` is what the daemon printed, or the contents of the `daemon.token`
 file next to the store. If `DSOS_TOKEN` is set in the daemon's environment
 instead of written to a file, pass that same value here.
@@ -181,7 +207,8 @@ questions rather than running analysis — use the other profile:
 ```sh
 claude mcp add dsos-consumer -s user \
   -e DSOS_DB_PATH="<db>" \
-  -- "<python>" -m dsos.mcp_server --profile consumer
+  -e DSOS_PYTHON_PATH="<analysis-python>" \
+  -- "<python>" -P -m dsos.mcp_server --profile consumer
 ```
 
 It reaches `/mcp/consumer/`, which serves four read-oriented tools:
@@ -190,8 +217,9 @@ behind them), `get_claim` (one result in full, with its validation and
 derivation), `cite` (a pasteable reference plus a link to the result's GUI
 page) and `ask` (put a question the store cannot answer on the board for an
 analysis agent). None of them runs code or writes a finding. Register both
-profiles if you want both roles; the HTTP form works here too, at
-`http://127.0.0.1:8765/mcp/consumer/` with the same bearer token.
+profiles if you want both roles — both shims share one daemon, whichever
+starts first. The HTTP form works here too, at
+`http://127.0.0.1:<port>/mcp/consumer/` with the same bearer token.
 
 ## 5. Verify
 
@@ -230,13 +258,21 @@ On a fresh store the correct answer is an empty `results` list plus a
 through. It needs no session and no prior state, so it is the consumer's
 liveness check the way `start_session` is the producer's.
 
-If either profile comes back with an empty tool list, the shim connected to
-nothing: check that the daemon is still running (open
-`http://127.0.0.1:8765/healthz`, which answers `{ok, version, db_path}` with
-no token), and that its `db_path` is the store you registered — the client
-and the daemon must be given the same `DSOS_DB_PATH`. Launching the shim by
-hand prints the reason on stderr: no daemon at all, or a daemon that is
-serving a different store (it names both).
+The first call after registering can take several seconds: the shim is
+starting the daemon, which opens (and, for an older store, migrates) the
+store before it answers.
+
+If a profile fails to connect or comes back with an empty tool list:
+
+- Read `<store>.daemon.log` beside the store — a daemon that failed to
+  start says why there, and the shim repeats its last lines on stderr.
+- Open `<base_url>/healthz` (`base_url` is in `<store>.daemon.json`); it
+  answers `{ok, version, db_path, channel}` with no token. Its `db_path`
+  must be the store you registered.
+- Launch the shim by hand with the registration's environment; it prints
+  the reason on stderr — no `DSOS_DB_PATH` (so it would not start a
+  daemon), autostart turned off, or a daemon serving a different store (it
+  names both).
 
 ## Notes for the agent doing the installing
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dsos"
-version = "0.4.0"
+version = "0.5.0"
 description = "DS Artifact OS — the working-layer artifact store for agent-driven analysis"
 requires-python = ">=3.11"
 dependencies = [
