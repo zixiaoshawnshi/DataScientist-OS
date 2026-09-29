@@ -313,16 +313,18 @@
           <button class="copy" type="button">copy</button>
         </div>
         <pre class="cmd" data-panel="claude"><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
-<span class="p">$</span> claude mcp add dsos -s user -- python -m dsos.mcp_server</pre>
+<span class="p">$</span> claude mcp add dsos -s user -e DSOS_DB_PATH="$HOME/.dsos/store.db" -- python -P -m dsos.mcp_server</pre>
         <pre class="cmd" data-panel="pi" hidden><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
 <span class="p">$</span> pi install npm:pi-mcp-adapter
-<span class="c"># then add to ~/.config/mcp/mcp.json</span>
-{ "mcpServers": { "dsos": { "command": "python", "args": ["-m", "dsos.mcp_server"] } } }</pre>
+<span class="c"># then add to ~/.pi/agent/mcp.json (use your absolute home path)</span>
+{ "mcpServers": { "dsos": { "command": "python", "args": ["-P", "-m", "dsos.mcp_server"],
+  "env": { "DSOS_DB_PATH": "/home/you/.dsos/store.db" } } } }</pre>
         <pre class="cmd" data-panel="codex" hidden><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
-<span class="p">$</span> codex mcp add dsos -- python -m dsos.mcp_server</pre>
+<span class="p">$</span> codex mcp add dsos --env DSOS_DB_PATH="$HOME/.dsos/store.db" -- python -P -m dsos.mcp_server</pre>
         <pre class="cmd" data-panel="opencode" hidden><span class="p">$</span> pip install "git+https://github.com/zixiaoshawnshi/DataScientist-OS.git@latest"
-<span class="c"># then add to opencode.json</span>
-{ "mcp": { "dsos": { "type": "local", "command": ["python", "-m", "dsos.mcp_server"] } } }</pre>
+<span class="c"># then add to opencode.json (use your absolute home path)</span>
+{ "mcp": { "dsos": { "type": "local", "command": ["python", "-P", "-m", "dsos.mcp_server"],
+  "environment": { "DSOS_DB_PATH": "/home/you/.dsos/store.db" } } } }</pre>
 
         <div class="sub-block">
           <div class="block-head">

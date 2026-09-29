@@ -7,7 +7,7 @@ an agent's analysis, not a notebook or a dashboard. See
 model, and demo plan.
 
 Runs from a local venv against the source tree during development; tagged
-releases (currently `v0.2.0`) are citable checkpoints — see "Installing a
+releases (currently `v0.5.0`) are citable checkpoints — see "Installing a
 released version" below.
 
 ## Status
@@ -57,7 +57,7 @@ cut (see "Cutting a release" below) — it's not a real git "latest release"
 feature (git/pip have no such concept for `git+https` installs), just a
 floating alias so this command never needs hand-editing. Pin an explicit
 `@vX.Y.Z` instead if you want a reproducible install that won't shift under
-you later (currently `v0.2.0`).
+you later (currently `v0.5.0`).
 
 This is a real (non-editable) build, not the editable install above —
 verified against a throwaway venv as part of cutting each release, since an
