@@ -8,7 +8,9 @@ agent has no way to tell which is canonical. The benchmark pilot hit this
 in 7 of 10 reuse rounds.
 
 Covers: collapse on identical content, distinct content still registers,
-dedupe=False forces a real second copy, and the column migration on a
+dedupe=False forces a real second copy, that only a current result (the
+latest version, status='result') is a collapse target — never a superseded
+row, an exploratory one or an older version — and the column migration on a
 store created before content_hash existed.
 
 Run: .venv/Scripts/python.exe tests/dedupe_smoke_test.py
@@ -81,12 +83,102 @@ async def main() -> None:
               r4.get("row_id") and r4.get("row_id") != r1.get("row_id"))
 
         n_rows = (await client.call_tool("run_sql", {
-            "code": "SELECT COUNT(*) AS n FROM titanic", "session_id": s2,
+            "code": "SELECT COUNT(*) AS n FROM in_1", "session_id": s2,
             "title": "Row count", "description": "Count rows in the registered dataset.",
             "input_row_ids": [r1["row_id"]],
         })).data
         check("collapsed artifact is still queryable", n_rows.get("status") == "ok",
               f"status={n_rows.get('status')}")
+
+        # --- dedupe respects the lifecycle: only a CURRENT result is a thing
+        # a re-registration may collapse into. Collapsing into a superseded
+        # row hands back a row search hides and whose status stays
+        # superseded, so the claim the caller just made is invisible; into an
+        # exploratory one, the claim silently stays unclaimed.
+        def narrative(sid, text, title, **kw):
+            return {
+                **kw,
+                "type": "narrative", "title": title,
+                "description": f"Which region led Q3, as called in {title}.",
+                "content_format": "markdown", "session_id": sid, "content_text": text,
+            }
+
+        first_call = (await client.call_tool("save_artifact", narrative(
+            s1, "red leads q3", "Q3 leader first call"))).data
+        corrected = (await client.call_tool("save_artifact", narrative(
+            s1, "blue leads q3", "Q3 leader corrected call"))).data
+        await client.call_tool("mark", {
+            "row_id": first_call["row_id"], "session_id": s1, "status": "superseded",
+            "superseded_by": corrected["row_id"],
+        })
+        reclaimed = (await client.call_tool("save_artifact", narrative(
+            s2, "red leads q3", "Q3 leader rederived call",
+            caveats=["west region only"]))).data
+        check("identical content to a SUPERSEDED row registers a new row",
+              reclaimed.get("row_id") and reclaimed.get("row_id") != first_call["row_id"]
+              and not reclaimed.get("deduplicated"), str(reclaimed)[:200])
+        from dsos import db, store  # import after DSOS_DB_PATH is set
+
+        conn = db.connect(os.environ["DSOS_DB_PATH"])
+        row = conn.execute(
+            "SELECT status, caveats FROM artifacts WHERE row_id = ?", (reclaimed.get("row_id"),)
+        ).fetchone()
+        check("...as a result carrying the new caveats",
+              row is not None and row["status"] == "result"
+              and "west region only" in (row["caveats"] or ""),
+              str(dict(row) if row else None))
+        check("...and the superseded row is left exactly as it was",
+              conn.execute("SELECT status, superseded_by FROM artifacts WHERE row_id = ?",
+                           (first_call["row_id"],)).fetchone()["superseded_by"]
+              == corrected["row_id"])
+        hits = (await client.call_tool("search_artifacts", {
+            "query": "Q3 leader rederived", "session_id": s2})).data["results"]
+        check("...and the re-registration is searchable",
+              any(h["row_id"] == reclaimed.get("row_id") for h in hits),
+              str([h["title"] for h in hits]))
+        check("...and is evidence to a consumer",
+              any(a.row_id == reclaimed.get("row_id")
+                  for a, _, _ in store.find_evidence(conn, "Q3 leader rederived")))
+
+        same_as_current = (await client.call_tool("save_artifact", narrative(
+            s3, "blue leads q3", "Q3 leader corrected again"))).data
+        check("identical content to a current RESULT still collapses",
+              same_as_current.get("row_id") == corrected["row_id"]
+              and same_as_current.get("deduplicated") is True, str(same_as_current)[:200])
+
+        parked = (await client.call_tool("save_artifact", narrative(
+            s1, "green leads q4", "Q4 leader parked", status="exploratory"))).data
+        claimed = (await client.call_tool("save_artifact", narrative(
+            s2, "green leads q4", "Q4 leader claimed"))).data
+        check("identical content to an EXPLORATORY row registers a new result",
+              claimed.get("row_id") and claimed.get("row_id") != parked.get("row_id")
+              and not claimed.get("deduplicated"), str(claimed)[:200])
+        claimed_again = (await client.call_tool("save_artifact", narrative(
+            s3, "green leads q4", "Q4 leader claimed twice"))).data
+        check("...and the next identical save collapses into that result, not the lead",
+              claimed_again.get("row_id") == claimed.get("row_id"), str(claimed_again)[:200])
+
+        # An older VERSION of a logical artifact is no more current than a
+        # superseded row: search reads the latest version only, so a collapse
+        # into v1 would hand back a row nothing can find.
+        v1 = store.save_artifact(
+            conn, type="narrative", title="Q2 leader", description="Which region led Q2.",
+            content="amber leads q2", content_format="markdown", session_id=s1,
+            artifact_id="q2-leader",
+        )
+        v2 = store.save_artifact(
+            conn, type="narrative", title="Q2 leader", description="Which region led Q2.",
+            content="violet leads q2", content_format="markdown", session_id=s1,
+            artifact_id="q2-leader",
+        )
+        check("content only an OLDER version holds does not collapse",
+              store.find_by_content_hash(
+                  conn, "narrative", store._content_hash("amber leads q2", "markdown")) is None)
+        check("content the latest version holds does",
+              store.find_by_content_hash(
+                  conn, "narrative", store._content_hash("violet leads q2", "markdown")) == v2,
+              f"v1={v1}")
+        conn.close()
 
     # A store written before content_hash existed must open, gain the column,
     # and keep its rows (db._add_missing_columns runs before SCHEMA).

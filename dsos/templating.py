@@ -6,8 +6,12 @@ Two kinds, one mechanism:
   run_python's `style` parameter, so every chart from every session gets the
   same house look by default.
 - **report templates** (HTML with `{{title}}` / `{{body}}` / `{{published_at}}`
-  / `{{session_question}}` tokens) — selected via publish_report's `template`
-  parameter, so every published report shares one layout.
+  / `{{session_question}}` tokens) — selected by `template` when a report is
+  rendered, so every published report shares one layout. `publish_report` is
+  not on the MCP surface (see U1 in the TTD), so the live consumer is the
+  GUI's report route, `/artifacts/<row_id>/report?template=<name-or-id>`,
+  which resolves through `publish.render_report_html` and so through
+  `resolve_report_template` below.
 
 Built-ins live as package assets (dsos/assets/), versioned with the code and
 always resolvable — they are files, not artifacts, because the default style
@@ -154,6 +158,8 @@ def resolve_report_template(conn: sqlite3.Connection, template: str) -> str:
         f"unknown report template {template!r}. Built-ins: "
         f"{', '.join(sorted(REPORT_TEMPLATE_BUILTINS))}. Custom report templates: "
         f"{', '.join(_custom_template_refs(conn, REPORT_KIND)) or '(none saved yet — create one with save_template)'}"
+        ". A report template is the layout the GUI's report page renders for a "
+        "narrative (/artifacts/<row_id>/report?template=<name-or-id>)."
     )
 
 

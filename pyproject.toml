@@ -16,7 +16,11 @@ dependencies = [
     "numpy>=1.26",
     "pyarrow>=16.0",
     "pandas>=2.2",
-    "fastmcp>=0.4",
+    # 4.0 is the floor because dsos/daemon.py depends on 4.x APIs that
+    # earlier releases do not have: StaticTokenVerifier imported from
+    # fastmcp.server.auth.providers.jwt, and an http_app whose mounted
+    # lifespan the daemon composes into its own (WP-D1).
+    "fastmcp>=4.0",
     "fastapi>=0.110",
     "jinja2>=3.1",
     "uvicorn>=0.30",

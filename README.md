@@ -22,24 +22,18 @@ released version" below.
 python -m venv .venv
 .venv/Scripts/pip install -e ".[analysis]"
 
-# layer 1: exercises store + execution via direct function calls
-.venv/Scripts/python tests/smoke_test.py
+# the whole suite: every tests/*_test.py, each in its own subprocess
+.venv/Scripts/python tests/run_all.py
 
-# layer 2: exercises the MCP server over the real wire protocol
-.venv/Scripts/python tests/mcp_smoke_test.py
-
-# layer 2b: exercises publish_report over the real wire protocol
-.venv/Scripts/python tests/publish_smoke_test.py
-
-# layer 3: exercises the GUI's routes via FastAPI's TestClient
-.venv/Scripts/python tests/gui_smoke_test.py
-
-# skill library + templates (consistency layer) over the real wire protocol
-.venv/Scripts/python tests/skills_templates_smoke_test.py
-
-# update-check: mocks the network call, doesn't hit the real GitHub API
-.venv/Scripts/python tests/update_check_smoke_test.py
+# just the ones whose filename contains a substring
+.venv/Scripts/python tests/run_all.py --only lifecycle
 ```
+
+`run_all.py` prints one pass/fail line per script with its duration, then the
+full output of anything that failed, and exits 1 if any script failed — that
+is the command to run, rather than the individual scripts. Use
+`--only <substring>` to narrow it to one area while iterating; run the whole
+thing before you call a change done.
 
 See `examples/README.md` for question pairs to try against a real agent
 session once the server is wired in.
@@ -94,15 +88,22 @@ tracking main directly.
 
 ## Running the server standalone
 
+The store is owned by one long-lived daemon; `python -m dsos.mcp_server` is
+only a stdio shim that finds it and forwards to it. Start the daemon first,
+with the store and the default analysis interpreter in *its* environment:
+
 ```sh
-.venv/Scripts/python -m dsos.mcp_server
+DSOS_DB_PATH="<abs path>/store.db" DSOS_PYTHON_PATH="<analysis python>" \
+  .venv/Scripts/python -m dsos.daemon
 ```
 
-Set `DSOS_DB_PATH` to an absolute path if you're launching this from outside
-the repo (e.g. a coding agent open in an unrelated project) — otherwise it
-defaults to `data/store.db` relative to wherever the process happens to be
-launched, which silently scatters a fresh empty store into whatever directory
-that is.
+(PowerShell: `$env:DSOS_DB_PATH = "..."; $env:DSOS_PYTHON_PATH = "..."; & .venv/Scripts/python -m dsos.daemon`.)
+
+Use an absolute `DSOS_DB_PATH` — otherwise the daemon defaults to
+`data/store.db` relative to wherever it happens to be launched, which
+silently scatters a fresh empty store into whatever directory that is.
+`DSOS_PYTHON_PATH` is read by the daemon, which is where `run_python` runs;
+it does nothing in an MCP client's config.
 
 ## Wiring into a coding agent
 
@@ -111,7 +112,9 @@ agent to follow directly (e.g. "install dsos and wire it into Claude
 Code"). The summary, for a human doing it manually:
 
 Both agents below use the identical command, so registering once makes it
-available from any repo the agent opens — no per-project setup.
+available from any repo the agent opens — no per-project setup. Both launch
+the shim, which needs the daemon above running over the same
+`DSOS_DB_PATH`; the shim itself reads only that variable.
 
 **Claude Code** (registered globally, one time):
 
@@ -233,8 +236,15 @@ dsos/
                  resolution/validation/rendering (built-ins live in assets/)
   present.py     shared artifact-payload rendering — used by both the MCP
                  server and the GUI so they can't drift apart
-  mcp_server.py  FastMCP wrapper exposing the tools + a middleware that
-                 auto-logs every tool call
+  mcp_server.py  the stdio shim: finds the daemon and proxies one profile to
+                 it, plus the lazily-built `mcp` the tests import
+  daemon.py      the process that owns the store — GUI + both MCP profiles
+                 off one Database, one per store, guarded by <store>.daemon.json
+  server/        the MCP layer proper: build_producer/build_consumer over a
+                 ServerConfig, the tool-call logger, the instructions, and
+                 contract.py (renders the tool table into Doc II)
+  ingest.py      dataset ingestion shared by the server and the GUI
+  sandbox.py     the per-call filesystem/workspace boundary for run_python
   publish.py     renders a narrative + its embeds into HTML via a template
                  (render_report_html); publish_report (the MCP tool) writes
                  that to one self-contained .html file, the GUI's
@@ -243,21 +253,44 @@ dsos/
                  (.html) — package files, not artifacts; customs are
                  `template` artifacts
   gui.py         read-only FastAPI+Jinja2+htmx browser over the store —
-                 a separate process, not an MCP tool
+                 a router mounted by the daemon, still runnable standalone
+                 with `python -m dsos.gui`
   templates/     Jinja2 templates for the GUI
   update_check.py  best-effort "a newer release exists" notice for people
                  on an installed release, prepended to the MCP instructions;
                  a no-op for editable dev installs (see Cutting a release)
 tests/
-  smoke_test.py         layer 1 — direct function calls, no protocol
-  mcp_smoke_test.py     layer 2 — real MCP wire protocol via FastMCP's Client
-  publish_smoke_test.py layer 2b — publish_report over the real MCP wire
+  run_all.py                 runs every script below, one subprocess each
+  smoke_test.py              layer 1 — direct function calls, no protocol
+  mcp_smoke_test.py          layer 2 — real MCP wire protocol via FastMCP's Client
+  publish_smoke_test.py      layer 2b — publish_report over the real MCP wire
   skills_templates_smoke_test.py
-                        layer 2c — skill library + templates over the wire
-  gui_smoke_test.py     layer 3 — GUI routes via FastAPI's TestClient
+                             layer 2c — skill library + templates over the wire
+  gui_smoke_test.py          layer 3 — GUI routes via FastAPI's TestClient
   update_check_smoke_test.py
-                        update_check.py, with the network call mocked
+                             update_check.py, with the network call mocked
+  migrations_smoke_test.py   numbered migrations, backups, refusal to downgrade
+  database_concurrency_smoke_test.py
+                             one Database per process, serialised writers
+  input_binding_smoke_test.py  inputs bound as in_1..in_N, not by title
+  dedupe_smoke_test.py       content-hash dedupe on save_artifact
+  execution_hygiene_smoke_test.py
+                             a failed run is an execution, not an artifact
+  surface_smoke_test.py      the exact producer tool list
+  prior_work_smoke_test.py   reuse detection across sessions
+  freshness_smoke_test.py    staleness derived from source.refresh_after
+  layering_smoke_test.py     dsos/server/ has no module-level connection
+  contract_smoke_test.py     Doc II's tool tables are the generated ones
+  daemon_smoke_test.py       the daemon: auth, both profiles, one store
+  shim_smoke_test.py         dsos.mcp_server proxies the daemon, owns no store
 Design/
   DS Artifact OS — Design Doc.md   philosophy, data model, MCP tool list,
                                     demo plan
+  DS Artifact OS — Design Doc II (Spine & Scale).md
+                                    the daemon, the lifecycle, the consumer
+  DS Artifact OS — TTD (Spine & Scale).md
+                                    the implementation breakdown, one WP each
+benchmark/
+  metrics.py, report.py, score.py, runner.mjs, arms.json
+                             the measurement harness; see benchmark/README.md
 ```

@@ -21,6 +21,7 @@ from dsos.execution import run_sql
 from dsos.seed import seed
 from dsos.store import (
     get_artifact_by_row_id,
+    get_execution,
     get_lineage,
     log_tool_call,
     reused_artifact_row_ids,
@@ -59,10 +60,10 @@ def main() -> None:
     print(f"[ok] saved dataset artifact: {dataset_row}")
 
     query_row = run_sql(
-        conn, code="SELECT team, score FROM toy_scores WHERE score > 10",
+        conn, code="SELECT team, score FROM in_1 WHERE score > 10",
         session_id=s1, title="High scorers", description="Teams scoring above 10.",
         input_row_ids=[dataset_row],
-    )
+    ).row_id
     log_tool_call(conn, s1, "run_sql", {"title": "High scorers"}, "2 rows", [query_row, dataset_row])
     print(f"[ok] ran SQL, produced query artifact: {query_row}")
 
@@ -70,8 +71,12 @@ def main() -> None:
     assert any(a.row_id == dataset_row for a in ancestors), "lineage should link query -> dataset"
     print(f"[ok] lineage resolved: {[a.title for a in ancestors]}")
 
-    hits = search_artifacts(conn, "how do I find and register a new dataset?", top_k=3)
-    print("[ok] search_artifacts('how do I find and register a new dataset?') ->")
+    # type="skill": search no longer returns skills/templates unless the
+    # caller asks for that type (WP-B2) — the cold-start retrieval this
+    # asserts is now an explicit request for skills.
+    hits = search_artifacts(conn, "how do I find and register a new dataset?",
+                            top_k=3, type="skill")
+    print("[ok] search_artifacts('how do I find and register a new dataset?', type='skill') ->")
     for art, score in hits:
         print(f"      {score:.3f}  {art.type:10s}  {art.title}")
     assert hits[0][0].row_id == skill_row_id, "discovery skill should rank first for a discovery query"
@@ -112,10 +117,10 @@ def main() -> None:
     # --- round 2: reuse round 1's dataset ---
     s2 = start_session(conn, "round 2: deeper synthetic question")
     query2_row = run_sql(
-        conn, code="SELECT AVG(score) AS avg_score FROM toy_scores",
+        conn, code="SELECT AVG(score) AS avg_score FROM in_1",
         session_id=s2, title="Average score", description="Average score across all teams.",
         input_row_ids=[dataset_row],  # reusing round 1's dataset artifact
-    )
+    ).row_id
     log_tool_call(conn, s2, "run_sql", {"title": "Average score"}, "1 row", [query2_row, dataset_row])
 
     reused = reused_artifact_row_ids(conn, s2)
@@ -130,14 +135,19 @@ def main() -> None:
     assert art.content is None and art.content_error, "missing blob should set content_error, not raise"
     print(f"[ok] get_artifact_by_row_id degrades gracefully on a missing blob: {art.content_error}")
 
-    broken_query_row = run_sql(
-        conn, code="SELECT * FROM toy_scores",
+    broken = run_sql(
+        conn, code="SELECT * FROM in_1",
         session_id=s2, title="Should fail", description="Input's blob is gone.",
         input_row_ids=[dataset_row],
     )
-    broken = get_artifact_by_row_id(conn, broken_query_row, load_content=False)
-    assert broken.status == "error", "run_sql against a missing-blob input should fail cleanly, not crash"
-    print("[ok] run_sql against a missing-blob input reports status=error instead of crashing")
+    assert broken.status == "error" and broken.row_id is None, (
+        "run_sql against a missing-blob input should fail cleanly and leave no artifact behind"
+    )
+    # The error lives on the execution row: there is no artifact to carry it
+    # any more, so this is the only place it can be read from.
+    failed = get_execution(conn, execution_id=broken.execution_id)
+    assert failed and failed["error"], "a failed run should record why it failed"
+    print("[ok] run_sql against a missing-blob input records a failed execution, not an artifact")
 
     print("\nLayer 1 smoke test passed.")
 

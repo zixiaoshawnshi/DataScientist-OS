@@ -57,10 +57,10 @@ def main() -> None:
         },
     )
     query_row = run_sql(
-        conn, code="SELECT team, score FROM toy_scores WHERE score > 10",
+        conn, code="SELECT team, score FROM in_1 WHERE score > 10",
         session_id=s1, title="High scorers", description="Teams scoring above 10.",
         input_row_ids=[dataset_row],
-    )
+    ).row_id
     chart_row = save_artifact(
         conn, type="chart", title="Score chart",
         description="A toy chart, to exercise the GUI's inlined-PNG path.",
@@ -85,7 +85,7 @@ def main() -> None:
 
     s2 = start_session(conn, "round 2: deeper gui smoke-test question")
     run_sql(
-        conn, code="SELECT AVG(score) AS avg_score FROM toy_scores",
+        conn, code="SELECT AVG(score) AS avg_score FROM in_1",
         session_id=s2, title="Average score", description="Average score, round 2.",
         input_row_ids=[dataset_row],
     )
@@ -134,7 +134,7 @@ def main() -> None:
 
     r = client.get(f"/artifacts/{query_row}")
     assert r.status_code == 200 and "Code" in r.text and "sql" in r.text
-    assert "SELECT team, score FROM toy_scores WHERE score &gt; 10" in r.text, (
+    assert "SELECT team, score FROM in_1 WHERE score &gt; 10" in r.text, (
         "the query's actual SQL code should render, not just an empty output block"
     )
     print("[ok] GET /artifacts/{row_id} for a query shows its SQL code + execution trace")

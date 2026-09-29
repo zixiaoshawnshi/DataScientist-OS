@@ -6,3 +6,12 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+# The benchmark keeps its own working store and blob dir alongside its source.
+benchmark/blobs/
+benchmark/store.db
+benchmark/store.db-shm
+benchmark/store.db-wal
+
+# pi runtime state: subagent worktree handoff manifests and patches.
+.pi/

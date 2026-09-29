@@ -1,8 +1,15 @@
-"""Layer-2b smoke test: publish_report, over the MCP wire (same pattern as
+"""Layer-2b smoke test: publishing, at the library level (same pattern as
 tests/mcp_smoke_test.py). Builds a narrative that embeds both a tabular
 artifact and a chart, publishes it, and checks the rendered HTML actually
 contains the substituted table/image rather than the raw {{artifact:...}}
 markers.
+
+The artifacts are still registered over MCP — that is the part a real
+session does — but the publish itself goes through dsos.publish directly:
+publish_report is not an MCP tool, and WP-B2R deliberately did not restore
+it, because the GUI's report route already renders a narrative through any
+report template (see the "house layout" section below — that route is what
+makes save_template(kind="report") a real capability rather than a dead end).
 
 Run: .venv/Scripts/python.exe tests/publish_smoke_test.py
 """
@@ -28,6 +35,15 @@ os.environ["DSOS_DB_PATH"] = "data/test-runs/publish_smoke_test/store.db"
 shutil.rmtree(Path(os.environ["DSOS_DB_PATH"]).parent, ignore_errors=True)
 
 from fastmcp import Client  # noqa: E402
+
+from dsos import publish  # noqa: E402
+from dsos.db import connect  # noqa: E402
+
+# The test's own read of the store the server writes to, on the path set
+# above. WP-C1 removed the module-level `conn` from dsos.mcp_server on
+# purpose — a process can no longer have "the" connection — so this opens
+# its own, on the same file.
+mcp_conn = connect(os.environ["DSOS_DB_PATH"])
 
 from dsos.mcp_server import mcp  # noqa: E402 — import after DSOS_DB_PATH is set
 
@@ -65,7 +81,7 @@ async def main() -> None:
         chart_row = r.data["row_id"]
 
         r = await client.call_tool("run_sql", {
-            "code": "SELECT team, score FROM toy_scores WHERE score > 10",
+            "code": "SELECT team, score FROM in_1 WHERE score > 10",
             "session_id": s1, "title": "High scorers", "description": "Teams scoring above 10.",
             "input_row_ids": [dataset_row],
         })
@@ -84,15 +100,12 @@ async def main() -> None:
         narrative_row = r.data["row_id"]
         print(f"[ok] saved narrative embedding dataset/query/chart -> {narrative_row}")
 
-        r = await client.call_tool(
-            "publish_report", {"row_id": narrative_row, "session_id": s1}
-        )
-        assert "error" not in r.data, r.data
-        path = r.data["path"]
+        r = publish.publish_report(mcp_conn, narrative_row)
+        path = r["path"]
         assert Path(path).is_file(), f"publish_report should write a real file: {path}"
         print(f"[ok] publish_report wrote {path}")
 
-        touched = set(r.data["artifact_row_ids"])
+        touched = set(r["artifact_row_ids"])
         assert {narrative_row, dataset_row, query_row, chart_row} <= touched, r.data
         print("[ok] artifact_row_ids covers the narrative and everything it embeds")
 
@@ -108,9 +121,9 @@ async def main() -> None:
         assert "<p></table>" not in html_text, "a table must not be torn in half by a stray </p><p>"
         print("[ok] rendered HTML is self-contained: tables + inlined image, no raw embed markers")
 
-        # publish_report should NOT create its own artifact row (Philosophy
-        # #5: a rendered export exits this layer, it isn't itself a
-        # versioned artifact) — search shouldn't surface the .html output.
+        # publish should NOT create its own artifact row (Philosophy #5: a
+        # rendered export exits this layer, it isn't itself a versioned
+        # artifact) — search shouldn't surface the .html output.
         r = await client.call_tool(
             "search_artifacts", {"query": "Team Scores Report", "session_id": s1}
         )
@@ -118,11 +131,64 @@ async def main() -> None:
         print("[ok] publish_report did not register itself as a new artifact")
 
         # publish_report on a non-narrative row should fail cleanly.
-        r = await client.call_tool(
-            "publish_report", {"row_id": dataset_row, "session_id": s1}
+        try:
+            publish.publish_report(mcp_conn, dataset_row)
+            raise AssertionError("publishing a non-narrative row should raise")
+        except ValueError as exc:
+            assert "narrative" in str(exc), str(exc)
+            print(f"[ok] publish_report on a non-narrative row fails cleanly: {exc}")
+
+        # --- a house report layout an agent saved is consumable -----------
+        # The load-bearing claim behind U1's restoration: publish_report
+        # did NOT come back, so if a report template could only be used by
+        # publish_report, restoring save_template would have handed agents a
+        # dead end. It isn't: the template is saved over MCP, discovered
+        # through list_templates, and rendered by the GUI's report route —
+        # which resolves it through templating.resolve_report_template.
+        tpl = (await client.call_tool("save_template", {
+            "session_id": s1, "kind": "report", "artifact_id": "report-smoke-house",
+            "title": "House report layout", "description": "Custom layout for the publish smoke test.",
+            "content": (
+                "<!doctype html><html><head><meta charset=\"utf-8\">"
+                "<title>SMOKE-TEMPLATE {{title}}</title></head><body>"
+                "<h1>{{title}}</h1><p>SMOKE-QUESTION {{session_question}}</p>"
+                "SMOKE-TEMPLATE-MARKER {{body}}</body></html>"
+            ),
+        })).data
+        assert tpl["artifact_id"] == "report-smoke-house" and tpl["version"] == 1, tpl
+        listed = (await client.call_tool(
+            "list_templates", {"session_id": s1, "kind": "report"})).data
+        assert "chart_styles" not in listed, sorted(listed)
+        assert tpl["artifact_id"] in {t["artifact_id"] for t in listed["report_templates"]["custom"]}
+        print(f"[ok] report template saved over MCP and discoverable -> {tpl['artifact_id']}")
+
+        from fastapi.testclient import TestClient
+
+        from dsos import gui  # imported here, after DSOS_DB_PATH is set
+
+        gui_client = TestClient(gui.app)
+        r = gui_client.get(
+            f"/artifacts/{narrative_row}/report", params={"template": tpl["artifact_id"]}
         )
-        assert "error" in r.data and "narrative" in r.data["error"]
-        print(f"[ok] publish_report on a non-narrative row fails cleanly: {r.data['error']}")
+        assert r.status_code == 200, r.text[:200]
+        assert "SMOKE-TEMPLATE-MARKER" in r.text, "the custom template must wrap the rendered body"
+        assert "<title>SMOKE-TEMPLATE Team Scores Report</title>" in r.text, r.text[:300]
+        assert "publish smoke test" in r.text  # {{session_question}} substituted
+        assert "{{artifact:" not in r.text and "<table" in r.text
+        print("[ok] GET /artifacts/{row_id}/report?template=<custom> renders the agent's template")
+
+        # The same template, rendered to a file by the library path — the two
+        # consumers resolve the identical text.
+        rendered = publish.publish_report(mcp_conn, narrative_row, template=tpl["artifact_id"])
+        html_text = Path(rendered["path"]).read_text(encoding="utf-8")
+        assert "SMOKE-TEMPLATE-MARKER" in html_text and "<table" in html_text, html_text[:200]
+        print(f"[ok] publish.publish_report(template=<custom id>) writes the same layout to {rendered['path']}")
+
+        # An unknown template is a clean 400 on the route, with the options
+        # in the message — the agent-facing error, not a stack trace.
+        r = gui_client.get(f"/artifacts/{narrative_row}/report", params={"template": "nope"})
+        assert r.status_code == 400 and "report" in r.text, r.text[:200]
+        print("[ok] an unknown report template 400s on the GUI route with the allowed options")
 
     print("\npublish_report smoke test passed.")
 

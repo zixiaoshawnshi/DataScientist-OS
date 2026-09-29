@@ -1,0 +1,279 @@
+{
+  "source": {
+    "benchmark": "InfiAgent-DABench (dev split)",
+    "url": "https://huggingface.co/datasets/infiagent/DABench",
+    "paper": "https://arxiv.org/abs/2401.05507",
+    "code": "https://github.com/InfiAgent/InfiAgent (Apache-2.0)",
+    "fetched_at": "2026-09-26T23:59:20+00:00",
+    "method": "downloaded via benchmark/prepare.py"
+  },
+  "rounds_per_table": 3,
+  "tables": [
+    {
+      "file_name": "titanic.csv",
+      "data_path": "data/titanic.csv",
+      "size_bytes": 60302,
+      "questions_available": 24,
+      "rounds": [
+        {
+          "round": 1,
+          "question_id": 129,
+          "question": "Calculate the mean and standard deviation of the fare paid by the passengers.",
+          "constraints": "Calculate the arithmetic mean and population standard deviation (σ). For the mean, sum up all fare and divide by the count of the data points. For the standard deviation, use the formula:\nσ = sqrt(sum for i = 1 to n (xi - μ)^2/n), where xi is each fare and μ is the mean fare, n is the count of the fare data points.",
+          "format": "@mean_fare[mean_value] @std_dev_fare[std_dev_value] where \"mean_value\" and \"std_dev_value\" are decimal numbers rounded to two decimal places.",
+          "level": "easy",
+          "concepts": [
+            "Summary Statistics"
+          ],
+          "answers": {
+            "std_dev_fare": "49.67"
+          }
+        },
+        {
+          "round": 2,
+          "question_id": 130,
+          "question": "Check if the age of the passengers follows a normal distribution.",
+          "constraints": "Use the Shapiro-Wilk test to check the normality of the age distribution. Ignore the null values. The null hypothesis of this test is that the population is normally distributed. If the p value is less than 0.05, the null hypothesis is rejected and there is evidence that the data tested are not normally distributed. On the other hand, if the p value is greater than 0.05, then the null hypothesis that the data came from a normally distributed population cannot be rejected.",
+          "format": "@norm_test_pvalue[pvalue] @is_normal[isNormal] where \"pvalue\" is a decimal number rounded to four decimal places and \"isNormal\" is a boolean value, 'True' if the age values follow a normal distribution and 'False' otherwise.",
+          "level": "medium",
+          "concepts": [
+            "Distribution Analysis"
+          ],
+          "answers": {
+            "is_normal": "False"
+          }
+        },
+        {
+          "round": 3,
+          "question_id": 133,
+          "question": "Perform comprehensive data preprocessing for the dataset by handling missing values in the age and cabin columns. Use the deletion strategy for the missing values in the cabin column and imputation strategy for the missing values in the age column.",
+          "constraints": "{\nFor the deletion strategy in the cabin column, remove any row that has a missing value in the cabin column.\nFor the imputation strategy in the age column, replace the missing values with the median age of all passengers.\nReport on the new total number of rows after deletion and the median age used for imputation.\n}",
+          "format": "{\n@row_count[count]\n@median_age[value]\nwhere \"count\" is a positive integer representing the total number of rows after deletion.\nwhere \"value\" is a positive real number representing the median age used for imputation, rounded to one decimal place.",
+          "level": "hard",
+          "concepts": [
+            "Comprehensive Data Preprocessing"
+          ],
+          "answers": {
+            "median_age": "36.0",
+            "row_count": "204"
+          }
+        }
+      ]
+    },
+    {
+      "file_name": "auto-mpg.csv",
+      "data_path": "data/auto-mpg.csv",
+      "size_bytes": 14179,
+      "questions_available": 8,
+      "rounds": [
+        {
+          "round": 1,
+          "question_id": 719,
+          "question": "1. Calculate the mean and median of the 'mpg' column.",
+          "constraints": "Calculate the mean and median of the 'mpg' column without excluding any data. Round your results to two decimal places.",
+          "format": "@mean_mpg[mean_value], @median_mpg[median_value] where 'mean_value' and 'median_value' are numbers rounded to two decimal places.",
+          "level": "easy",
+          "concepts": [
+            "Summary Statistics"
+          ],
+          "answers": {
+            "median_mpg": "22.75",
+            "mean_mpg": "23.45"
+          }
+        },
+        {
+          "round": 2,
+          "question_id": 721,
+          "question": "3. Find the correlation coefficient between the 'mpg' and 'weight' columns.",
+          "constraints": "Calculate the Pearson correlation coefficient (r) to assess the strength and direction of the linear relationship between mpg and weight. Round r to two decimal places.",
+          "format": "@correlation_coefficient[r_value] where 'r_value' is a number between -1 and 1, rounded to two decimal places.",
+          "level": "medium",
+          "concepts": [
+            "Correlation Analysis"
+          ],
+          "answers": {
+            "correlation_coefficient": "-0.83"
+          }
+        },
+        {
+          "round": 3,
+          "question_id": 722,
+          "question": "1. Identify the vehicle with the highest horsepower and provide its corresponding model year. Calculate the average horsepower along with the standard deviation for all vehicles within the same model year as this vehicle.",
+          "constraints": "For the \"average horsepower\", calculate it using the arithmetic mean formula. Calculate the standard deviation using the population standard deviation formula, not the sample standard deviation formula. Round both measures to two decimal places.",
+          "format": "@highest_horsepower_vehicle[vehicle_model_year]\n@average_horsepower[same_year_avg_horsepower]\n@standard_deviation[same_year_horsepower_std]\nwhere \"vehicle_model_year\" is an integer from 1900 to the current year. \"same_year_avg_horsepower\" and \"same_year_horsepower_std\" are numbers rounded to two decimal places.",
+          "level": "hard",
+          "concepts": [
+            "Summary Statistics",
+            "Comprehensive Data Preprocessing"
+          ],
+          "answers": {
+            "highest_horsepower_vehicle": "1973",
+            "average_horsepower": "130.48",
+            "standard_deviation": "45.83"
+          }
+        }
+      ]
+    },
+    {
+      "file_name": "insurance.csv",
+      "data_path": "data/insurance.csv",
+      "size_bytes": 54289,
+      "questions_available": 6,
+      "rounds": [
+        {
+          "round": 1,
+          "question_id": 24,
+          "question": "Calculate the mean age of the individuals in the dataset.",
+          "constraints": "Ignore rows with missing values in the age column. Use Python's built-in function to calculate the mean.",
+          "format": "@mean_age[value] where \"value\" is a number between 0 and 100, rounded to two decimal places.",
+          "level": "easy",
+          "concepts": [
+            "Summary Statistics"
+          ],
+          "answers": {
+            "mean_age": "39.21"
+          }
+        },
+        {
+          "round": 2,
+          "question_id": 27,
+          "question": "Identify the outliers in the charges incurred by individuals using the Z-score method.",
+          "constraints": "Apply the Z-score method for outlier detection using the 1.5xIQR rule. Consider any value that falls below Q1 - 1.5 * IQR or above Q3 + 1.5 * IQR as an outlier. Report the total number of outliers, and the mean and median charges of these identified outliers.",
+          "format": "@total_outliers[total_outliers] \n@mean_charges_outliers[mean_charges_outliers] \n@median_charges_outliers[median_charges_outliers] \nwhere \"total_outliers\" is an integer, \"mean_charges_outliers\" and \"median_charges_outliers\" are floating-point numbers rounded to two decimal places.",
+          "level": "medium",
+          "concepts": [
+            "Outlier Detection"
+          ],
+          "answers": {
+            "median_charges_outliers": "40974.16",
+            "mean_charges_outliers": "42103.95",
+            "total_outliers": "139"
+          }
+        },
+        {
+          "round": 3,
+          "question_id": 28,
+          "question": "Perform comprehensive data preprocessing on the dataset, including cleaning, transformation, and handling of missing values.",
+          "constraints": "Handle the missing values in the 'age', 'sex', and 'region' columns by removing the corresponding rows. Transform the 'sex' and 'smoker' columns to binary format (0 and 1). Normalize 'age', 'bmi', 'children', and 'charges' columns. Report the mean of each column after the preprocessing.",
+          "format": "@mean_age[mean_age]\n@mean_sex[mean_sex]\n@mean_bmi[mean_bmi]\n@mean_children[mean_children]\n@mean_smoker[mean_smoker]\n@mean_region[mean_region]\n@mean_charges[mean_charges]\nwhere \"mean_xxx\" are all floating-point numbers rounded to four decimal places.",
+          "level": "hard",
+          "concepts": [
+            "Comprehensive Data Preprocessing"
+          ],
+          "answers": {
+            "mean_smoker": "0.2048",
+            "mean_children": "0.2190",
+            "mean_sex": "0.5052",
+            "mean_age": "0.4610",
+            "mean_bmi": "0.3956",
+            "mean_charges": "0.1939"
+          }
+        }
+      ]
+    },
+    {
+      "file_name": "hotel_data.csv",
+      "data_path": "data/hotel_data.csv",
+      "size_bytes": 83961,
+      "questions_available": 6,
+      "rounds": [
+        {
+          "round": 1,
+          "question_id": 506,
+          "question": "1. What is the average number of reviews per hotel in the dataset?",
+          "constraints": "Calculate the mean reviews per hotel from the entire dataset. Round your result to two decimal places.",
+          "format": "@average_reviews[average] where \"average\" is a number rounded to two decimal places, and representing the average number of reviews per hotel.",
+          "level": "easy",
+          "concepts": [
+            "Summary Statistics"
+          ],
+          "answers": {
+            "average_reviews": "1013.53"
+          }
+        },
+        {
+          "round": 2,
+          "question_id": 508,
+          "question": "3. Is there a correlation between the number of reviews a hotel has received and its bubble score? If yes, what is the correlation coefficient?",
+          "constraints": "Calculate the Pearson correlation coefficient between review count and bubble score. Consider the correlation to be significant if its absolute value is greater than 0.5. Round your result to three decimal places.",
+          "format": "@correlation_coefficient[r_value] where \"r_value\" is a number between -1 and 1, rounded to three decimal places, representing the correlation between the review count and the bubble score.",
+          "level": "medium",
+          "concepts": [
+            "Correlation Analysis"
+          ],
+          "answers": {
+            "correlation_coefficient": "0.176"
+          }
+        },
+        {
+          "round": 3,
+          "question_id": 507,
+          "question": "2. Are there any hotels in the dataset that have a star rating of 5? If yes, how many hotels have a star rating of 5?",
+          "constraints": "Count only hotels that have a star rating exactly equal to 5. This count value should be a non-negative integer.",
+          "format": "@total_hotels[count] where \"count\" is a non-negative integer representing the total number of hotels with a star rating of 5.",
+          "level": "easy",
+          "concepts": [
+            "Distribution Analysis"
+          ],
+          "answers": {
+            "total_hotels": "46"
+          }
+        }
+      ]
+    },
+    {
+      "file_name": "microsoft.csv",
+      "data_path": "data/microsoft.csv",
+      "size_bytes": 11515,
+      "questions_available": 5,
+      "rounds": [
+        {
+          "round": 1,
+          "question_id": 71,
+          "question": "Calculate the mean and standard deviation of the \"Volume\" column.",
+          "constraints": "Use the built-in functions in Python's pandas library for computation. Round the result to 2 decimal places.",
+          "format": "@mean_volume[mean_volume]\\n@std_dev_volume[std_dev_volume]\\nwhere \"mean_volume\" and \"std_dev_volume\" are floating-point numbers rounded to 2 decimal places.",
+          "level": "easy",
+          "concepts": [
+            "Summary Statistics"
+          ],
+          "answers": {
+            "mean_volume": "22607406.19",
+            "std_dev_volume": "8254791.71"
+          }
+        },
+        {
+          "round": 2,
+          "question_id": 75,
+          "question": "Create a new column called \"Daily Return\" that calculates the percentage change in the \"Close\" price from the previous day. Calculate the mean and standard deviation of the \"Daily Return\" column.",
+          "constraints": "Calculate \"Daily Return\" as ((Close price of today - Close price of previous day) / Close price of previous day) * 100. Calculate mean and standard deviation to two decimal places.",
+          "format": "@daily_return_mean[mean], @daily_return_std[std] where \"mean\" and \"std\" are the mean and standard deviation of the \"Daily Return\" column, respectively, rounded to two decimal places.",
+          "level": "medium",
+          "concepts": [
+            "Feature Engineering",
+            "Summary Statistics"
+          ],
+          "answers": {
+            "daily_return_std": "0.94",
+            "daily_return_mean": "-0.14"
+          }
+        },
+        {
+          "round": 3,
+          "question_id": 77,
+          "question": "Perform comprehensive data preprocessing on the \"Date\" column to extract the month and year information. Calculate the average closing price for each month and year combination. Return the month and year combination which has the highest average closing price.",
+          "constraints": "Set the start of each month to be the first day of the month and the end of the month to be the last day of the month.\nThe calculation of the average closing price should be done using the arithmetic mean. \nFor ties, return the most recent month and year combination.",
+          "format": "@Highest_Monthly_Average_Close_Price[month, year, average_close_price]\nwhere \"month\" is an integer between 1 and 12, \"year\" is an integer, and \"average_close_price\" is a float rounded to two decimal places.",
+          "level": "hard",
+          "concepts": [
+            "Comprehensive Data Preprocessing",
+            "Summary Statistics"
+          ],
+          "answers": {
+            "Highest_Monthly_Average_Close_Price": "1, 2018, 88.32"
+          }
+        }
+      ]
+    }
+  ]
+}

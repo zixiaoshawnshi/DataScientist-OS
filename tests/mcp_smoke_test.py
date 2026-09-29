@@ -57,9 +57,12 @@ async def main() -> None:
         r = await client.call_tool(
             "search_artifacts", {"query": "how do I find and register data?", "session_id": s1}
         )
-        assert r.data["results"], "search should find the seeded discovery skill"
-        assert r.data["results"][0]["type"] == "skill"
-        print(f"[ok] search_artifacts (over the wire) -> {r.data['results'][0]['title']}")
+        assert r.data["results"] == [], (
+            "nothing is seeded into a fresh store any more (WP-B2), and the "
+            "consistency layer is no longer a search result, so an empty "
+            "store must search empty"
+        )
+        print("[ok] search_artifacts (over the wire) on a fresh store -> no results, no seed library")
 
         with tempfile.TemporaryDirectory() as tmp:
             csv_path = Path(tmp) / "toy.csv"
@@ -74,14 +77,14 @@ async def main() -> None:
             })
             assert "row_id" in r.data, r.data
             dataset_row = r.data["row_id"]
-            assert r.data.get("table_name") == "toy_scores", (
-                "save_artifact should surface the normalized table/variable name "
-                "up front, not make the agent guess or wait for an error (feedback #1)"
+            assert "table_name" not in r.data, (
+                "inputs are bound positionally (in_1..in_N), so there is no "
+                "title-derived name to hand back (WP-B1)"
             )
-            print(f"[ok] save_artifact ingested csv -> dataset row {dataset_row}, table_name inlined")
+            print(f"[ok] save_artifact ingested csv -> dataset row {dataset_row}, no table_name")
 
         r = await client.call_tool("run_sql", {
-            "code": "SELECT team, score FROM toy_scores WHERE score > 10",
+            "code": "SELECT team, score FROM in_1 WHERE score > 10",
             "session_id": s1, "title": "High scorers", "description": "Teams scoring above 10.",
             "input_row_ids": [dataset_row],
         })
@@ -93,15 +96,15 @@ async def main() -> None:
         # id run_sql actually returns) was itself broken. Both fixed now.
         assert r.data["row_count"] == 2, r.data
         assert r.data["preview"], "run_sql should inline a preview, not just a row_id"
-        assert r.data.get("table_name") == "high_scorers", (
-            "the output artifact's own table name should be inlined too, for chaining "
-            "into a later run_sql/run_python call (feedback #1)"
+        assert "table_name" not in r.data, (
+            "the output artifact has no title-derived name any more; it is "
+            "bound as in_1 of the next call (WP-B1)"
         )
-        assert r.data.get("input_tables") == {dataset_row: "toy_scores"}, (
-            "run_sql should map each input row_id to the table name it registered "
-            "it under (feedback #1)"
+        assert r.data.get("input_tables") == {dataset_row: "in_1"}, (
+            "run_sql should map each input row_id to the alias it registered "
+            "it under, by position (WP-B1)"
         )
-        print(f"[ok] run_sql (over the wire) -> query row {query_row}, preview + table names inlined")
+        print(f"[ok] run_sql (over the wire) -> query row {query_row}, preview + input aliases inlined")
 
         r = await client.call_tool("get_artifact", {"row_id": query_row, "session_id": s1})
         assert "error" not in r.data, r.data
@@ -125,7 +128,7 @@ async def main() -> None:
         print("[ok] narrative's {{artifact:...}} embed auto-derived lineage, with no parent_row_ids passed")
 
         r = await client.call_tool("run_sql", {
-            "code": "SELECT this_column_does_not_exist FROM toy_scores",
+            "code": "SELECT this_column_does_not_exist FROM in_1",
             "session_id": s1, "title": "Deliberately broken query",
             "description": "Exercises the error path.", "input_row_ids": [dataset_row],
         })
@@ -136,7 +139,7 @@ async def main() -> None:
         )
         assert "Traceback" not in r.data["error"], "error should exclude internal frame noise"
         assert "Traceback" in r.data.get("stderr", ""), "full traceback should still be in stderr"
-        assert "toy_scores(team, score)" in r.data["error"], (
+        assert 'in_1 "Toy Scores" (team, score)' in r.data["error"], (
             "a failed run_sql should name the available tables/columns, not just "
             "the bad reference (feedback #8)"
         )
@@ -152,7 +155,7 @@ async def main() -> None:
         r = await client.call_tool("start_session", {"question": "round 2: deeper question"})
         s2 = r.data["session_id"]
         r = await client.call_tool("run_sql", {
-            "code": "SELECT AVG(score) AS avg_score FROM toy_scores",
+            "code": "SELECT AVG(score) AS avg_score FROM in_1",
             "session_id": s2, "title": "Average score", "description": "Average score, round 2.",
             "input_row_ids": [dataset_row],
         })
@@ -161,7 +164,7 @@ async def main() -> None:
 
         # --- round 3: scratch mode + ImportError hint (feedback #7, #8) ---
         r = await client.call_tool("run_sql", {
-            "code": "SELECT COUNT(*) AS n FROM high_scorers",
+            "code": "SELECT COUNT(*) AS n FROM in_1",
             "session_id": s2, "title": "Scratch count",
             "description": "Scratch run — must NOT become an artifact.",
             "input_row_ids": [query_row], "scratch": True,
@@ -236,7 +239,7 @@ async def main() -> None:
             # (parquet out, parquet back in), resolved per-call by uv
             r = await client.call_tool("run_python", {
                 "code": "import tabulate; "
-                        "result = tabulate.tabulate(high_scorers.to_dict('records'), headers='keys')",
+                        "result = tabulate.tabulate(in_1.to_dict('records'), headers='keys')",
                 "session_id": s2, "title": "Scratch via uv",
                 "description": "Scratch run pulling a missing package via uv, with a DataFrame input.",
                 "input_row_ids": [query_row], "scratch": True,
@@ -264,7 +267,7 @@ async def main() -> None:
         # --- round 5: agent-facing diagnostics (feedback #4, #5, #10) ---
         r = await client.call_tool("run_python", {
             "code": "print('computing averages'); "
-                    "result = toy_scores.groupby('team')['score'].mean().reset_index()",
+                    "result = in_1.groupby('team')['score'].mean().reset_index()",
             "session_id": s2, "title": "Mean by team",
             "description": "Mean score per team; also exercises stdout passthrough.",
             "input_row_ids": [dataset_row],
@@ -275,13 +278,13 @@ async def main() -> None:
         )
         print("[ok] run_python over the wire -> stdout surfaced on success (feedback #10)")
 
-        # --- round 6: chart auto-render, scratch promotion, publish dry-run
-        # (feedback #1, #2, #3, #4, #7) ---
+        # --- round 6: chart auto-render, scratch has nothing to promote
+        # (feedback #1, #2, #3, #7) ---
         r = await client.call_tool("run_python", {
             "code": (
                 "import matplotlib.pyplot as plt\n"
                 "fig, ax = plt.subplots()\n"
-                "ax.plot(toy_scores['score'])\n"
+                "ax.plot(in_1['score'])\n"
                 "result = fig\n"
             ),
             "session_id": s2, "title": "Score chart", "description": "A plot of scores.",
@@ -299,43 +302,24 @@ async def main() -> None:
         print("[ok] run_python: a matplotlib Figure `result` auto-renders to an inline PNG image")
 
         r = await client.call_tool("run_sql", {
-            "code": "SELECT COUNT(*) AS n FROM toy_scores",
-            "session_id": s2, "title": "Scratch to promote",
-            "description": "A scratch run worth keeping after all.",
+            "code": "SELECT COUNT(*) AS n FROM in_1",
+            "session_id": s2, "title": "Scratch to re-run",
+            "description": "A scratch run that turns out to be worth keeping.",
             "input_row_ids": [dataset_row], "scratch": True,
         })
         assert r.data["status"] == "ok", r.data
-        scratch_id = r.data.get("scratch_id")
-        assert scratch_id, "a scratch run should return a scratch_id (feedback #4)"
-        assert r.data.get("input_tables") == {dataset_row: "toy_scores"}
-        print(f"[ok] scratch run_sql -> scratch_id {scratch_id}, input_tables inlined")
-
-        r = await client.call_tool("promote_scratch", {
-            "scratch_id": scratch_id, "session_id": s2,
-            "title": "Row count", "description": "Promoted from a scratch check.",
-        })
-        assert "error" not in r.data, r.data
-        promoted_row = r.data["row_id"]
-        assert r.data["row_count"] == 1, r.data
-        print(f"[ok] promote_scratch persisted the cached scratch run without re-running it -> {promoted_row}")
-
+        assert "scratch_id" not in r.data, (
+            "a scratch run is not promotable any more (WP-B2) — nothing is "
+            "cached for it, so the response must not hand back an id"
+        )
+        assert r.data.get("input_tables") == {dataset_row: "in_1"}
         r = await client.call_tool(
-            "search_artifacts", {"query": "Row count", "session_id": s2}
+            "search_artifacts", {"query": "Scratch to re-run", "session_id": s2}
         )
-        assert any(h["row_id"] == promoted_row for h in r.data["results"]), (
-            "a promoted scratch run must become a real, searchable artifact"
+        assert not any(h["title"] == "Scratch to re-run" for h in r.data["results"]), (
+            "a scratch run leaves nothing behind to promote"
         )
-        print("[ok] promoted artifact is searchable, unlike the scratch run it came from")
-
-        r = await client.call_tool("promote_scratch", {
-            "scratch_id": scratch_id, "session_id": s2,
-            "title": "Row count again", "description": "Re-promoting an already-consumed id.",
-        })
-        assert "error" in r.data and "no cached scratch run" in r.data["error"], (
-            "promoting an already-consumed (or unknown) scratch_id should fail clearly, "
-            "not silently re-run or duplicate"
-        )
-        print("[ok] promote_scratch on a consumed/unknown scratch_id fails clearly")
+        print("[ok] scratch run_sql -> no scratch_id and nothing persisted to re-run from")
 
         r = await client.call_tool("save_artifact", {
             "type": "narrative", "title": "Preview Report", "session_id": s2,
@@ -347,17 +331,25 @@ async def main() -> None:
             ),
         })
         preview_narrative_row = r.data["row_id"]
-        r = await client.call_tool("publish_report", {
-            "row_id": preview_narrative_row, "session_id": s2, "dry_run": True,
-        })
-        assert "error" not in r.data, r.data
-        assert "path" not in r.data, "dry_run must not write an HTML file"
-        assert any(e["row_id"] == dataset_row and e["resolved"] for e in r.data["embeds"]), r.data
-        assert "not-a-real-row-id" in r.data["broken_row_ids"], (
+        # publish_report is no longer an MCP tool (WP-B2); the renderer
+        # behind it is library code and is driven directly from here.
+        from dsos import publish as publish_mod
+        from dsos.db import connect
+
+        # The test's own read of the store the server just wrote to, on the
+        # path this test set. WP-C1 removed the module-level `conn` from
+        # dsos.mcp_server on purpose — a process can no longer have "the"
+        # connection — so the server's connection is not something a test
+        # should reach into.
+        mcp_conn = connect(os.environ["DSOS_DB_PATH"])
+        preview = publish_mod.preview_report(mcp_conn, preview_narrative_row)
+        assert "path" not in preview, "dry_run must not write an HTML file"
+        assert any(e["row_id"] == dataset_row and e["resolved"] for e in preview["embeds"]), preview
+        assert "not-a-real-row-id" in preview["broken_row_ids"], (
             "dry_run should flag an embed that doesn't resolve (feedback #3, #7)"
         )
-        print(f"[ok] publish_report(dry_run=True) reports resolved/broken embeds without writing a file: "
-              f"broken={r.data['broken_row_ids']}")
+        print(f"[ok] publish.preview_report reports resolved/broken embeds without writing a file: "
+              f"broken={preview['broken_row_ids']}")
 
         r = await client.call_tool("save_artifact", {
             "type": "narrative", "title": "Real Report", "session_id": s2,
@@ -366,14 +358,11 @@ async def main() -> None:
             "content_text": f"See {{{{artifact:{dataset_row}}}}} for details.",
         })
         real_narrative_row = r.data["row_id"]
-        r = await client.call_tool("publish_report", {
-            "row_id": real_narrative_row, "session_id": s2,
-        })
-        assert "error" not in r.data, r.data
-        assert any(e["row_id"] == dataset_row and e["resolved"] for e in r.data["embeds"]), (
+        published = publish_mod.publish_report(mcp_conn, real_narrative_row)
+        assert any(e["row_id"] == dataset_row and e["resolved"] for e in published["embeds"]), (
             "a real publish should also report which artifacts it embedded (feedback #3)"
         )
-        print("[ok] publish_report (real) reports its resolved embeds alongside the file path")
+        print("[ok] publish.publish_report reports its resolved embeds alongside the file path")
 
         r = await client.call_tool("save_artifact", {
             "type": "narrative", "title": "Huge Report", "session_id": s2,
@@ -405,7 +394,7 @@ async def main() -> None:
         print("[ok] get_artifact on a missing blob returns a named, actionable error (feedback #4)")
 
         r = await client.call_tool("run_sql", {
-            "code": "SELECT * FROM toy_scores",
+            "code": "SELECT * FROM in_1",
             "session_id": s2, "title": "Should fail",
             "description": "Input blob was deleted above.",
             "input_row_ids": [dataset_row],

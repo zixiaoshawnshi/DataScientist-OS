@@ -36,6 +36,9 @@
 {% if art.tags %}
 <p>{% for t in art.tags %}<span class="badge badge-type">{{ t }}</span> {% endfor %}</p>
 {% endif %}
+{% if superseded_by %}
+<p class="muted">⚠ superseded by <a href="/artifacts/{{ superseded_by.row_id }}">{{ superseded_by.title }}</a> — kept for the record, no longer the current answer.</p>
+{% endif %}
 {% if art.source %}
 <p class="muted">source:
 {% for k, v in art.source.items() %}
@@ -50,6 +53,47 @@
 </div>
 
 <div class="tab-pane active" data-tab="overview">
+<h2>Status</h2>
+<p>status <strong>{{ art.status }}</strong> · validation <strong>{{ validation.current }}</strong>
+{% if validation.stale_reason %}
+<br><span class="muted">stale: {{ validation.stale_reason }}</span>
+{% endif %}
+</p>
+
+{% if art.caveats %}
+<h2>Caveats</h2>
+<ul>
+{% for c in art.caveats %}<li>{{ c }}</li>{% endfor %}
+</ul>
+{% endif %}
+
+{% if art.confidence %}
+<h2>Confidence</h2>
+<table>
+  <thead><tr><th>claim</th><th>level</th><th>basis</th></tr></thead>
+  <tbody>
+  {% for c in art.confidence %}
+    <tr><td>{{ c.claim }}</td><td>{{ c.level }}</td><td>{{ c.basis }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% if validation.history %}
+<h2>Validation history</h2>
+<p class="muted">Append-only: every verdict ever recorded on this row, newest first.</p>
+<table>
+  <thead><tr><th>at</th><th>verdict</th><th>by</th><th>basis</th></tr></thead>
+  <tbody>
+  {% for v in validation.history %}
+    <tr><td>{{ v.at }}</td><td>{{ v.verdict }}</td><td>{{ v.by }}</td><td>{{ v.basis }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No validation recorded — nothing has checked this row yet.</p>
+{% endif %}
+
 {% if payload.content_error %}
 <h2>Content</h2>
 <p class="muted">⚠ {{ payload.content_error }}</p>

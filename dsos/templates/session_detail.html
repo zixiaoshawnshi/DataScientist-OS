@@ -23,6 +23,26 @@
 <p class="muted">No artifacts yet.</p>
 {% endif %}
 
+<h2>Failed runs</h2>
+{% if failed_runs %}
+<p class="muted">Runs that failed and left nothing behind — a crash is an
+execution, not a result, so there is no artifact to open.</p>
+<table>
+  <thead><tr><th>Kind</th><th>Error</th><th>When</th></tr></thead>
+  <tbody>
+  {% for r in failed_runs %}
+    <tr>
+      <td><span class="badge badge-type">{{ r.kind }}</span></td>
+      <td>{{ r.error }}</td>
+      <td class="muted">{{ r.ended_at }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No failed runs.</p>
+{% endif %}
+
 <h2>Tool-call feed</h2>
 <div hx-get="/sessions/{{ session.id }}/tool_calls" hx-trigger="load, every 2s" hx-swap="innerHTML">
   loading…
