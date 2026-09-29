@@ -68,7 +68,9 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from dsos import gui
+from dsos import paths
 from dsos.channel import channel
+from dsos.paths import store_path
 from dsos.db import Database
 from dsos.server import ServerConfig, build_consumer, build_producer
 from dsos.server.common import server_version
@@ -116,7 +118,7 @@ def db_path_from_env() -> Path:
     """Where the store is, from DSOS_DB_PATH or the usual default. Same
     lookup dsos.mcp_server does, so a client and its daemon agree without
     the user having to say it twice."""
-    return Path(os.environ.get("DSOS_DB_PATH", "data/store.db")).resolve()
+    return store_path(os.environ.get("DSOS_DB_PATH", "data/store.db"))
 
 
 class PortUnavailable(RuntimeError):
@@ -359,9 +361,7 @@ def same_store(a: str | Path, b: str | Path) -> bool:
     store look like two; then case-folded where the filesystem is (normcase
     is a no-op off Windows, which is the right answer there).
     """
-    def canonical(p: str | Path) -> str:
-        return os.path.normcase(str(Path(p).resolve()))
-    return canonical(a) == canonical(b)
+    return paths.same_store(a, b)
 
 
 def _healthz(base_url: str, timeout: float = 2.0) -> dict | None:
