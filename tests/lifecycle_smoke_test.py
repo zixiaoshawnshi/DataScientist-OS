@@ -28,6 +28,17 @@ about what is *not* allowed and what is *derived*:
    dishonestly: caveats are short properties, and a confidence entry
    without a basis is refused (that requirement is the guard against a
    model answering "high" every time).
+7. No writer can create a superseded row: save_artifact takes exploratory or
+   result, and superseded is only reachable through mark, which demands the
+   replacement.
+8. The supersede chain always ends at a current row: superseded_by may not
+   name a row that is itself superseded (which is what rules out a cycle),
+   and it is accepted only alongside status=superseded.
+9. Stale promotes confirmed and unvalidated but not needs_review, whose
+   specific request outranks the generic staleness label; the stale reason
+   is still reported beside it.
+10. Keyword hits rank by bm25, with recency only breaking ties — a much
+   better older match ranks above a passing newer one.
 
 Plus the display half: the GUI artifact page shows the status, the caveats
 and the validation history.
@@ -436,6 +447,150 @@ async def main() -> None:
                   {"claim": "orders are up", "level": "medium",
                    "basis": "one fetch of two rows, re-derived by hand"}],
               str({k: read_back.get(k) for k in ("caveats", "confidence")}))
+
+        # --- 7. a writer cannot create a superseded row. superseded_by is
+        # what makes superseded mean something, and only mark requires it, so
+        # a save that could say "superseded" would write the one state mark
+        # exists to forbid: dead, with nothing named as its replacement.
+        born_dead = (await client.call_tool("save_artifact", {
+            "type": "narrative", "title": "Born superseded",
+            "description": "A row a writer tried to create already superseded.",
+            "content_text": "this should never be stored", "content_format": "markdown",
+            "session_id": s1, "status": "superseded",
+        })).data
+        born_error = str(born_dead.get("error"))
+        check("save_artifact(status=superseded) is rejected",
+              "error" in born_dead and "row_id" not in born_dead, str(born_dead)[:200])
+        check("the rejection names both writable states and points at mark",
+              all(w in born_error for w in ("exploratory", "result", "mark")), born_error[:200])
+        check("...and nothing was written",
+              conn.execute("SELECT COUNT(*) AS n FROM artifacts WHERE title = 'Born superseded'"
+                           ).fetchone()["n"] == 0)
+        try:
+            store.save_artifact(
+                conn, type="narrative", title="Born superseded (direct)",
+                description="The same attempt, below the tool layer.",
+                content="still never stored", content_format="markdown",
+                session_id=s1, status="superseded",
+            )
+            direct_rejected = False
+        except ValueError:
+            direct_rejected = True
+        check("store.save_artifact rejects it too, for every other writer", direct_rejected)
+
+        # --- 8. the supersede chain always ends at a current row.
+        async def narrative(title: str, text: str) -> str:
+            return (await client.call_tool("save_artifact", {
+                "type": "narrative", "title": title,
+                "description": f"A call on the quarter's leader: {title}.",
+                "content_text": text, "content_format": "markdown", "session_id": s1,
+            })).data["row_id"]
+
+        first_call = await narrative("Quarter leader first call", "north leads")
+        corrected = await narrative("Quarter leader corrected", "south leads")
+        bystander = await narrative("Quarter leader third opinion", "east leads")
+        await client.call_tool("mark", {
+            "row_id": first_call, "session_id": s1, "status": "superseded",
+            "superseded_by": corrected,
+        })
+
+        cycle = (await client.call_tool("mark", {
+            "row_id": corrected, "session_id": s1, "status": "superseded",
+            "superseded_by": first_call,
+        })).data
+        check("a supersede cycle is rejected",
+              "error" in cycle and first_call in str(cycle.get("error")),
+              str(cycle.get("error"))[:200])
+        check("...and the replacement is still current",
+              row_status(conn, corrected) == "result", str(row_status(conn, corrected)))
+
+        onto_dead = (await client.call_tool("mark", {
+            "row_id": bystander, "session_id": s1, "status": "superseded",
+            "superseded_by": first_call,
+        })).data
+        check("superseded_by may not name a superseded row",
+              "error" in onto_dead, str(onto_dead)[:200])
+        check("...and the error points at that row's replacement",
+              corrected in str(onto_dead.get("error")), str(onto_dead.get("error"))[:240])
+
+        claim_with_pointer = (await client.call_tool("mark", {
+            "row_id": run["row_id"], "session_id": s1, "status": "result",
+            "superseded_by": corrected,
+        })).data
+        check("superseded_by with status=result is rejected",
+              "error" in claim_with_pointer, str(claim_with_pointer)[:200])
+        verdict_with_pointer = (await client.call_tool("mark", {
+            "row_id": run["row_id"], "session_id": s1, "verdict": "confirmed",
+            "basis": "re-ran it", "superseded_by": corrected,
+        })).data
+        check("superseded_by with only a verdict is rejected",
+              "error" in verdict_with_pointer, str(verdict_with_pointer)[:200])
+        run_row = conn.execute(
+            "SELECT status, superseded_by FROM artifacts WHERE row_id = ?", (run["row_id"],)
+        ).fetchone()
+        check("...and neither wrote a pointer or a status",
+              run_row["status"] == "exploratory" and run_row["superseded_by"] is None
+              and len(validations_rows(conn, run["row_id"])) == 0, str(dict(run_row)))
+
+        verdict_on_dead = (await client.call_tool("mark", {
+            "row_id": first_call, "session_id": s1, "verdict": "contradicted",
+            "basis": "the north figure double-counted returns",
+        })).data
+        check("a verdict alone on a superseded row leaves its pointer alone",
+              verdict_on_dead.get("superseded_by") == corrected
+              and conn.execute("SELECT superseded_by FROM artifacts WHERE row_id = ?",
+                               (first_call,)).fetchone()["superseded_by"] == corrected,
+              str(verdict_on_dead)[:200])
+
+        # --- 9. stale does not bury a needs_review. Both say "do not lean on
+        # this yet", but a needs_review names WHAT to check; replacing it with
+        # the generic staleness label would drop the more specific request.
+        # The stale reason is still reported beside it.
+        under_review = (await client.call_tool("run_sql", {
+            "code": "SELECT MAX(usdeur) AS max_usdeur FROM in_1",
+            "session_id": s1, "title": "Highest EUR rate (january)",
+            "description": "The best day in the fetched January days.",
+            "input_row_ids": [aged["row_id"]], "status": "result",
+        })).data
+        await client.call_tool("mark", {
+            "row_id": under_review["row_id"], "session_id": s1, "verdict": "needs_review",
+            "basis": "the max may be a fat-fingered quote; check against a second source",
+        })
+        review_state = store.validation_status(conn, under_review["row_id"])
+        check("stale does not override needs_review",
+              review_state["current"] == "needs_review", str(review_state["current"]))
+        check("...but the stale reason is still reported beside it",
+              "Exchange rates" in (review_state.get("stale_reason") or ""),
+              str(review_state.get("stale_reason")))
+        unvalidated_desc = (await client.call_tool("run_sql", {
+            "code": "SELECT COUNT(*) AS n_days FROM in_1",
+            "session_id": s1, "title": "Days of EUR rates (january)",
+            "description": "How many January days were fetched.",
+            "input_row_ids": [aged["row_id"]], "status": "result",
+        })).data
+        check("stale does override unvalidated",
+              store.validation_status(conn, unvalidated_desc["row_id"])["current"] == "stale")
+
+        # --- 10. keyword hits rank by relevance, recency only breaks ties.
+        # The older row is about exactly the query; the newer one mentions
+        # both words once in a long description about something else.
+        focused = await narrative(
+            "Walrus migration", "walrus migration routes by season")
+        passing = (await client.call_tool("save_artifact", {
+            "type": "narrative", "title": "Seabird colony survey",
+            "description": (
+                "A survey of puffins, gannets, terns, cormorants, kittiwakes, guillemots, "
+                "razorbills, fulmars and shags along the cliffs; one walrus was seen once "
+                "and a note on migration timing appears in passing among the counts."),
+            "content_text": "seabird counts", "content_format": "markdown",
+            "session_id": s1,
+        })).data["row_id"]
+        ranked = [a.row_id for a, _ in store.search_artifacts(conn, "walrus migration")]
+        check("search_artifacts ranks the better keyword match above the newer one",
+              ranked[:2] == [focused, passing], str(ranked))
+        evidence = [a.row_id for a, _, _ in store.find_evidence(conn, "walrus migration")]
+        check("find_evidence ranks the same way",
+              evidence[:2] == [focused, passing], str(evidence))
 
         # --- the display half: the GUI page shows all three.
         from dsos import gui  # import after DSOS_DB_PATH is set
