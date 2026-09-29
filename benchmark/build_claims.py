@@ -45,9 +45,9 @@ import sys
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parent
 RESULTS = HERE / "results"
-# In its own directory: the daemon writes `daemon.json` beside the store and
-# refuses to start a second daemon over the same directory, so the consumer
-# store cannot share `benchmark/` with the chain store's daemon.
+# In its own directory, which is tidier than it is necessary: the daemon's
+# manifest is per store (`<store>.daemon.json`), so two stores could share
+# `benchmark/` now, but they share `daemon.token` there.
 STORE_PATH = HERE / "consumer" / "store.db"
 WORKSPACE = RESULTS / "consumer_workspace"
 

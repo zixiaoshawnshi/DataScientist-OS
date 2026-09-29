@@ -239,7 +239,7 @@ dsos/
   mcp_server.py  the stdio shim: finds the daemon and proxies one profile to
                  it, plus the lazily-built `mcp` the tests import
   daemon.py      the process that owns the store — GUI + both MCP profiles
-                 off one Database, one per store, guarded by daemon.json
+                 off one Database, one per store, guarded by <store>.daemon.json
   server/        the MCP layer proper: build_producer/build_consumer over a
                  ServerConfig, the tool-call logger, the instructions, and
                  contract.py (renders the tool table into Doc II)

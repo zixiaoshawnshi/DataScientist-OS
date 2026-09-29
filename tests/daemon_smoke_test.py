@@ -335,14 +335,14 @@ def check_lifespan_composition() -> None:
     # is outside anything this in-process check can reach, so it is written
     # here with the same function: the removal below then has a real file to
     # remove, and would pass vacuously without one.
-    write_manifest(own_dir, 8765, "http://127.0.0.1:8765", own_store)
+    write_manifest(own_store, 8765, "http://127.0.0.1:8765")
 
     # TestClient's default Host is "testserver", which the daemon's
     # TrustedHostMiddleware refuses like any other non-loopback name. A real
     # client sends 127.0.0.1:<port>, so that is what this one sends too.
     with TestClient(app, base_url="http://127.0.0.1") as client:
         check("a manifest written at start is present while the daemon is running",
-              (own_dir / "daemon.json").exists(), "")
+              (own_dir / "store.db.daemon.json").exists(), "")
         response = client.post(
             "/mcp/producer/", json=INIT_BODY,
             headers={**INIT_HEADERS, "Authorization": f"Bearer {token}"},
@@ -353,8 +353,8 @@ def check_lifespan_composition() -> None:
               client.post("/mcp/producer/", json=INIT_BODY, headers=INIT_HEADERS).status_code == 401,
               "")
 
-    check("the lifespan removes daemon.json when the daemon shuts down",
-          not (own_dir / "daemon.json").exists(), "")
+    check("the lifespan removes the manifest when the daemon shuts down",
+          not (own_dir / "store.db.daemon.json").exists(), "")
 
 
 def check_host_header() -> None:
@@ -399,7 +399,7 @@ def check_other_store_manifest(record: dict) -> None:
     other_dir = DB_DIR / "other-store"
     other_dir.mkdir(parents=True, exist_ok=True)
     other_db = other_dir / "store.db"
-    (other_dir / "daemon.json").write_text(json.dumps(record), encoding="utf-8")
+    (other_dir / "store.db.daemon.json").write_text(json.dumps(record), encoding="utf-8")
     other_url = f"http://127.0.0.1:{free_port()}"
     other = launch(
         "daemon-other", ["--host", "127.0.0.1", "--port", other_url.rsplit(":", 1)[1]],
@@ -415,7 +415,7 @@ def check_other_store_manifest(record: dict) -> None:
         note = read_log("daemon-other")
         check("it says why it overwrote the manifest, naming the other store",
               "overwriting" in note and str(DB_PATH) in note, note.strip()[:300])
-        rewritten = json.loads((other_dir / "daemon.json").read_text(encoding="utf-8"))
+        rewritten = json.loads((other_dir / "store.db.daemon.json").read_text(encoding="utf-8"))
         check("the overwritten manifest records the new daemon, not the old one",
               rewritten.get("base_url") == other_url
               and rewritten.get("pid") != record.get("pid"),
@@ -425,12 +425,69 @@ def check_other_store_manifest(record: dict) -> None:
     check("the first daemon was not disturbed", healthz(DAEMON_URL) is not None, "")
 
 
+def check_two_stores_one_dir(record: dict) -> None:
+    """Two stores in one directory each get their own daemon and manifest.
+
+    With a single directory-wide daemon.json, the second daemon overwrote the
+    first's manifest, and the first store's shim then found the second
+    store's daemon. The manifest is now `<store file>.daemon.json`, so the
+    two claims live in two files and neither can clobber the other.
+    """
+    from dsos.daemon import manifest_path, read_manifest
+
+    second_db = DB_DIR / "second.db"
+    second_url = f"http://127.0.0.1:{free_port()}"
+    second = launch(
+        "daemon-second-store",
+        ["--host", "127.0.0.1", "--port", second_url.rsplit(":", 1)[1]],
+        {"DSOS_DB_PATH": str(second_db)},
+    )
+    try:
+        answer = wait_until_serving(second_url, second)
+        check("a daemon for a second store in the same directory starts",
+              answer is not None and answer.get("db_path") == str(second_db),
+              read_log("daemon-second-store")[-400:])
+        second_record = read_manifest(second_db) or {}
+        check("it writes its own manifest, second.db.daemon.json, naming its store",
+              manifest_path(second_db).name == "second.db.daemon.json"
+              and second_record.get("base_url") == second_url
+              and second_record.get("db_path") == str(second_db),
+              json.dumps(second_record))
+        first_record = read_manifest(DB_PATH) or {}
+        check("the first store's manifest is untouched",
+              first_record.get("pid") == record.get("pid")
+              and first_record.get("base_url") == DAEMON_URL,
+              json.dumps(first_record))
+    finally:
+        stop(second)
+    check("the first daemon was not disturbed by the second store's",
+          healthz(DAEMON_URL) is not None, "")
+
+
+def check_legacy_manifest() -> None:
+    """A directory-wide daemon.json from before the rename is still read —
+    but only for the store it names."""
+    from dsos.daemon import read_manifest
+
+    legacy_dir = DB_DIR / "legacy"
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    named, other = legacy_dir / "store.db", legacy_dir / "other.db"
+    (legacy_dir / "daemon.json").write_text(
+        json.dumps({"pid": 1, "base_url": "http://127.0.0.1:1", "db_path": str(named)}),
+        encoding="utf-8",
+    )
+    check("a legacy daemon.json is read for the store it names",
+          (read_manifest(named) or {}).get("base_url") == "http://127.0.0.1:1", "")
+    check("...and ignored for any other store in the same directory",
+          read_manifest(other) is None, "")
+
+
 def main() -> int:
     global DAEMON_URL, DAEMON_TOKEN
 
     port = free_port()
     DAEMON_URL = f"http://127.0.0.1:{port}"
-    manifest = DB_DIR / "daemon.json"
+    manifest = DB_DIR / "store.db.daemon.json"
 
     proc = launch("daemon", ["--host", "127.0.0.1", "--port", str(port)])
     answer = wait_until_serving(DAEMON_URL, proc)
@@ -451,7 +508,7 @@ def main() -> int:
     # is the interpreter's. What this test can say about the recorded pid is
     # that a later daemon must defer to it (check 5, below) and that a fresh
     # daemon replaces it.
-    check("daemon.json records pid, port, base_url, db_path and started_at",
+    check("the manifest records pid, port, base_url, db_path and started_at",
           isinstance(record.get("pid"), int) and record["pid"] > 0
           and record.get("port") == port
           and record.get("base_url") == DAEMON_URL
@@ -491,6 +548,8 @@ def main() -> int:
 
     check_host_header()
     check_other_store_manifest(record)
+    check_two_stores_one_dir(record)
+    check_legacy_manifest()
 
     # (5) A second daemon over the same store must refuse. The first daemon is
     # provably live here: this test started it and has just been talking to it
@@ -523,7 +582,7 @@ def main() -> int:
         deadline = time.time() + 20
         while manifest.exists() and time.time() < deadline:
             time.sleep(0.25)
-        check("daemon.json is removed on a clean shutdown", not manifest.exists(),
+        check("the manifest is removed on a clean shutdown", not manifest.exists(),
               str(manifest))
     else:
         print("[skip] clean-shutdown removal of daemon.json over a signal — no POSIX "
@@ -533,11 +592,11 @@ def main() -> int:
     # its pid is gone, so the file is stale and gets overwritten. Same store,
     # same port, which is the harder half of that claim.
     revived = launch("daemon-3", ["--host", "127.0.0.1", "--port", str(port)])
-    check("a daemon.json left by a dead daemon is stale, not a lockout",
+    check("a manifest left by a dead daemon is stale, not a lockout",
           wait_until_serving(DAEMON_URL, revived) is not None, read_log("daemon-3")[-400:])
     if manifest.exists():
         fresh = json.loads(manifest.read_text(encoding="utf-8"))
-        check("the restarted daemon rewrote daemon.json with its own pid",
+        check("the restarted daemon rewrote the manifest with its own pid",
               fresh.get("pid") != record.get("pid") and isinstance(fresh.get("pid"), int),
               f"pid {record.get('pid')} -> {fresh.get('pid')}")
     stop(revived)
@@ -549,7 +608,7 @@ def main() -> int:
     check("DSOS_PORT sets the port when --port is not given",
           wait_until_serving(env_url, from_env) is not None, read_log("daemon-4")[-400:])
     if manifest.exists():
-        check("a daemon started from DSOS_PORT records that port in daemon.json",
+        check("a daemon started from DSOS_PORT records that port in its manifest",
               json.loads(manifest.read_text(encoding="utf-8")).get("port") == env_port, "")
     stop(from_env)
 

@@ -30,7 +30,8 @@ than quietly allowed: Doc II lists remote access as an open question, and an
 accidental `--host 0.0.0.0` on a machine that would accept one is a worse
 outcome than a refusal.
 
-`daemon.json`, next to the store, is how "one daemon per store" is enforced
+`<store file>.daemon.json` (e.g. `store.db.daemon.json`), next to the store,
+is how "one daemon per store" is enforced
 across processes. A file naming a live pid whose `/healthz` answers *for this
 store* means somebody is already serving it, and this process exits rather
 than binding a second writer to the same file. A file whose pid is gone is
@@ -86,7 +87,11 @@ ALLOWED_HOST_HEADERS = ["127.0.0.1", "localhost", "::1", "[::1]"]
 TOKEN_ENV = "DSOS_TOKEN"
 PORT_ENV = "DSOS_PORT"
 TOKEN_FILENAME = "daemon.token"
-MANIFEST_FILENAME = "daemon.json"
+# The manifest is `<store file>.daemon.json` (see manifest_path);
+# `daemon.json` is the directory-wide name daemons used before that, still
+# read when it names the store being asked about.
+MANIFEST_SUFFIX = ".daemon.json"
+LEGACY_MANIFEST_FILENAME = "daemon.json"
 
 
 class DaemonConflict(RuntimeError):
@@ -180,23 +185,49 @@ def resolve_token(db_dir: Path) -> str:
     return token
 
 
-def manifest_path(db_dir: Path) -> Path:
-    return db_dir / MANIFEST_FILENAME
+def manifest_path(db_path: Path) -> Path:
+    """`<store file>.daemon.json`, beside the store.
+
+    Named after the store file rather than fixed, because the manifest is a
+    claim about ONE store and a directory can hold several: with a single
+    `daemon.json` per directory, a daemon for `data/b.db` overwrote the one
+    for `data/a.db`, and a.db's shim then found b.db's daemon and was
+    (correctly) refused. The token stays one per directory — it is a
+    secret shared by the same user's daemons, not a claim about a store.
+    """
+    return db_path.parent / f"{db_path.name}{MANIFEST_SUFFIX}"
 
 
-def read_manifest(db_dir: Path) -> dict | None:
-    path = manifest_path(db_dir)
+def _load_manifest(path: Path) -> dict | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        record = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         # A truncated or hand-edited manifest is not evidence of anything;
         # treat it as absent and let the caller overwrite it.
         return None
+    return record if isinstance(record, dict) else None
 
 
-def check_no_other_daemon(db_dir: Path, db_path: Path) -> None:
+def read_manifest(db_path: Path) -> dict | None:
+    """This store's manifest, or None.
+
+    The per-store file first. Failing that, a legacy directory-wide
+    `daemon.json` — what a daemon from before the rename writes — but only
+    if it names THIS store, because in a directory of several stores that
+    file belongs to whichever one wrote it last.
+    """
+    record = _load_manifest(manifest_path(db_path))
+    if record is not None:
+        return record
+    legacy = _load_manifest(db_path.parent / LEGACY_MANIFEST_FILENAME)
+    if legacy and isinstance(legacy.get("db_path"), str) and same_store(legacy["db_path"], db_path):
+        return legacy
+    return None
+
+
+def check_no_other_daemon(db_path: Path) -> None:
     """Refuse to start if a live daemon already owns this store.
 
     Three conditions matter, and they are not the same condition. A live pid
@@ -211,7 +242,7 @@ def check_no_other_daemon(db_dir: Path, db_path: Path) -> None:
     daemon): nobody is serving this store, so that is stale too. A dead pid
     is stale by definition. Every stale case gets overwritten, with a note.
     """
-    record = read_manifest(db_dir)
+    record = read_manifest(db_path)
     if not record:
         return
     pid = record.get("pid")
@@ -225,18 +256,18 @@ def check_no_other_daemon(db_dir: Path, db_path: Path) -> None:
         # be taken at its word, which is the manifest's.
         if not isinstance(served, str) or same_store(served, db_path):
             raise DaemonConflict(
-                f"a dsos daemon is already serving {served or record.get('db_path', str(db_dir))}: "
+                f"a dsos daemon is already serving {served or record.get('db_path', str(db_path))}: "
                 f"pid {pid} on {base_url} (started {record.get('started_at', 'unknown')}). "
                 f"Stop it, or point DSOS_DB_PATH at another store."
             )
         print(
-            f"dsos: overwriting a daemon.json whose daemon (pid {pid}, {base_url}) "
+            f"dsos: overwriting a daemon manifest whose daemon (pid {pid}, {base_url}) "
             f"is serving a different store, {served}, not {db_path}",
             file=sys.stderr,
         )
         return
     print(
-        f"dsos: overwriting a daemon.json that no live daemon answers for "
+        f"dsos: overwriting a daemon manifest that no live daemon answers for "
         f"(pid {pid}, {base_url or 'no base_url recorded'})",
         file=sys.stderr,
     )
@@ -266,8 +297,8 @@ def _healthz(base_url: str, timeout: float = 2.0) -> dict | None:
     return body if isinstance(body, dict) else {}
 
 
-def write_manifest(db_dir: Path, port: int, base_url: str, db_path: Path) -> None:
-    manifest_path(db_dir).write_text(
+def write_manifest(db_path: Path, port: int, base_url: str) -> None:
+    manifest_path(db_path).write_text(
         json.dumps(
             {
                 "pid": os.getpid(),
@@ -282,15 +313,16 @@ def write_manifest(db_dir: Path, port: int, base_url: str, db_path: Path) -> Non
     )
 
 
-def remove_manifest(db_dir: Path) -> None:
+def remove_manifest(db_path: Path) -> None:
     """Only ever removes *our* manifest. A daemon that was slow to start, and
     lost the race to a second one, must not delete the winner's file on its
     way out — that would turn "refuse to start" into "no daemon at all"."""
-    record = read_manifest(db_dir)
+    path = manifest_path(db_path)
+    record = _load_manifest(path)
     if record and record.get("pid") != os.getpid():
         return
     try:
-        manifest_path(db_dir).unlink()
+        path.unlink()
     except FileNotFoundError:
         pass
 
@@ -330,7 +362,7 @@ def build_app(config: ServerConfig, db_path: Path, db_dir: Path) -> FastAPI:
                     await stack.enter_async_context(mounted.lifespan(mounted))
                 yield
         finally:
-            remove_manifest(db_dir)
+            remove_manifest(db_path)
 
     app = FastAPI(title="DS Artifact OS", lifespan=lifespan)
     # Outermost, so it covers everything below: the GUI, /healthz, and both
@@ -395,7 +427,7 @@ def main(argv: list[str] | None = None) -> int:
     db_dir = db_path.parent
     db_dir.mkdir(parents=True, exist_ok=True)
     try:
-        check_no_other_daemon(db_dir, db_path)
+        check_no_other_daemon(db_path)
     except DaemonConflict as exc:
         print(f"dsos: {exc}", file=sys.stderr)
         return 3
@@ -410,7 +442,7 @@ def main(argv: list[str] | None = None) -> int:
         base_url=base_url,
     )
     app = build_app(config, db_path, db_dir)
-    write_manifest(db_dir, port, base_url, db_path)
+    write_manifest(db_path, port, base_url)
     print(
         f"dsos daemon on {base_url} serving {db_path}\n"
         f"  producer: {base_url}/mcp/producer/\n"
@@ -425,7 +457,7 @@ def main(argv: list[str] | None = None) -> int:
         # Belt to the lifespan's braces: uvicorn's own shutdown does not
         # always reach the finaliser above (a failed bind, for one), and a
         # manifest that outlives the process is a manifest that lies.
-        remove_manifest(db_dir)
+        remove_manifest(db_path)
     return 0
 
 

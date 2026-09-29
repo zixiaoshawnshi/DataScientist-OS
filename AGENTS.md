@@ -112,8 +112,9 @@ Windows (PowerShell):
 $env:DSOS_DB_PATH = "<db>"; $env:DSOS_PYTHON_PATH = "<analysis-python>"; & "<python>" -m dsos.daemon
 ```
 
-It prints its base URL and where the store is, and writes `daemon.json` and
-`daemon.token` next to the store — that is how the shim finds it, so the
+It prints its base URL and where the store is, and writes a manifest named
+after the store (`store.db.daemon.json` for `store.db`) and `daemon.token`
+next to it — that is how the shim finds it, so the
 daemon and the client must agree on `DSOS_DB_PATH` (the shim checks: a
 daemon serving a different store is reported as "not running for `<db>`",
 with both paths named). Leave it running for as long as you want dsos
@@ -125,7 +126,8 @@ daemon, against the directory the *daemon* was started from, not the
 agent's. Pass absolute paths.
 
 **Claude Code** (the shim, over stdio). The shim needs only `DSOS_DB_PATH`,
-to find `daemon.json` and `daemon.token` beside the store; everything else
+to find the store's manifest (`<store>.daemon.json`) and `daemon.token`
+beside it; everything else
 is the daemon's:
 
 ```sh
@@ -252,7 +254,7 @@ serving a different store (it names both).
   the caller's. The same goes for any path passed in a tool call.
 - Both of those belong in the **daemon's** environment. The shim reads only
   `DSOS_DB_PATH` (plus the optional `DSOS_URL`/`DSOS_TOKEN` overrides, which
-  skip `daemon.json`/`daemon.token`; if `DSOS_DB_PATH` is set too, the
+  skip the manifest and `daemon.token`; if `DSOS_DB_PATH` is set too, the
   daemon at `DSOS_URL` must be serving that store), and an HTTP
   registration reads nothing at all.
 - `run_python` code executes with whatever ambient permissions the

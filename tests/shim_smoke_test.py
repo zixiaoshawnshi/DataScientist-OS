@@ -35,7 +35,7 @@ Covered here:
    command to start one. This is the first thing a new user hits, and the
    message is the entire difference between "broken" and "not started yet".
 5. A daemon that answers, but for a *different* store — a copied
-   `daemon.json`, or a `DSOS_URL` left pointing at another store's daemon —
+   manifest (`store.db.daemon.json`), or a `DSOS_URL` left pointing at another store's daemon —
    is not a daemon for this one. The shim exits non-zero naming both stores,
    and opens nothing of its own on the way out. (PR #15 review: before this,
    /healthz answering was the whole check, and a shim would happily proxy a
@@ -184,12 +184,12 @@ def launch_daemon(port: int) -> subprocess.Popen:
 def seed_shim_dir() -> None:
     """A directory whose discovery files point at a live daemon for another store.
 
-    A verbatim copy of the daemon's own daemon.json and daemon.token, and no
+    A verbatim copy of the daemon's own manifest (store.db.daemon.json) and daemon.token, and no
     store: the manifest is real and its daemon answers, but that daemon is
     serving DB_PATH, not SHIM_DB_PATH.
     """
     SHIM_DIR.mkdir(parents=True, exist_ok=True)
-    for name in ("daemon.json", "daemon.token"):
+    for name in ("store.db.daemon.json", "daemon.token"):
         shutil.copyfile(DB_DIR / name, SHIM_DIR / name)
 
 
@@ -232,7 +232,7 @@ async def run_python_over_stdio(**env_overrides: str) -> dict:
 
 
 def check_discovery_path() -> None:
-    """Checks 1 and 3: daemon.json + daemon.token, and the consumer profile."""
+    """Checks 1 and 3: the manifest + daemon.token, and the consumer profile."""
     env = {"DSOS_DB_PATH": str(DB_PATH), "DSOS_PYTHON_PATH": str(BOGUS_PYTHON)}
 
     producer = asyncio.run(list_over_stdio("producer", **env))
@@ -267,11 +267,11 @@ def check_url_override(base_url: str, token: str) -> None:
 
     The files are moved aside rather than pointed around: the shim has to be
     given the daemon's own store, or the db_path check (check 5) would refuse
-    it. The daemon read its token at start-up and reads daemon.json only at
+    it. The daemon read its token at start-up and reads its manifest only at
     the next start-up, so neither misses them while they are away.
     """
     moved = []
-    for name in ("daemon.json", "daemon.token"):
+    for name in ("store.db.daemon.json", "daemon.token"):
         aside = DB_DIR / f"{name}.aside"
         (DB_DIR / name).replace(aside)
         moved.append((aside, DB_DIR / name))
@@ -296,7 +296,7 @@ def check_url_override(base_url: str, token: str) -> None:
         for aside, source in moved:
             aside.replace(source)
     check(
-        "DSOS_URL + DSOS_TOKEN work with no daemon.json beside the store",
+        "DSOS_URL + DSOS_TOKEN work with no manifest beside the store",
         EXPECTED_PRODUCER_TOOLS.issubset(set(names)),
         f"{len(names)} tools: {', '.join(names)}",
     )
@@ -325,7 +325,7 @@ def check_other_store(base_url: str, token: str) -> None:
     seed_shim_dir()
     done = run_shim(DSOS_DB_PATH=str(SHIM_DB_PATH))
     check(
-        "a daemon.json naming a daemon for another store: the shim exits non-zero",
+        "a manifest naming a daemon for another store: the shim exits non-zero",
         done.returncode != 0,
         f"returncode {done.returncode}",
     )

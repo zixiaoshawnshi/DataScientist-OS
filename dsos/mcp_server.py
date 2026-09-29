@@ -127,22 +127,37 @@ if __name__ == "__main__":
             return os.path.normcase(str(Path(p).resolve()))
         return canonical(a) == canonical(b)
 
-    def _manifest_base_url(db_dir: Path) -> str | None:
-        """The running daemon's base URL, from the file it wrote beside the store.
+    def _manifest_path(db_path: Path) -> Path:
+        """`<store file>.daemon.json` — dsos.daemon.manifest_path's rule."""
+        return db_path.parent / f"{db_path.name}.daemon.json"
 
-        Same reader the daemon's own "one daemon per store" check uses, and for
-        the same reason: the file next to the store is the answer to "who owns
-        this store", and a shim that invented a second way to ask would be a
-        second answer.
-        """
-        path = db_dir / "daemon.json"
+    def _load(path: Path) -> dict | None:
         if not path.exists():
             return None
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
-        base_url = record.get("base_url")
+        return record if isinstance(record, dict) else None
+
+    def _manifest_base_url(db_path: Path) -> str | None:
+        """The running daemon's base URL, from the file it wrote beside the store.
+
+        Same lookup the daemon's own "one daemon per store" check makes
+        (dsos.daemon.read_manifest), and for the same reason: the file next to
+        the store is the answer to "who owns this store", and a shim that
+        invented a second way to ask would be a second answer. The per-store
+        manifest first; a legacy directory-wide daemon.json only if it names
+        this store, since in a directory of several stores it belongs to
+        whichever daemon wrote it last.
+        """
+        record = _load(_manifest_path(db_path))
+        if record is None:
+            legacy = _load(db_path.parent / "daemon.json")
+            if legacy and isinstance(legacy.get("db_path"), str) and _same_store(
+                    legacy["db_path"], db_path):
+                record = legacy
+        base_url = (record or {}).get("base_url")
         return base_url if isinstance(base_url, str) and base_url else None
 
     def _no_daemon(db_path: Path) -> int:
@@ -191,7 +206,7 @@ if __name__ == "__main__":
         db_dir = db_path.parent
 
         from_env = os.environ.get(URL_ENV)
-        base_url = from_env or _manifest_base_url(db_dir)
+        base_url = from_env or _manifest_base_url(db_path)
         if not base_url:
             return _no_daemon(db_path)
         answer = _healthz(base_url)
@@ -208,13 +223,13 @@ if __name__ == "__main__":
         stated = "DSOS_DB_PATH" in os.environ or not from_env
         if stated and isinstance(served, str) and not _same_store(served, db_path):
             # A daemon answers, but for another store: a DSOS_URL left
-            # pointing at a different store's daemon, or a copied daemon.json.
+            # pointing at a different store's daemon, or a copied manifest.
             # Proxying anyway would hand the client somebody else's store
             # under this one's name — every write would land in the wrong
             # file, and nothing would say so. It is "not running" as far as
             # *this* store is concerned, so it is said the same way, with the
             # mismatch named so the fix is obvious.
-            source = URL_ENV if from_env else str(db_dir / "daemon.json")
+            source = URL_ENV if from_env else str(_manifest_path(db_path))
             print(
                 f"dsos daemon not running for {db_path}. The daemon at {base_url} "
                 f"(from {source}) is serving a different store, {served}. "
