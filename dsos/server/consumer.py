@@ -1,9 +1,10 @@
 """The consumer profile: the four tools a PM or reviewer uses to decide
 whether to believe a number.
 
-Built here, with no tools, so the shape exists before anything depends on
-it. WP-D1 mounts it beside the producer in one daemon and WP-F1 adds the
-four tools (find_evidence, get_claim, cite, ask).
+Four tools: find_evidence, get_claim, cite and ask (WP-F1). The daemon
+mounts this profile beside the producer at /mcp/consumer/ (WP-D1), over the
+same store, and `python -m dsos.mcp_server --profile consumer` proxies it
+over stdio.
 
 **This is the other direction through the same store, and the caller is a
 different kind of agent.** Everything on the producer side is designed for a
@@ -39,7 +40,8 @@ what keeps the ordinary case cheap.
 
 Tools take no `session_id` (D12): a reader has no session to manage, and
 `ConsumerSessions` in `common.py` establishes and logs one per MCP client
-session.
+session — see there for what that means on MCP 2026-07-28, which has no
+sessions of its own.
 """
 
 from __future__ import annotations
