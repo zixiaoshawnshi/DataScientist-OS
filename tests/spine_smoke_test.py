@@ -31,6 +31,11 @@ sleeping, so expiry is reachable deterministically and in milliseconds.
    reaches the producer who asked it, an unrelated question reaches
    nothing at all, and the ranking is by shared content words *within* the
    status bands rather than across them.
+9. Claiming an `open` question makes it `in_progress`, so the board ranks
+   it as live work; a question that is already answered or abandoned
+   refuses a second close (and record_decision refuses it before writing a
+   decision); and a decision's `source` column stays NULL, because source
+   is provenance and not the question link.
 
 Run: E:/Projects/DataScienceOS/.venv/Scripts/python.exe tests/spine_smoke_test.py
 """
@@ -401,6 +406,139 @@ async def main() -> None:
         check("DSOS_DISABLE_BOARD=1 still empties the board at this level too",
               spine.related_questions(conn, "narwhal tusk length by sex") == [], "")
         os.environ.pop(BOARD_ENV, None)
+
+        # --- 9. claiming moves a question on, and a finished one stays finished.
+        #
+        # A consumer's question is created `open`. Claiming it has to make it
+        # `in_progress`, or the board goes on reading "somebody is waiting"
+        # for a question somebody is already on — which is the band a second
+        # producer is most likely to act on, so it is the worst one to be
+        # wrong in. Private vocabulary (platypus) as in section 8.
+        platypus_text = "how long do platypus eggs take to incubate"
+        asked_q = spine.create_question(
+            conn, question=platypus_text, status="open", asked_by="consumer-session-2",
+        )
+        waiting_platypus = spine.create_question(
+            conn, question="platypus egg clutch size", status="open",
+            asked_by="consumer-session-2",
+        )
+        taker = (await client.call_tool(
+            "start_session", {"question": platypus_text, "question_id": asked_q})).data
+        taken = question_row(conn, asked_q)
+        check("claiming an open question makes it in_progress, held by the claimant",
+              "error" not in taker and taken.get("status") == "in_progress"
+              and taken.get("claimed_by") == taker.get("session_id")
+              and taken.get("asked_by") == "consumer-session-2", str(taken))
+        onlooker = (await client.call_tool(
+            "start_session", {"question": platypus_text})).data
+        platypus_board = onlooker.get("related_questions", [])
+        claimed_entry = entry_for(platypus_board, asked_q)
+        check("a second session sees the claimed question as live in_progress work",
+              bool(claimed_entry) and claimed_entry["status"] == "in_progress"
+              and claimed_entry["claimed"] is True
+              and claimed_entry["lease_expires_at"] is not None, str(claimed_entry))
+        check("... ranked in the live band, ahead of the question still waiting",
+              bool(claimed_entry) and entry_for(platypus_board, waiting_platypus) is not None
+              and platypus_board.index(claimed_entry)
+              < platypus_board.index(entry_for(platypus_board, waiting_platypus)),
+              str([(e["question"], e["status"]) for e in platypus_board]))
+        rank = spine._board_rank(
+            conn.execute("SELECT * FROM questions WHERE id = ?", (asked_q,)).fetchone(),
+            spine.lease_state(conn, conn.execute(
+                "SELECT * FROM questions WHERE id = ?", (asked_q,)).fetchone())["live"],
+        )
+        check("the claimed question ranks as live in_progress (band 0)", rank == 0, str(rank))
+        rerun = (await client.call_tool(
+            "start_session", {"question": platypus_text, "question_id": asked_q})).data
+        check("a claimed-then-in_progress question still refuses a second live claimant",
+              "error" in rerun, str(rerun))
+
+        # A finished question is closed once. Re-closing an answered one would
+        # overwrite the row the board hands every later session, and closing
+        # somebody else's answer as abandoned would erase it.
+        answer = (await client.call_tool("record_decision", {
+            "session_id": taker["session_id"],
+            "decision": "Platypus eggs incubate for about ten days",
+            "rationale": "The fixture dataset is the only evidence, and it is enough here.",
+            "evidence_row_ids": [evidence["row_id"]], "question_id": asked_q,
+        })).data
+        answered_row = question_row(conn, asked_q)
+        check("record_decision answers the claimed question",
+              answered_row.get("status") == "answered"
+              and answered_row.get("artifact_row_id") == answer.get("row_id"), str(answered_row))
+        other = (await client.call_tool("record_decision", {
+            "session_id": onlooker["session_id"],
+            "decision": "Platypus eggs incubate for about four weeks",
+            "rationale": "A different reading of the same fixture, recorded on its own.",
+            "evidence_row_ids": [evidence["row_id"]],
+        })).data
+        check("a decision with no question_id is still recorded", bool(other.get("row_id")),
+              str(other))
+        reclose = (await client.call_tool("close_question", {
+            "session_id": onlooker["session_id"], "question_id": asked_q,
+            "status": "answered", "artifact_row_id": other["row_id"],
+        })).data
+        check("re-closing an answered question is refused, pointing at the existing answer",
+              "error" in reclose and answer["row_id"] in str(reclose.get("error", "")),
+              str(reclose))
+        abandon = (await client.call_tool("close_question", {
+            "session_id": onlooker["session_id"], "question_id": asked_q,
+            "status": "abandoned",
+        })).data
+        check("closing someone else's answered question as abandoned is refused",
+              "error" in abandon, str(abandon))
+        after = question_row(conn, asked_q)
+        check("the refused closes left the answer untouched",
+              after.get("status") == "answered"
+              and after.get("artifact_row_id") == answer["row_id"]
+              and after.get("closed_at") == answered_row.get("closed_at"), str(after))
+
+        gave_up = spine.create_question(conn, question="platypus venom spur yield", status="open")
+        spine.close_question(conn, session_id=onlooker["session_id"], question_id=gave_up,
+                             status="abandoned")
+        revive = (await client.call_tool("close_question", {
+            "session_id": onlooker["session_id"], "question_id": gave_up,
+            "status": "answered", "artifact_row_id": other["row_id"],
+        })).data
+        check("an abandoned question cannot be closed again either",
+              "error" in revive and question_row(conn, gave_up).get("status") == "abandoned"
+              and question_row(conn, gave_up).get("artifact_row_id") is None, str(revive))
+
+        # record_decision has to find that out BEFORE it writes the decision,
+        # so the caller learns the question is closed while it can still act
+        # on that, rather than after a row it did not mean to write.
+        decisions_before = conn.execute(
+            "SELECT COUNT(*) AS n FROM artifacts WHERE type = 'decision'").fetchone()["n"]
+        late = (await client.call_tool("record_decision", {
+            "session_id": onlooker["session_id"],
+            "decision": "Platypus eggs incubate for about two weeks",
+            "rationale": "Arrived after the question was already answered.",
+            "evidence_row_ids": [evidence["row_id"]], "question_id": asked_q,
+        })).data
+        decisions_after = conn.execute(
+            "SELECT COUNT(*) AS n FROM artifacts WHERE type = 'decision'").fetchone()["n"]
+        check("record_decision against an answered question is refused",
+              "error" in late and answer["row_id"] in str(late.get("error", "")), str(late))
+        check("... before any decision row is written",
+              decisions_after == decisions_before, f"{decisions_before} -> {decisions_after}")
+        check("... and the question still points at its original answer",
+              question_row(conn, asked_q).get("artifact_row_id") == answer["row_id"], "")
+
+        # `source` is provenance ({url, fetched_at, refresh_after}); the
+        # decision -> question link lives on questions.artifact_row_id, and
+        # the question_id is in the decision's own content where it is data.
+        for label, row_id in (("with a question_id", answer["row_id"]),
+                              ("from section 5", decision["row_id"]),
+                              ("with no question", other["row_id"])):
+            src = conn.execute("SELECT source, content_ref FROM artifacts WHERE row_id = ?",
+                               (row_id,)).fetchone()
+            check(f"a decision's source column is NULL ({label})", src["source"] is None,
+                  str(src["source"]))
+        answer_body = json.loads(Path(conn.execute(
+            "SELECT content_ref FROM artifacts WHERE row_id = ?", (answer["row_id"],)
+        ).fetchone()["content_ref"]).read_text(encoding="utf-8"))
+        check("the decision's content names the question it answered",
+              answer_body.get("question_id") == asked_q, str(answer_body))
 
     print()
     if FAILURES:
