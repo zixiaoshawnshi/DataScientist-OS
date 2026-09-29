@@ -370,6 +370,65 @@ async def main() -> None:
           f"questions {before['questions']}->{after['questions']}, "
           f"sessions {before['sessions']}->{after['sessions']}")
 
+    # 8. ask is also the follow-up. Once a producer answers a consumer's
+    #    question, asking it again hands back the answer rather than opening
+    #    a duplicate; reopen=True asks afresh; an abandoned question is asked
+    #    again as a new one that names the abandoned one.
+    async with Client(build_producer(config)) as producer, Client(consumer) as client:
+        claimed = (await producer.call_tool("start_session", {
+            "question": CONSUMER_QUESTION, "question_id": asked["question_id"]})).data
+        await producer.call_tool("close_question", {
+            "session_id": claimed["session_id"], "question_id": asked["question_id"],
+            "status": "answered", "artifact_row_id": ids["result"]})
+        questions_before = count(conn, "questions")
+        follow_up = (await client.call_tool("ask", {"question": CONSUMER_QUESTION})).data
+        check("asking an answered question again returns its answer",
+              follow_up.get("status") == "answered"
+              and follow_up.get("question_id") == asked["question_id"]
+              and (follow_up.get("answer") or {}).get("row_id") == ids["result"],
+              str(follow_up))
+        check("...with the answer's standing and url, and no warning on a clean result",
+              (follow_up.get("answer") or {}).get("status") == "result"
+              and (follow_up.get("answer") or {}).get("url") == f"dsos:{ids['result']}"
+              and "warning" not in (follow_up.get("answer") or {}),
+              str(follow_up.get("answer")))
+        check("...and opens no new question", count(conn, "questions") == questions_before,
+              f"{questions_before} -> {count(conn, 'questions')}")
+
+        fresh = (await client.call_tool(
+            "ask", {"question": CONSUMER_QUESTION, "reopen": True})).data
+        check("reopen=True opens a new question instead of returning the answer",
+              fresh.get("status") == "open" and fresh.get("question_id")
+              and fresh.get("question_id") != asked["question_id"], str(fresh))
+
+        # An answer that has been contradicted since carries the warning.
+        doubtful_q = "is the onboarding activation estimate still right"
+        doubtful = (await client.call_tool("ask", {"question": doubtful_q})).data
+        s = (await producer.call_tool("start_session", {
+            "question": doubtful_q, "question_id": doubtful["question_id"]})).data
+        await producer.call_tool("close_question", {
+            "session_id": s["session_id"], "question_id": doubtful["question_id"],
+            "status": "answered", "artifact_row_id": ids["contradicted"]})
+        doubted = (await client.call_tool("ask", {"question": doubtful_q})).data
+        check("an answer contradicted since is returned with a CONTRADICTED warning",
+              doubted.get("status") == "answered"
+              and "CONTRADICTED" in ((doubted.get("answer") or {}).get("warning") or ""),
+              str(doubted.get("answer")))
+
+        dropped_q = "what was q4 churn by plan"
+        dropped = (await client.call_tool("ask", {"question": dropped_q})).data
+        s = (await producer.call_tool("start_session", {
+            "question": dropped_q, "question_id": dropped["question_id"]})).data
+        await producer.call_tool("close_question", {
+            "session_id": s["session_id"], "question_id": dropped["question_id"],
+            "status": "abandoned"})
+        retry = (await client.call_tool("ask", {"question": dropped_q})).data
+        check("asking an abandoned question again opens a new one naming the abandoned one",
+              retry.get("status") == "open"
+              and retry.get("question_id") != dropped["question_id"]
+              and retry.get("previously_abandoned") == dropped["question_id"],
+              str(retry))
+
 
 if __name__ == "__main__":
     asyncio.run(main())

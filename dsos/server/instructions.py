@@ -106,6 +106,7 @@ dropping those is how a retracted number gets quoted again.
 5. ask(question, context=...) when no evidence exists, or when what exists
 does not settle it. That opens a question an analysis agent picks up; it is
 not a computation and nothing waits on it. Say in `context` what you already
-know and what decision the answer is for. Asking the same question twice
-returns the one already open.
+know and what decision the answer is for. Asking the same question again is
+how you follow up: it returns the one already open, or — once a producer
+has answered it — the answer itself, with its current standing.
 """

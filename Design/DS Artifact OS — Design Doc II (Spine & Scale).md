@@ -193,7 +193,7 @@ Every tool definition costs tokens on every turn, for every agent that loads it,
 <!-- contract:consumer -->
 | tool | params | summary |
 |---|---|---|
-| `ask` | `question*`: string, `context`: string \| null | Put a question this store cannot answer to an analysis agent, and return its id. |
+| `ask` | `question*`: string, `context`: string \| null, `reopen`: boolean | Put a question this store cannot answer to an analysis agent, and return its id. |
 | `cite` | `row_id*`: string | Turn a result into a reference you can paste into a document, with its standing attached. |
 | `find_evidence` | `claim*`: string, `top_k`: integer | Find the stated results in this store that speak to a claim, with the numbers behind them. |
 | `get_claim` | `row_id*`: string | Get one result in full: what it says, how well it is backed, and how it was computed. |
@@ -204,7 +204,7 @@ The consumer tools are designed against the PM agent:
 - **`find_evidence(claim)`** searches `result` and `decision` rows only (never `exploratory`). Each hit returns the finding in one line, the number or numbers behind it, its current validation status (confirmed / contradicted / stale), and the question it answered.
 - **`get_claim(row_id)`** returns the result, its caveats, its lineage flattened to *source → transforms → result*, and the code that produced it. That is enough for the PM agent to judge the claim without re-running anything.
 - **`cite(row_id)`** returns a stable reference that the PM agent can paste into a document. It resolves to the GUI's artifact page.
-- **`ask(question)`** is the consumer's only write. When no evidence exists, the PM agent opens a question for a producer to pick up instead of computing the answer itself.
+- **`ask(question)`** is the consumer's only write. When no evidence exists, the PM agent opens a question for a producer to pick up instead of computing the answer itself. Asking the same question again is the follow-up: it returns the question while it is in flight, and the answering row (with its current standing) once a producer has closed it; `reopen=True` asks afresh. *(Added after the PR #15 review: the hand-off was one-way, and this closes it without a fifth consumer tool.)*
 
 ### Questions as the coordination board
 

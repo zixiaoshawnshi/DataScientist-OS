@@ -346,8 +346,42 @@ def build_consumer(config: ServerConfig) -> FastMCP:
             payload["warning"] = warning
         return payload
 
+    def _answer(conn, row_id: str | None) -> dict | None:
+        """The row a question was closed with, in the shape a reader needs to
+        decide whether to quote it: what it says, its standing, and where it
+        lives. The row may have been superseded or contradicted SINCE it
+        answered the question, and that is exactly what a PM coming back for
+        the answer must be told, so the same warnings get_claim gives apply."""
+        art = store.get_artifact_by_row_id(conn, row_id, load_content=False) if row_id else None
+        if art is None:
+            return None
+        validation = store.validation_status(conn, art.row_id)
+        answer = {
+            "row_id": art.row_id,
+            "type": art.type,
+            "title": art.title,
+            "finding": art.description,
+            "status": art.status,
+            "validation": validation["current"],
+            "url": url_for(art.row_id),
+        }
+        if art.superseded_by:
+            answer["superseded_by"] = art.superseded_by
+        warning = _status_warning(art) or _validation_warning(validation)
+        if warning:
+            answer["warning"] = warning
+        return answer
+
+    def _matching(conn, wanted: str, statuses: tuple[str, ...]):
+        """The newest question in `statuses` whose normalised text is `wanted`."""
+        return next(
+            (q for q in store.unfinished_questions(conn, statuses)
+             if spine.normalise_question_text(q["question"]) == wanted),
+            None,
+        )
+
     @mcp.tool()
-    def ask(question: str, context: str | None = None) -> dict:
+    def ask(question: str, context: str | None = None, reopen: bool = False) -> dict:
         """Put a question this store cannot answer to an analysis agent, and return its id.
 
         Use this when find_evidence comes back empty, or when what it returns
@@ -362,13 +396,22 @@ def build_consumer(config: ServerConfig) -> FastMCP:
         producer picking this up in one pass and starting over, and it is
         worth writing even when you have nothing.
 
-        Asking the same question twice returns the existing question instead
-        of opening a second one, so a retry or a re-read costs nothing and
-        the board stays readable. Comparison is on the normalised text — case,
-        whitespace and a trailing question mark do not make a new question —
-        and it applies to questions that are open or being worked on right
-        now. An answered question is not a duplicate: asking again means you
-        want it looked at afresh, which is a new question.
+        Asking the same question again is also how you FOLLOW UP on it, so a
+        retry or a later check costs nothing and the board stays readable.
+        Comparison is on the normalised text — case, whitespace and a
+        trailing question mark do not make a new question — and what comes
+        back depends on where the question has got to:
+
+        - still open or being worked on: the existing question, with
+          `deduplicated: true`, and nothing new is opened;
+        - answered: `status: "answered"` and `answer` — the row that answered
+          it, with its current standing and a `warning` if it has been
+          superseded or contradicted since. That is the answer; read it (or
+          get_claim its row_id) rather than asking again. Pass
+          `reopen=True` only when you want it looked at afresh — that opens a
+          new question;
+        - abandoned: a new open question, with `previously_abandoned` naming
+          the one nobody finished.
 
         This is a request, not a reservation. Nothing is queued behind it and
         no agent is committed to picking it up; it is the one write this
@@ -380,27 +423,46 @@ def build_consumer(config: ServerConfig) -> FastMCP:
                          "picks up and what the board matches on.",
                 "artifact_row_ids": [],
             }
-        conn = db.conn()
         wanted = spine.normalise_question_text(question)
         with db.write() as conn:
             # Dedupe on the same normalisation spine's board uses, rather
             # than a second spelling of it: a consumer's "Which team won q3?"
             # and a producer's "which  team won q3" are one question, and two
             # spellings of that rule is the drift TTD U4 is about.
-            for existing in store.unfinished_questions(conn):
-                if spine.normalise_question_text(existing["question"]) == wanted:
-                    return {
-                        "question_id": existing["id"],
-                        "status": existing["status"],
-                        "deduplicated": True,
-                        "note": f"an unfinished question already asks this (asked "
-                                f"{existing['created_at'][:10]}). It is on the board; "
-                                f"no second one was opened.",
-                    }
+            existing = _matching(conn, wanted, ("open", "in_progress"))
+            if existing is not None:
+                return {
+                    "question_id": existing["id"],
+                    "status": existing["status"],
+                    "deduplicated": True,
+                    "note": f"an unfinished question already asks this (asked "
+                            f"{existing['created_at'][:10]}). It is on the board; "
+                            f"no second one was opened.",
+                }
+            # Answered is the follow-up case: the reader asked, someone
+            # answered, and asking again is how the reader finds out. Handing
+            # back the answer is the whole point; opening a duplicate would
+            # put already-done work back on the board.
+            answered = None if reopen else _matching(conn, wanted, ("answered",))
+            answer = _answer(conn, answered["artifact_row_id"]) if answered else None
+            if answered is not None and answer is not None:
+                return {
+                    "question_id": answered["id"],
+                    "status": "answered",
+                    "answer": answer,
+                    "note": f"this was answered on {(answered['closed_at'] or '')[:10]} "
+                            f"by row {answer['row_id']}. Pass reopen=True to ask for it "
+                            f"to be looked at afresh.",
+                    "artifact_row_ids": [answer["row_id"]],
+                }
+            abandoned = _matching(conn, wanted, ("abandoned",))
             question_id = spine.create_question(
                 conn, question=question, status="open",
                 hypothesis=context, asked_by=consumer_session_id(),
             )
-        return {"question_id": question_id, "status": "open"}
+        response = {"question_id": question_id, "status": "open"}
+        if abandoned is not None:
+            response["previously_abandoned"] = abandoned["id"]
+        return response
 
     return mcp
