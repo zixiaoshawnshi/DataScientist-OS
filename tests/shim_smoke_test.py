@@ -19,20 +19,27 @@ point is the thing being changed.
 Covered here:
 
 1. With a live daemon, a stdio fastmcp.Client driven through the shim lists
-   the producer tools — and the shim's own `DSOS_DB_PATH`, a directory that
-   holds a copied `daemon.json`/`daemon.token` and no store, still has no
-   `store.db` afterwards. That second half is the load-bearing assertion: it
-   is what makes this test fail against the pre-D2 module, which would have
-   answered the same tool list by opening a brand new store of its own.
+   the producer tools, and a `run_python` call through it succeeds even
+   though the *shim's* `DSOS_PYTHON_PATH` names an interpreter that does not
+   exist. That second half is the load-bearing assertion: the call can only
+   have run in the daemon, whose own `DSOS_PYTHON_PATH` is the one that
+   counts — a shim that served the tools itself, the way the pre-D2 module
+   did, would have tried the bogus interpreter and failed. It is also the
+   claim AGENTS.md makes about where that variable belongs.
 2. `DSOS_URL` + `DSOS_TOKEN` override the discovery files, so a shim pointed
-   at a daemon it has no manifest for still works, and still opens nothing.
-3. `--profile consumer` reaches the consumer endpoint and answers with
-   nothing the producer also has. Deliberately not a count: the consumer
-   surface is empty until WP-F1 and has four tools after it, and a hardcoded
-   number here would be wrong twice.
+   at a daemon it has no manifest for still works — with `DSOS_DB_PATH`
+   naming that daemon's store, or with no `DSOS_DB_PATH` at all.
+3. `--profile consumer` reaches the consumer endpoint: it serves the
+   consumer's evidence tools and nothing the producer also has.
 4. With no daemon, the shim exits non-zero and names the store and the exact
    command to start one. This is the first thing a new user hits, and the
    message is the entire difference between "broken" and "not started yet".
+5. A daemon that answers, but for a *different* store — a copied
+   `daemon.json`, or a `DSOS_URL` left pointing at another store's daemon —
+   is not a daemon for this one. The shim exits non-zero naming both stores,
+   and opens nothing of its own on the way out. (PR #15 review: before this,
+   /healthz answering was the whole check, and a shim would happily proxy a
+   client to the wrong store.)
 
 On the tool list: assertions name tools that have existed since WP-B2R and
 are load-bearing for every lane since, never a count.
@@ -68,15 +75,18 @@ for _stream in (sys.stdout, sys.stderr):
 
 DB_DIR = REPO_ROOT / "data" / "test-runs" / "shim_smoke_test"
 DB_PATH = DB_DIR / "store.db"
-# A second directory, used as the shim's DSOS_DB_PATH in the checks that need
-# to prove the shim opened nothing. It carries a copy of the daemon's
-# discovery files and no store at all; if the shim builds a Database the way
-# the pre-D2 module did, `store.db` appears here and the test says so.
+# A second directory, holding a verbatim copy of the daemon's discovery files
+# and no store at all: a manifest that points at a live daemon serving
+# *another* store. The shim must refuse it — and if it builds a Database on
+# the way out, the way the pre-D2 module did, `store.db` appears here and the
+# test says so.
 SHIM_DIR = DB_DIR / "client-view"
 SHIM_DB_PATH = SHIM_DIR / "store.db"
-# A third, for the DSOS_URL check: no manifest, no token file, no store.
+# A third, for the DSOS_URL mismatch: no manifest, no token file, no store.
 URL_ONLY_DIR = DB_DIR / "url-only"
 URL_ONLY_DB_PATH = URL_ONLY_DIR / "store.db"
+# The shim's DSOS_PYTHON_PATH in check 1: an interpreter that does not exist.
+BOGUS_PYTHON = DB_DIR / "no-such-python" / "python.exe"
 
 os.environ["DSOS_DB_PATH"] = str(DB_PATH)
 shutil.rmtree(DB_DIR, ignore_errors=True)
@@ -93,6 +103,8 @@ FAILURES: list[str] = []
 # later lane builds on. Asserting these rather than a set of names or a count
 # keeps the test honest while WP-E2 and WP-F1 are still moving the surface.
 EXPECTED_PRODUCER_TOOLS = {"start_session", "search_artifacts", "get_artifact", "save_artifact"}
+# The consumer's four (D6, WP-F1).
+EXPECTED_CONSUMER_TOOLS = {"find_evidence", "get_claim", "cite", "ask"}
 
 
 def check(label: str, ok: bool, detail: str = "") -> None:
@@ -156,7 +168,11 @@ def stop(proc: subprocess.Popen) -> None:
 
 
 def launch_daemon(port: int) -> subprocess.Popen:
-    env = child_env(DSOS_DB_PATH=str(DB_PATH), DSOS_PORT=str(port))
+    # The daemon's DSOS_PYTHON_PATH is a real interpreter; check 1 gives the
+    # shim a bogus one and relies on the daemon's being the one that is used.
+    env = child_env(
+        DSOS_DB_PATH=str(DB_PATH), DSOS_PORT=str(port), DSOS_PYTHON_PATH=sys.executable,
+    )
     out = open(LOG_DIR / "daemon.out.log", "w", encoding="utf-8")
     err = open(LOG_DIR / "daemon.err.log", "w", encoding="utf-8")
     return subprocess.Popen(
@@ -166,40 +182,58 @@ def launch_daemon(port: int) -> subprocess.Popen:
 
 
 def seed_shim_dir() -> None:
-    """Give the shim somewhere to look for a daemon, with no store in it.
+    """A directory whose discovery files point at a live daemon for another store.
 
-    A verbatim copy of the daemon's own discovery files, so the only way the
-    shim can serve a tool list is by finding the running daemon — and the
-    only way it can *create* a store is by ignoring them.
+    A verbatim copy of the daemon's own daemon.json and daemon.token, and no
+    store: the manifest is real and its daemon answers, but that daemon is
+    serving DB_PATH, not SHIM_DB_PATH.
     """
     SHIM_DIR.mkdir(parents=True, exist_ok=True)
     for name in ("daemon.json", "daemon.token"):
         shutil.copyfile(DB_DIR / name, SHIM_DIR / name)
 
 
-def stdio_client(profile: str, **env_overrides: str) -> Client:
+def stdio_client(profile: str, unset: tuple[str, ...] = (), **env_overrides: str) -> Client:
     """A real MCP client, over stdio, pointed at the shim as a user would."""
+    env = child_env(**{"DSOS_DB_PATH": str(DB_PATH), **env_overrides})
+    for name in unset:
+        env.pop(name, None)
     return Client(
         StdioTransport(
             command=sys.executable,
             args=["-m", "dsos.mcp_server", "--profile", profile],
-            env=child_env(**{"DSOS_DB_PATH": str(DB_PATH), **env_overrides}),
+            env=env,
             cwd=str(REPO_ROOT),
         ),
         timeout=180,
     )
 
 
-async def list_over_stdio(profile: str, **env_overrides: str) -> list[str]:
-    async with stdio_client(profile, **env_overrides) as client:
+async def list_over_stdio(
+    profile: str, unset: tuple[str, ...] = (), **env_overrides: str
+) -> list[str]:
+    async with stdio_client(profile, unset, **env_overrides) as client:
         tools = await client.list_tools()
     return sorted(tool.name for tool in tools)
 
 
+async def run_python_over_stdio(**env_overrides: str) -> dict:
+    """One start_session and one scratch run_python, through the shim."""
+    async with stdio_client("producer", **env_overrides) as client:
+        started = await client.call_tool("start_session", {"question": "shim probe"})
+        session_id = started.data["session_id"]
+        outcome = await client.call_tool("run_python", {
+            "code": "import sys\nresult = sys.executable",
+            "session_id": session_id, "title": "which interpreter",
+            "description": "the interpreter run_python used", "input_row_ids": [],
+            "scratch": True,
+        })
+    return outcome.data
+
+
 def check_discovery_path() -> None:
     """Checks 1 and 3: daemon.json + daemon.token, and the consumer profile."""
-    seed_shim_dir()
-    env = {"DSOS_DB_PATH": str(SHIM_DB_PATH)}
+    env = {"DSOS_DB_PATH": str(DB_PATH), "DSOS_PYTHON_PATH": str(BOGUS_PYTHON)}
 
     producer = asyncio.run(list_over_stdio("producer", **env))
     check(
@@ -207,35 +241,118 @@ def check_discovery_path() -> None:
         EXPECTED_PRODUCER_TOOLS.issubset(set(producer)),
         f"{len(producer)} tools: {', '.join(producer)}",
     )
+    ran = asyncio.run(run_python_over_stdio(**env))
     check(
-        "the shim opened no store of its own (daemon.json + daemon.token discovery)",
-        not SHIM_DB_PATH.exists(),
-        f"looked for {SHIM_DB_PATH}",
+        "run_python through the shim runs in the daemon, ignoring the shim's "
+        "DSOS_PYTHON_PATH",
+        ran.get("status") == "ok",
+        json.dumps(ran)[:400],
     )
 
     consumer = asyncio.run(list_over_stdio("consumer", **env))
     check(
-        "--profile consumer reaches the consumer endpoint, not the producer one",
-        not set(consumer) & set(producer),
+        "--profile consumer reaches the consumer endpoint and its evidence tools",
+        EXPECTED_CONSUMER_TOOLS.issubset(set(consumer)),
         f"{len(consumer)} tools: {', '.join(consumer) or 'none'}",
+    )
+    check(
+        "--profile consumer serves none of the producer's tools",
+        not set(consumer) & set(producer),
+        f"{sorted(set(consumer) & set(producer))}",
     )
 
 
 def check_url_override(base_url: str, token: str) -> None:
-    """Check 2: DSOS_URL + DSOS_TOKEN, with no discovery files present."""
-    URL_ONLY_DIR.mkdir(parents=True, exist_ok=True)
-    names = asyncio.run(
-        list_over_stdio(
-            "producer",
-            DSOS_DB_PATH=str(URL_ONLY_DB_PATH),
-            DSOS_URL=base_url,
-            DSOS_TOKEN=token,
+    """Check 2: DSOS_URL + DSOS_TOKEN, with no discovery files present.
+
+    The files are moved aside rather than pointed around: the shim has to be
+    given the daemon's own store, or the db_path check (check 5) would refuse
+    it. The daemon read its token at start-up and reads daemon.json only at
+    the next start-up, so neither misses them while they are away.
+    """
+    moved = []
+    for name in ("daemon.json", "daemon.token"):
+        aside = DB_DIR / f"{name}.aside"
+        (DB_DIR / name).replace(aside)
+        moved.append((aside, DB_DIR / name))
+    try:
+        names = asyncio.run(
+            list_over_stdio(
+                "producer",
+                DSOS_DB_PATH=str(DB_PATH),
+                DSOS_URL=base_url,
+                DSOS_TOKEN=token,
+            )
         )
-    )
+        # DSOS_URL alone names no store, so there is nothing to mismatch: the
+        # shim takes the URL at its word rather than comparing the daemon's
+        # store with a cwd-relative default nobody asked for.
+        unnamed = asyncio.run(
+            list_over_stdio(
+                "producer", ("DSOS_DB_PATH",), DSOS_URL=base_url, DSOS_TOKEN=token,
+            )
+        )
+    finally:
+        for aside, source in moved:
+            aside.replace(source)
     check(
         "DSOS_URL + DSOS_TOKEN work with no daemon.json beside the store",
         EXPECTED_PRODUCER_TOOLS.issubset(set(names)),
         f"{len(names)} tools: {', '.join(names)}",
+    )
+    check(
+        "DSOS_URL + DSOS_TOKEN with no DSOS_DB_PATH at all still work",
+        EXPECTED_PRODUCER_TOOLS.issubset(set(unnamed)),
+        f"{len(unnamed)} tools: {', '.join(unnamed)}",
+    )
+
+
+def run_shim(**env_overrides: str) -> subprocess.CompletedProcess:
+    """The shim as a subprocess that is expected to refuse, not to serve.
+
+    stdin is closed, so a shim that wrongly decides to serve sees EOF and
+    exits instead of hanging the test; the timeout is the second belt.
+    """
+    return subprocess.run(
+        [sys.executable, "-m", "dsos.mcp_server", "--profile", "producer"],
+        cwd=str(REPO_ROOT), env=child_env(**env_overrides), capture_output=True,
+        text=True, encoding="utf-8", stdin=subprocess.DEVNULL, timeout=120,
+    )
+
+
+def check_other_store(base_url: str, token: str) -> None:
+    """Check 5: a daemon that answers for a different store is not this store's."""
+    seed_shim_dir()
+    done = run_shim(DSOS_DB_PATH=str(SHIM_DB_PATH))
+    check(
+        "a daemon.json naming a daemon for another store: the shim exits non-zero",
+        done.returncode != 0,
+        f"returncode {done.returncode}",
+    )
+    check(
+        "the refusal names this store and the one that daemon is serving",
+        f"dsos daemon not running for {SHIM_DB_PATH.resolve()}" in done.stderr
+        and str(DB_PATH) in done.stderr,
+        f"stderr: {done.stderr.strip()[-600:]!r}",
+    )
+    check(
+        "the shim opened no store of its own on the way out",
+        not SHIM_DB_PATH.exists(),
+        f"looked for {SHIM_DB_PATH}",
+    )
+
+    URL_ONLY_DIR.mkdir(parents=True, exist_ok=True)
+    done = run_shim(DSOS_DB_PATH=str(URL_ONLY_DB_PATH), DSOS_URL=base_url, DSOS_TOKEN=token)
+    check(
+        "a DSOS_URL pointing at another store's daemon: the shim exits non-zero",
+        done.returncode != 0,
+        f"returncode {done.returncode}",
+    )
+    check(
+        "the refusal names DSOS_URL, this store, and the store that daemon serves",
+        f"dsos daemon not running for {URL_ONLY_DB_PATH.resolve()}" in done.stderr
+        and str(DB_PATH) in done.stderr and "DSOS_URL" in done.stderr,
+        f"stderr: {done.stderr.strip()[-600:]!r}",
     )
     check(
         "the URL-only shim opened no store either",
@@ -290,6 +407,7 @@ def main() -> int:
         check_discovery_path()
         token = (DB_DIR / "daemon.token").read_text(encoding="utf-8").strip()
         check_url_override(base_url, token)
+        check_other_store(base_url, token)
     finally:
         stop(daemon)
     check_no_daemon()

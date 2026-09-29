@@ -97,20 +97,31 @@ if __name__ == "__main__":
     TOKEN_ENV = "DSOS_TOKEN"
     PROFILES = ("producer", "consumer")
 
-    def _healthz_answers(base_url: str, timeout: float = 2.0) -> bool:
+    def _healthz(base_url: str, timeout: float = 2.0) -> dict | None:
         """Is that daemon actually up? Not merely recorded in daemon.json.
 
         A manifest is a claim, and a claim outlives the process that made it:
         a killed daemon, a reboot, a port taken by something else. Asking
         /healthz is the same check the daemon itself makes before refusing to
         start a second one over the same store, which keeps "the shim says no"
-        and "the daemon says no" from ever disagreeing.
+        and "the daemon says no" from ever disagreeing. The answer comes back
+        whole, because *which* store the daemon reports is half the question.
         """
         try:
             with urllib.request.urlopen(f"{base_url}/healthz", timeout=timeout) as response:
-                return response.status == 200
+                if response.status != 200:
+                    return None
+                body = json.loads(response.read().decode("utf-8"))
         except (urllib.error.URLError, OSError, ValueError):
-            return False
+            return None
+        return body if isinstance(body, dict) else {}
+
+    def _same_store(a: str | Path, b: str | Path) -> bool:
+        """The comparison dsos.daemon.same_store makes, for the same reason:
+        resolved, then case-folded where the filesystem is."""
+        def canonical(p: str | Path) -> str:
+            return os.path.normcase(str(Path(p).resolve()))
+        return canonical(a) == canonical(b)
 
     def _manifest_base_url(db_dir: Path) -> str | None:
         """The running daemon's base URL, from the file it wrote beside the store.
@@ -175,14 +186,39 @@ if __name__ == "__main__":
         db_path = Path(os.environ.get("DSOS_DB_PATH", "data/store.db")).resolve()
         db_dir = db_path.parent
 
-        base_url = os.environ.get(URL_ENV) or _manifest_base_url(db_dir)
+        from_env = os.environ.get(URL_ENV)
+        base_url = from_env or _manifest_base_url(db_dir)
         if not base_url:
             return _no_daemon(db_path)
-        if not _healthz_answers(base_url):
+        answer = _healthz(base_url)
+        if answer is None:
             # A manifest left by a daemon that is gone, or a DSOS_URL that
-            # points somewhere else. Both are the same thing to the user, and
+            # points at nothing. Both are the same thing to the user, and
             # the same command fixes both.
             return _no_daemon(db_path)
+        served = answer.get("db_path")
+        # Checked whenever the user named a store. DSOS_URL with no
+        # DSOS_DB_PATH at all names none — the default is a guess relative to
+        # wherever the client launched this — so there the URL is taken at its
+        # word, as it always was.
+        stated = "DSOS_DB_PATH" in os.environ or not from_env
+        if stated and isinstance(served, str) and not _same_store(served, db_path):
+            # A daemon answers, but for another store: a DSOS_URL left
+            # pointing at a different store's daemon, or a copied daemon.json.
+            # Proxying anyway would hand the client somebody else's store
+            # under this one's name — every write would land in the wrong
+            # file, and nothing would say so. It is "not running" as far as
+            # *this* store is concerned, so it is said the same way, with the
+            # mismatch named so the fix is obvious.
+            source = URL_ENV if from_env else str(db_dir / "daemon.json")
+            print(
+                f"dsos daemon not running for {db_path}. The daemon at {base_url} "
+                f"(from {source}) is serving a different store, {served}. "
+                f"Start one for this store: {sys.executable} -m dsos.daemon "
+                f"with DSOS_DB_PATH={db_path}, or point DSOS_DB_PATH at {served}.",
+                file=sys.stderr,
+            )
+            return 1
 
         token = os.environ.get(TOKEN_ENV) or _token_file_token(db_dir)
         if not token:
