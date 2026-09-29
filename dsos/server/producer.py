@@ -323,8 +323,9 @@ def build_producer(config: ServerConfig) -> FastMCP:
         Pass exactly one of:
         - content_text: inline text, for markdown/python/sql/json content.
           `content_format` must describe it (markdown, python, sql, json, ...).
-        - content_path: a local file you already produced with your own tools.
-          For type="dataset" the format is read from the file extension —
+        - content_path: a local file you already produced with your own tools,
+          as an ABSOLUTE path — a relative one resolves against this server's
+          working directory, not yours. For type="dataset" the format is read from the file extension —
           .csv/.tsv/.json/.parquet are all accepted and normalized to parquet
           internally; whatever you pass as content_format is ignored. For other
           types the file is read as text and content_format describes it.
@@ -480,6 +481,13 @@ def build_producer(config: ServerConfig) -> FastMCP:
             input_row_ids=["<row_id of the toy_scores dataset artifact>"],
           )
         """
+        # Checked before anything runs: a status the row cannot be saved in
+        # used to run the query first and fail (or worse, save a superseded
+        # row) afterwards.
+        try:
+            execution.check_run_status(status)
+        except ValueError as exc:
+            return {"error": str(exc), "artifact_row_ids": []}
         if scratch:
             # Scratch persists nothing — no write to serialise, so a quick
             # check never blocks another writer.
@@ -487,17 +495,16 @@ def build_producer(config: ServerConfig) -> FastMCP:
                 db.conn(), code=code, session_id=session_id, title=title, description=description,
                 input_row_ids=input_row_ids, scratch=scratch,
             )
-        # The lock spans the run, not just its write: execution.py owns the
-        # tail that saves the artifact and records the execution, so from
-        # here there is no way to take the lock for less than the whole
-        # call. That costs a concurrent writer the duration of a long run;
-        # it buys the D13 guarantee on the read-then-write inside it.
-        with db.write() as conn:
-            outcome = execution.run_sql(
-                conn, code=code, session_id=session_id, title=title, description=description,
-                input_row_ids=input_row_ids, scratch=scratch, status=status,
-            )
-            return execution_response(conn, outcome, input_row_ids)
+        # The query runs with no lock held; `persist=db.write` takes the
+        # write lock only around the tail that saves the artifact and
+        # records the execution, which is where the D13 read-then-write is.
+        # Holding it for the whole run stalled every other client's calls
+        # (the tool-call log takes the same lock) for as long as it ran.
+        outcome = execution.run_sql(
+            db.conn(), code=code, session_id=session_id, title=title, description=description,
+            input_row_ids=input_row_ids, scratch=scratch, status=status, persist=db.write,
+        )
+        return execution_response(db.conn(), outcome, input_row_ids)
 
     @mcp.tool()
     def run_python(
@@ -559,7 +566,9 @@ def build_producer(config: ServerConfig) -> FastMCP:
         you actually need them.
 
         code_paths=["/abs/dir", ...]: directories holding your own unpackaged
-        .py modules to import from — works with or without requirements.
+        .py modules to import from — works with or without requirements. Use
+        ABSOLUTE paths: a relative one resolves against this server's working
+        directory, not yours.
 
         style: the chart style (the consistency layer) applied to rcParams
         BEFORE your code runs — "dsos" (the dark house style, the default),
@@ -573,7 +582,8 @@ def build_producer(config: ServerConfig) -> FastMCP:
         python_path: overrides the server default for THIS call only — e.g.
         point it at a specific repo's .venv interpreter to run against that
         project's exact dependencies, instead of whatever DSOS_PYTHON_PATH (or
-        this server's own interpreter, if that's unset) has installed.
+        this server's own interpreter, if that's unset) has installed. An
+        ABSOLUTE path, for the same reason as code_paths.
 
         Example:
           run_python(
@@ -583,6 +593,11 @@ def build_producer(config: ServerConfig) -> FastMCP:
             input_row_ids=["<row_id of the toy_scores dataset artifact>"],
           )
         """
+        # Before the subprocess, for the same reason as run_sql's check.
+        try:
+            execution.check_run_status(status)
+        except ValueError as exc:
+            return {"error": str(exc), "artifact_row_ids": []}
         if scratch:
             return execution.run_python(
                 db.conn(), code=code, session_id=session_id, title=title, description=description,
@@ -590,14 +605,15 @@ def build_producer(config: ServerConfig) -> FastMCP:
                 requirements=requirements, code_paths=code_paths, style=style,
                 python_path=python_path or config.python_path,
             )
-        with db.write() as conn:
-            outcome = execution.run_python(
-                conn, code=code, session_id=session_id, title=title, description=description,
-                input_row_ids=input_row_ids, output_type=output_type, scratch=scratch,
-                requirements=requirements, code_paths=code_paths, style=style,
-                python_path=python_path or config.python_path, status=status,
-            )
-            return execution_response(conn, outcome, input_row_ids)
+        # The subprocess — up to DSOS_SANDBOX_TIMEOUT — runs unlocked; only
+        # the persist tail takes the write lock (see run_sql).
+        outcome = execution.run_python(
+            db.conn(), code=code, session_id=session_id, title=title, description=description,
+            input_row_ids=input_row_ids, output_type=output_type, scratch=scratch,
+            requirements=requirements, code_paths=code_paths, style=style,
+            python_path=python_path or config.python_path, status=status, persist=db.write,
+        )
+        return execution_response(db.conn(), outcome, input_row_ids)
 
     @mcp.tool()
     def get_lineage(row_id: str, session_id: str, direction: str = "ancestors") -> dict:

@@ -24,6 +24,16 @@ of it. Either way the result flows back through the same save/record/
 lineage path — see dsos/sandbox.py. code_paths=[...] (unpackaged local
 modules) is wired into the subprocess wrapper's sys.path.
 
+The store's write lock covers only the persist tail, never the run. A
+caller that serialises writers (the MCP tools, via Database.write) passes
+`persist`, and the query or subprocess runs with no lock held — reads go
+through the plain connection, and SELECTs open no transaction, so no read
+snapshot is carried into the write either. The one read-then-write the
+lock exists for (save_artifact's version read, D13) is inside
+_record_run, so that is the only part that needs it. A run holding the
+lock for its whole duration stalled every other client for up to
+DSOS_SANDBOX_TIMEOUT, since the tool-call log takes the same lock.
+
 A run_python `result` that's a matplotlib Figure/Axes (the natural shape of
 a chart cell) is rendered to PNG bytes automatically (feedback #2, this
 round) — see sandbox.py's wrapper template, which is the only place this
@@ -39,7 +49,7 @@ import traceback
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable, ContextManager
 
 import duckdb
 import pandas as pd
@@ -49,6 +59,15 @@ from dsos.store import Artifact, get_artifact_by_row_id, save_artifact
 
 _STDOUT_LIMIT = 2_000
 _STDERR_LIMIT = 4_000  # tail-capped: the traceback's final frames are the useful ones
+
+# The lifecycle states a run may save its row in. Not 'superseded': a row
+# only gets there through store.mark, which demands the superseded_by that
+# says what replaced it — a run has no such thing to name.
+RUN_STATUSES = ("exploratory", "result")
+
+# A zero-argument context manager factory yielding the connection to write
+# through — `Database.write` is one.
+Persist = Callable[[], ContextManager[sqlite3.Connection]]
 
 
 @dataclass(frozen=True)
@@ -63,6 +82,25 @@ class RunOutcome:
     status: str
     row_id: str | None
     execution_id: str
+
+
+def check_run_status(status: str) -> None:
+    """Refuse a lifecycle status a run may not save its row in, naming the
+    allowed ones. Called before any work, so a bad status costs the caller
+    nothing — not a query, a subprocess, or a half-recorded run."""
+    if status not in RUN_STATUSES:
+        raise ValueError(
+            f"status must be one of {list(RUN_STATUSES)} for a run, got {status!r}"
+            + ("; a row becomes superseded only through mark(status='superseded', "
+               "superseded_by=...)" if status == "superseded" else "")
+        )
+
+
+def _persist(conn: sqlite3.Connection, persist: Persist | None) -> ContextManager[sqlite3.Connection]:
+    """The block the persist tail runs in: the caller's `persist` if it gave
+    one, else just `conn` with no lock — the old direct-call shape, for a
+    single-threaded caller with nothing to serialise against."""
+    return persist() if persist is not None else contextlib.nullcontext(conn)
 
 
 def _now() -> str:
@@ -252,6 +290,7 @@ def _record_run(
 def run_sql(
     conn: sqlite3.Connection, *, code: str, session_id: str, title: str, description: str,
     input_row_ids: list[str], scratch: bool = False, status: str = "exploratory",
+    persist: Persist | None = None,
 ) -> RunOutcome | dict:
     """Runs `code` in DuckDB with each input artifact registered as a table
     named `in_1`, `in_2`, ... in the order the caller listed them in
@@ -265,7 +304,12 @@ def run_sql(
     `status` is the saved row's lifecycle state (D3): 'exploratory' (the
     default) for a query that is a finding, 'result' for one the caller is
     asserting as an answer. A scratch run persists nothing and takes no
-    status."""
+    status. A status outside those two raises ValueError before the query
+    runs.
+
+    `persist`: see the module docstring. `conn` is used for the reads; the
+    save/record tail runs inside `persist()` when given."""
+    check_run_status(status)
     started_at = _now()
     stdout = io.StringIO()
     # run_status: whether the CODE ran, as distinct from the `status`
@@ -299,11 +343,12 @@ def run_sql(
     if scratch:
         return _scratch_payload(run, inputs)
 
-    return _record_run(
-        conn, kind="sql", run=run, input_row_ids=input_row_ids, session_id=session_id,
-        title=title, description=description, output_type="query", started_at=started_at,
-        code=code, artifact_status=status,
-    )
+    with _persist(conn, persist) as wconn:
+        return _record_run(
+            wconn, kind="sql", run=run, input_row_ids=input_row_ids, session_id=session_id,
+            title=title, description=description, output_type="query", started_at=started_at,
+            code=code, artifact_status=status,
+        )
 
 
 def run_python(
@@ -312,6 +357,7 @@ def run_python(
     output_format: str = "parquet", scratch: bool = False,
     requirements: list[str] | None = None, code_paths: list[str] | None = None,
     style: str | None = "dsos", status: str = "exploratory",
+    persist: Persist | None = None,
 ) -> RunOutcome | dict:
     """Runs `code` in a subprocess against `python_path`, with each input
     artifact bound to `in_1`, `in_2`, ... in the order the caller listed
@@ -341,7 +387,11 @@ def run_python(
 
     `status` is the saved row's lifecycle state (D3), same as run_sql's:
     'exploratory' (the default) for a transform nobody has claimed yet,
-    'result' for one this session is asserting."""
+    'result' for one this session is asserting; anything else raises
+    ValueError before the subprocess starts.
+
+    `persist`: as run_sql's — the subprocess runs with no lock held."""
+    check_run_status(status)
     started_at = _now()
     inputs: list[Artifact] = []
 
@@ -368,11 +418,12 @@ def run_python(
     if scratch:
         return _scratch_payload(run, inputs)
 
-    return _record_run(
-        conn, kind="python", run=run, input_row_ids=input_row_ids, session_id=session_id,
-        title=title, description=description, output_type=output_type, started_at=started_at,
-        code=code, artifact_status=status,
-    )
+    with _persist(conn, persist) as wconn:
+        return _record_run(
+            wconn, kind="python", run=run, input_row_ids=input_row_ids, session_id=session_id,
+            title=title, description=description, output_type=output_type,
+            started_at=started_at, code=code, artifact_status=status,
+        )
 
 
 def _infer_format(result: Any) -> str:
