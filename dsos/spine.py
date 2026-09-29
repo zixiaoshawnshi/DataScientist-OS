@@ -35,7 +35,9 @@ the only thing it refuses is a *second* worker on a live question. It does
 not decide who is right, and `close_question` deliberately does not check
 that the closer is the claimer: a finished question is a fact about the
 store, and a stale claim is the abandon sweep's business (WP-G1), not a
-permission check.
+permission check. What it does refuse is closing a question twice: an
+answered or abandoned question keeps the outcome it was closed with,
+because that outcome is what the board hands every later session.
 """
 
 from __future__ import annotations
@@ -401,10 +403,18 @@ def check_claimable(
 
 
 def claim_question(conn: sqlite3.Connection, question_id: str, *, session_id: str) -> str:
-    """Take the question, or re-take one this session already holds."""
+    """Take the question, or re-take one this session already holds.
+
+    Claiming moves an `open` question to `in_progress`. The status is what
+    the board ranks on, and a claimed question left `open` would sit in the
+    "someone is waiting" band rather than at the top as live work — telling
+    a second producer that nobody is on it, which is precisely the reading
+    that starts the duplicate. `asked_by` is untouched: the consumer who
+    asked it is still who asked it."""
     check_claimable(conn, question_id, requester=session_id)
     conn.execute(
-        "UPDATE questions SET claimed_by = ?, claimed_at = ? WHERE id = ?",
+        "UPDATE questions SET status = 'in_progress', claimed_by = ?, claimed_at = ? "
+        "WHERE id = ?",
         (session_id, store._now(), question_id),
     )
     conn.commit()
@@ -564,6 +574,38 @@ def related_questions(
     ]
 
 
+def check_closable(conn: sqlite3.Connection, question_id: str) -> sqlite3.Row:
+    """Raise unless this question is still unfinished, and return it.
+
+    A question is closed once. Re-closing an answered one would overwrite
+    the row the board hands to every later session that asks the same
+    thing, and closing it `abandoned` would erase that answer outright —
+    either way the store forgets something it knew, silently, on the word
+    of whichever session called last. Split out, like `check_claimable`,
+    so `record_decision` can ask before it writes anything.
+    """
+    question = get_question(conn, question_id)
+    if question is None:
+        raise ValueError(
+            f"no question with id {question_id!r} in this store — pass the "
+            f"question_id start_session or related_questions reported."
+        )
+    if question["status"] not in ("open", "in_progress"):
+        answer = (
+            f"answered by row {question['artifact_row_id']}"
+            if question["artifact_row_id"] else "with no answer row"
+        )
+        raise ValueError(
+            f"question {question_id} is already {question['status']} ({answer}, closed "
+            f"{question['closed_at'] or 'at an unrecorded time'}), so it cannot be closed "
+            f"again — a finished question keeps the answer it was closed with. If that "
+            f"answer is wrong or out of date, start a new question and cite "
+            f"{question['artifact_row_id'] or 'the old one'} in it; a decision can still "
+            f"be recorded without a question_id."
+        )
+    return question
+
+
 def close_question(
     conn: sqlite3.Connection, *, session_id: str, question_id: str, status: str,
     artifact_row_id: str | None = None, note: str | None = None,
@@ -574,6 +616,10 @@ def close_question(
     current claim, or a decision. Not merely a row that exists — closing a
     question against an exploratory run would be a claim nobody ever made,
     asserted in the one place a later agent looks for the answer.
+
+    Only an `open` or `in_progress` question can be closed (`check_closable`).
+    That is a rule about the question, not about the caller: it stops an
+    answer being overwritten or abandoned after the fact, whoever asks.
 
     There is deliberately no check that the caller holds the claim. A
     finished question is a fact about the store rather than a permission,
@@ -594,9 +640,7 @@ def close_question(
             f"that is still in progress is one somebody is working on, and closing it "
             f"silently is how work gets lost."
         )
-    question = get_question(conn, question_id)
-    if question is None:
-        raise ValueError(f"no question with id {question_id!r} in this store")
+    question = check_closable(conn, question_id)
 
     if status == "answered":
         if not artifact_row_id:
@@ -623,11 +667,15 @@ def close_question(
                 f"first if it really is the answer."
             )
 
+    # The status guard is repeated in the WHERE clause. Every caller holds
+    # the daemon's write lock, so check_closable above has already decided
+    # this; the clause only makes the UPDATE itself unable to touch a
+    # finished row, whatever reaches it without that lock.
     conn.execute(
         """UPDATE questions
            SET status = ?, artifact_row_id = COALESCE(?, artifact_row_id),
                claimed_by = NULL, claimed_at = NULL, closed_at = ?
-           WHERE id = ?""",
+           WHERE id = ? AND status IN ('open', 'in_progress')""",
         (status, artifact_row_id, store._now(), question_id),
     )
     conn.commit()
@@ -665,7 +713,10 @@ def record_decision(
     With `question_id`, the question is closed as answered by this decision
     — after the decision row exists and is committed. The order is the
     point: a failure between the two would otherwise leave a question
-    answered by a row that was never written.
+    answered by a row that was never written. Whether the question can be
+    closed at all (it exists, and is still open or in progress) is checked
+    up front, before the decision is written, so a refusal leaves nothing
+    behind.
     """
     if not decision or not decision.strip():
         raise ValueError("a decision needs the call itself — what was decided, in one line")
@@ -699,17 +750,23 @@ def record_decision(
         "decision": decision.strip(),
         "rationale": rationale.strip(),
         "revisit_if": revisit_if,
+        "question_id": question_id,
     }
     if question_id:
         # Fail before writing anything if the question is not one that can be
-        # answered, rather than after: a decision with no question attached
-        # is a perfectly good artifact, and worth keeping on its own terms.
-        if get_question(conn, question_id) is None:
-            raise ValueError(
-                f"no question with id {question_id!r} in this store — pass the "
-                f"question_id start_session or related_questions reported."
-            )
+        # answered — missing, or already answered or abandoned — rather than
+        # after. A decision with no question attached is a perfectly good
+        # artifact, but the caller asked for one attached, and has to learn
+        # that the question is closed while it can still choose: drop the
+        # question_id and record the decision on its own terms, or start a
+        # new question. Writing the row first and refusing the close would
+        # make that choice for it.
+        check_closable(conn, question_id)
 
+    # No `source`: that column is provenance ({url, fetched_at,
+    # refresh_after}), and the consumer renders it as where a step's data came
+    # from. The decision -> question link is questions.artifact_row_id, set
+    # by the close below, and the question_id is in the content body above.
     row_id = store.save_artifact(
         conn,
         type="decision",
@@ -720,7 +777,6 @@ def record_decision(
         session_id=session_id,
         parent_row_ids=evidence,
         status="result",
-        source={"question_id": question_id} if question_id else None,
     )
 
     closed: dict | None = None
